@@ -5,12 +5,10 @@ export const COGNITO_GROUPS = {
 
 export type CognitoGroup = typeof COGNITO_GROUPS[keyof typeof COGNITO_GROUPS];
 
-// Database role mappings (different from Cognito groups)
+// Database roles (simplified to match your requirements)
 export const DB_ROLES = {
   OWNER: 'owner',
-  MANAGER: 'manager',
-  BARTENDER: 'bartender',
-  BARBACK: 'barback',
+  USER: 'user',
   ADMIN: 'admin',
 } as const;
 
@@ -20,11 +18,9 @@ export type DbRole = typeof DB_ROLES[keyof typeof DB_ROLES];
 export function mapDbRoleToCognitoGroup(dbRole: DbRole): CognitoGroup {
   switch (dbRole) {
     case DB_ROLES.OWNER:
-    case DB_ROLES.MANAGER:
     case DB_ROLES.ADMIN:
       return COGNITO_GROUPS.OWNER;
-    case DB_ROLES.BARTENDER:
-    case DB_ROLES.BARBACK:
+    case DB_ROLES.USER:
     default:
       return COGNITO_GROUPS.USER;
   }

@@ -16,7 +16,7 @@ export interface User {
   last_name: string | null;
   password_hash: string | null;
   organization_id: string;
-  role: 'owner' | 'manager' | 'bartender' | 'barback' | 'admin';
+  role: 'owner' | 'user' | 'admin';
   is_active: boolean;
   cognito_user_id: string | null;
   stripe_customer_id: string | null;

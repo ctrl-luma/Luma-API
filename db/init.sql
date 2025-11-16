@@ -3,7 +3,7 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
 -- Create enum types
-CREATE TYPE user_role AS ENUM ('owner', 'manager', 'bartender', 'barback', 'admin');
+CREATE TYPE user_role AS ENUM ('owner', 'user', 'admin');
 CREATE TYPE event_status AS ENUM ('draft', 'active', 'completed', 'cancelled');
 CREATE TYPE transaction_status AS ENUM ('pending', 'processing', 'completed', 'failed', 'refunded');
 CREATE TYPE payout_status AS ENUM ('pending', 'processing', 'paid', 'failed');
