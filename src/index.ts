@@ -1,0 +1,94 @@
+import { serve } from '@hono/node-server';
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { logger } from 'hono/logger';
+import { prettyJSON } from 'hono/pretty-json';
+import { OpenAPIHono } from '@hono/zod-openapi';
+import { swaggerUI } from '@hono/swagger-ui';
+import { createServer } from 'http';
+import { config } from './config';
+import { errorHandler } from './middleware/error-handler';
+import { requestId } from './middleware/request-id';
+import { testConnection } from './db';
+import { logger as winstonLogger } from './utils/logger';
+import { redisService } from './services/redis';
+import { registerAllWorkers } from './services/queue/workers';
+import { socketService } from './services/socket';
+import authRoutes from './routes/auth';
+import stripeWebhookRoutes from './routes/stripe/webhooks';
+import stripeConnectWebhookRoutes from './routes/stripe/connect-webhooks';
+
+const app = new OpenAPIHono();
+
+app.use('*', logger());
+app.use('*', requestId());
+app.use('*', cors({
+  origin: config.cors.origin.split(','),
+  credentials: true,
+}));
+app.use('*', prettyJSON());
+
+app.get('/', (c) => {
+  return c.json({
+    name: 'Luma API',
+    version: '1.0.0',
+    status: 'operational',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get('/health', (c) => {
+  return c.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.doc('/openapi.json', {
+  openapi: '3.0.0',
+  info: {
+    title: 'Luma API',
+    version: '1.0.0',
+    description: 'Backend API for Luma - Stripe-integrated POS system for mobile bars and events',
+  },
+  servers: [
+    {
+      url: config.api.url,
+      description: 'API Server',
+    },
+  ],
+});
+
+app.get('/swagger', swaggerUI({ url: '/openapi.json' }));
+
+// Mount routes
+app.route('/', authRoutes);
+app.route('/', stripeWebhookRoutes);
+app.route('/', stripeConnectWebhookRoutes);
+
+app.onError(errorHandler);
+
+const port = config.server.port;
+
+async function startServer() {
+  try {
+    await testConnection();
+    await redisService.connect();
+    registerAllWorkers();
+    
+    const server = serve({
+      fetch: app.fetch,
+      port,
+      createServer,
+    });
+    
+    socketService.initialize(server);
+    
+    winstonLogger.info(`Server is running on port ${port}`);
+  } catch (error) {
+    winstonLogger.error('Failed to start server', error);
+    process.exit(1);
+  }
+}
+
+startServer();

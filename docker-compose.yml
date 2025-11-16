@@ -1,0 +1,62 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: luma_postgres
+    environment:
+      POSTGRES_DB: luma_db
+      POSTGRES_USER: luma
+      POSTGRES_PASSWORD: luma_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U luma -d luma_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8-alpine
+    container_name: luma_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: luma_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@luma.io
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: luma_redis_commander
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+
+volumes:
+  postgres_data:
+  redis_data:
+  pgadmin_data:

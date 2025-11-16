@@ -1,0 +1,242 @@
+import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
+import { z } from 'zod';
+import { authService } from '../../services/auth';
+import { logger } from '../../utils/logger';
+import signupRoutes from './signup';
+
+const app = new OpenAPIHono();
+
+// Mount signup routes
+app.route('/', signupRoutes);
+
+const LoginRequestSchema = z.object({
+  email: z.string().email(),
+  password: z.string(),
+});
+
+const LoginResponseSchema = z.object({
+  user: z.object({
+    id: z.string(),
+    email: z.string(),
+    organizationId: z.string(),
+    role: z.string(),
+  }),
+  tokens: z.object({
+    accessToken: z.string(),
+    refreshToken: z.string(),
+    expiresIn: z.number(),
+  }),
+});
+
+const loginRoute = createRoute({
+  method: 'post',
+  path: '/auth/login',
+  summary: 'Login to account',
+  tags: ['Authentication'],
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: LoginRequestSchema,
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Login successful',
+      content: {
+        'application/json': {
+          schema: LoginResponseSchema,
+        },
+      },
+    },
+    401: {
+      description: 'Invalid credentials',
+    },
+  },
+});
+
+app.openapi(loginRoute, async (c) => {
+  const body = await c.req.json();
+  const validated = LoginRequestSchema.parse(body);
+
+  try {
+    const tokens = await authService.login(validated.email, validated.password);
+    const user = await authService.getUserByEmail(validated.email);
+
+    if (!user) {
+      return c.json({ error: 'Invalid credentials' }, 401);
+    }
+
+    logger.info('User logged in', { userId: user.id, email: user.email });
+
+    return c.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        organizationId: user.organization_id,
+        role: user.role,
+      },
+      tokens,
+    });
+  } catch (error: any) {
+    logger.error('Login error', { error, email: validated.email });
+    
+    if (error.message === 'Invalid credentials') {
+      return c.json({ error: 'Invalid credentials' }, 401);
+    }
+    
+    return c.json({ error: 'Login failed' }, 500);
+  }
+});
+
+const RefreshTokenRequestSchema = z.object({
+  refreshToken: z.string(),
+});
+
+const refreshRoute = createRoute({
+  method: 'post',
+  path: '/auth/refresh',
+  summary: 'Refresh access token',
+  tags: ['Authentication'],
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: RefreshTokenRequestSchema,
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Tokens refreshed',
+      content: {
+        'application/json': {
+          schema: z.object({
+            accessToken: z.string(),
+            refreshToken: z.string(),
+            expiresIn: z.number(),
+          }),
+        },
+      },
+    },
+    401: {
+      description: 'Invalid refresh token',
+    },
+  },
+});
+
+app.openapi(refreshRoute, async (c) => {
+  const body = await c.req.json();
+  const validated = RefreshTokenRequestSchema.parse(body);
+
+  try {
+    const tokens = await authService.refreshTokens(validated.refreshToken);
+    
+    return c.json(tokens);
+  } catch (error) {
+    logger.error('Token refresh error', error);
+    return c.json({ error: 'Invalid refresh token' }, 401);
+  }
+});
+
+const logoutRoute = createRoute({
+  method: 'post',
+  path: '/auth/logout',
+  summary: 'Logout from account',
+  tags: ['Authentication'],
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: RefreshTokenRequestSchema,
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Logged out successfully',
+    },
+  },
+});
+
+app.openapi(logoutRoute, async (c) => {
+  const body = await c.req.json();
+  const validated = RefreshTokenRequestSchema.parse(body);
+
+  try {
+    await authService.logout(validated.refreshToken);
+    return c.json({ message: 'Logged out successfully' });
+  } catch (error) {
+    logger.error('Logout error', error);
+    return c.json({ message: 'Logged out successfully' }); // Always return success
+  }
+});
+
+const ChangePasswordRequestSchema = z.object({
+  currentPassword: z.string(),
+  newPassword: z.string().min(8),
+});
+
+const changePasswordRoute = createRoute({
+  method: 'post',
+  path: '/auth/change-password',
+  summary: 'Change password',
+  tags: ['Authentication'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: ChangePasswordRequestSchema,
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Password changed successfully',
+    },
+    400: {
+      description: 'Invalid current password',
+    },
+    401: {
+      description: 'Unauthorized',
+    },
+  },
+});
+
+app.openapi(changePasswordRoute, async (c) => {
+  const user = c.get('user');
+  if (!user) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  const body = await c.req.json();
+  const validated = ChangePasswordRequestSchema.parse(body);
+
+  try {
+    await authService.changePassword(
+      user.userId,
+      validated.currentPassword,
+      validated.newPassword
+    );
+
+    logger.info('Password changed', { userId: user.userId });
+
+    return c.json({ message: 'Password changed successfully' });
+  } catch (error: any) {
+    logger.error('Password change error', { error, userId: user.userId });
+    
+    if (error.message === 'Current password is incorrect') {
+      return c.json({ error: 'Current password is incorrect' }, 400);
+    }
+    
+    return c.json({ error: 'Failed to change password' }, 500);
+  }
+});
+
+export default app;
