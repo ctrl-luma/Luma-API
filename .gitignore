@@ -6,8 +6,8 @@ pnpm-lock.yaml
 
 # Environment files
 .env
-.env.local
-.env.production
+.env.*
+!.env.example
 
 # Build output
 dist/

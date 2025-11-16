@@ -11,7 +11,7 @@ if (existsSync(envFile)) {
 }
 
 const envSchema = z.object({
-  NODE_ENV: z.enum(['development', 'staging', 'production', 'local']).default('development'),
+  NODE_ENV: z.enum(['development', 'production', 'local']).default('development'),
   PORT: z.string().transform(Number).default('3334'),
   API_URL: z.string().url().default('http://localhost:3334'),
   
