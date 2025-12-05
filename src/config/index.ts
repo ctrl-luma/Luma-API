@@ -14,6 +14,7 @@ const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'local']).default('development'),
   PORT: z.string().transform(Number).default('3334'),
   API_URL: z.string().url().default('http://localhost:3334'),
+  FRONTEND_URL: z.string().url().default('http://localhost:3333'),
   
   DATABASE_URL: z.string(),
   DB_SSL: z.string().transform(v => v === 'true').default('false'),
@@ -23,6 +24,8 @@ const envSchema = z.object({
   STRIPE_SECRET_KEY: z.string(),
   STRIPE_WEBHOOK_SECRET: z.string(),
   STRIPE_CONNECT_WEBHOOK_SECRET: z.string().optional(),
+  STRIPE_PRO_PRICE_ID: z.string().optional(),
+  STRIPE_ENTERPRISE_PRICE_ID: z.string().optional(),
   
   AWS_REGION: z.string().optional(),
   COGNITO_USER_POOL_ID: z.string().optional(),
@@ -31,7 +34,7 @@ const envSchema = z.object({
   
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly']).default('info'),
   
-  CORS_ORIGIN: z.string().default('http://localhost:3001,http://localhost:3002'),
+  CORS_ORIGIN: z.string().default('http://localhost:3001,http://localhost:3002,http://localhost:3333'),
   
   SOCKET_IO_PATH: z.string().default('/socket.io'),
   
@@ -49,6 +52,9 @@ export const config = {
   api: {
     url: env.API_URL,
   },
+  frontend: {
+    url: env.FRONTEND_URL,
+  },
   database: {
     url: env.DATABASE_URL,
     ssl: env.DB_SSL,
@@ -60,6 +66,8 @@ export const config = {
     secretKey: env.STRIPE_SECRET_KEY,
     webhookSecret: env.STRIPE_WEBHOOK_SECRET,
     connectWebhookSecret: env.STRIPE_CONNECT_WEBHOOK_SECRET,
+    proPriceId: env.STRIPE_PRO_PRICE_ID,
+    enterprisePriceId: env.STRIPE_ENTERPRISE_PRICE_ID,
   },
   aws: {
     region: env.AWS_REGION,

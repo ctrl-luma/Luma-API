@@ -1,11 +1,8 @@
-import jwt from 'jsonwebtoken';
 import bcrypt from 'bcrypt';
-import { v4 as uuidv4 } from 'uuid';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
-import { query, transaction } from '../../db';
+import { query } from '../../db';
 import { User } from '../../db/models';
-import { redisService } from '../redis';
 import { cacheService, CacheKeys } from '../redis/cache';
 import { cognitoService } from './cognito';
 import { normalizeEmail } from '../../utils/email';
@@ -26,9 +23,6 @@ export interface JWTPayload {
 }
 
 export class AuthService {
-  private readonly ACCESS_TOKEN_EXPIRY = '15m';
-  private readonly REFRESH_TOKEN_EXPIRY = '30d';
-  private readonly REFRESH_TOKEN_EXPIRY_SECONDS = 30 * 24 * 60 * 60;
 
   async register(params: {
     email: string;
@@ -129,7 +123,7 @@ export class AuthService {
     throw new Error('Local authentication not supported. Please use Cognito.');
   }
 
-  async generateTokens(user: User): Promise<AuthTokens> {
+  async generateTokens(_user: User): Promise<AuthTokens> {
     throw new Error('Local token generation not supported. Please use Cognito.');
   }
 

@@ -7,7 +7,8 @@ import { query, transaction } from '../../db';
 import { logger } from '../../utils/logger';
 import { normalizeEmail } from '../../utils/email';
 import { DEFAULT_FEATURES_BY_TIER, PRICING_BY_TIER } from '../../db/models/subscription';
-import { COGNITO_GROUPS, DB_ROLES, mapDbRoleToCognitoGroup } from '../../constants/auth';
+import { DB_ROLES, mapDbRoleToCognitoGroup } from '../../constants/auth';
+import { config } from '../../config';
 
 const app = new OpenAPIHono();
 
@@ -21,6 +22,11 @@ const SignupRequestSchema = z.object({
   acceptTerms: z.boolean(),
   acceptPrivacy: z.boolean(),
   subscriptionTier: z.enum(['starter', 'pro', 'enterprise']).default('starter'),
+  // For custom/enterprise plan
+  businessDescription: z.string().optional(),
+  expectedVolume: z.string().optional(),
+  useCase: z.string().optional(),
+  additionalRequirements: z.string().optional(),
 });
 
 const SignupResponseSchema = z.object({
@@ -46,6 +52,9 @@ const SignupResponseSchema = z.object({
     refreshToken: z.string(),
     expiresIn: z.number(),
   }),
+  stripeOnboardingUrl: z.string().optional(),
+  stripeCheckoutUrl: z.string().optional(),
+  customPlanRequested: z.boolean().optional(),
 });
 
 const signupRoute = createRoute({
@@ -175,26 +184,34 @@ app.openapi(signupRoute, async (c) => {
         }
       }
 
-      // 5. Create subscription
+      // 5. Create subscription based on tier
       const pricing = PRICING_BY_TIER[validated.subscriptionTier];
       const features = DEFAULT_FEATURES_BY_TIER[validated.subscriptionTier];
-      const trialEnd = new Date();
-      trialEnd.setDate(trialEnd.getDate() + 14); // 14-day trial
+      
+      let subscriptionStatus = 'active';
+      let stripeSubscriptionId = null;
+      
+      // For pro tier, status will be pending until payment
+      if (validated.subscriptionTier === 'pro') {
+        subscriptionStatus = 'pending_payment';
+      } else if (validated.subscriptionTier === 'enterprise') {
+        subscriptionStatus = 'pending_approval';
+      }
 
       const subscriptionResult = await client.query(
         `INSERT INTO subscriptions (
           user_id, organization_id, stripe_customer_id,
-          tier, status, trial_start, trial_end,
+          tier, status, stripe_subscription_id,
           monthly_price, transaction_fee_rate, features
-        ) VALUES ($1, $2, $3, $4, $5, NOW(), $6, $7, $8, $9)
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         RETURNING *`,
         [
           user.id,
           organization.id,
           stripeCustomer.id,
           validated.subscriptionTier,
-          'trialing',
-          trialEnd,
+          subscriptionStatus,
+          stripeSubscriptionId,
           pricing.monthly_price,
           pricing.transaction_fee_rate,
           features,
@@ -202,31 +219,88 @@ app.openapi(signupRoute, async (c) => {
       );
       const subscription = subscriptionResult.rows[0];
 
-      // 6. Create Stripe Connect account for the organization
-      const stripeAccount = await stripeService.createConnectedAccount({
-        type: 'express',
-        email: validated.email,
-        business_type: 'company',
-        metadata: {
-          organization_id: organization.id,
-          user_id: user.id,
-        },
-      });
+      // 6. Handle tier-specific flows
+      let stripeAccountId = null;
+      
+      // Only create Stripe Connect account for starter tier (immediate onboarding)
+      if (validated.subscriptionTier === 'starter') {
+        const stripeAccount = await stripeService.createConnectedAccount({
+          type: 'express',
+          email: validated.email,
+          business_type: 'company',
+          metadata: {
+            organization_id: organization.id,
+            user_id: user.id,
+          },
+        });
+        stripeAccountId = stripeAccount.id;
+      }
 
-      // Update organization with Stripe account ID
-      await client.query(
-        `UPDATE organizations SET stripe_account_id = $1 WHERE id = $2`,
-        [stripeAccount.id, organization.id]
-      );
-      organization.stripe_account_id = stripeAccount.id;
+      // Update organization with Stripe account ID if created
+      if (stripeAccountId) {
+        await client.query(
+          `UPDATE organizations SET stripe_account_id = $1 WHERE id = $2`,
+          [stripeAccountId, organization.id]
+        );
+        organization.stripe_account_id = stripeAccountId;
+      }
+      
+      // 7. Handle custom plan request
+      if (validated.subscriptionTier === 'enterprise') {
+        await client.query(
+          `INSERT INTO custom_plan_requests (
+            user_id, organization_id, business_description,
+            expected_volume, use_case, additional_requirements
+          ) VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            user.id,
+            organization.id,
+            validated.businessDescription || '',
+            validated.expectedVolume || '',
+            validated.useCase || '',
+            validated.additionalRequirements || ''
+          ]
+        );
+      }
 
       return { user, organization, subscription };
     });
 
-    // 7. Generate auth tokens
+    // 8. Generate auth tokens
     const tokens = await authService.generateTokens(result.user);
 
-    // 8. Log audit event
+    // 9. Generate appropriate URLs based on tier
+    let stripeOnboardingUrl: string | undefined;
+    let stripeCheckoutUrl: string | undefined;
+    let customPlanRequested = false;
+    
+    if (validated.subscriptionTier === 'starter') {
+      // Generate Stripe Connect onboarding link for starter
+      const accountLink = await stripeService.createAccountLink(
+        result.organization.stripe_account_id!,
+        `${config.frontend.url}/onboarding/refresh`,
+        `${config.frontend.url}/onboarding/complete`
+      );
+      stripeOnboardingUrl = accountLink.url;
+    } else if (validated.subscriptionTier === 'pro' && config.stripe.proPriceId) {
+      // Create checkout session for Pro tier
+      const checkoutSession = await stripeService.createCheckoutSession({
+        customer: result.user.stripe_customer_id!,
+        price: config.stripe.proPriceId,
+        successUrl: `${config.frontend.url}/subscription/success?session_id={CHECKOUT_SESSION_ID}`,
+        cancelUrl: `${config.frontend.url}/subscription/cancel`,
+        metadata: {
+          user_id: result.user.id,
+          organization_id: result.organization.id,
+          subscription_id: result.subscription.id,
+        },
+      });
+      stripeCheckoutUrl = checkoutSession.url || undefined;
+    } else if (validated.subscriptionTier === 'enterprise') {
+      customPlanRequested = true;
+    }
+
+    // 10. Log audit event
     await query(
       `INSERT INTO audit_logs (
         organization_id, user_id, action, entity_type, entity_id
@@ -265,6 +339,9 @@ app.openapi(signupRoute, async (c) => {
         trialEndsAt: result.subscription.trial_end?.toISOString() || null,
       },
       tokens,
+      ...(stripeOnboardingUrl && { stripeOnboardingUrl }),
+      ...(stripeCheckoutUrl && { stripeCheckoutUrl }),
+      ...(customPlanRequested && { customPlanRequested }),
     }, 201);
 
   } catch (error: any) {

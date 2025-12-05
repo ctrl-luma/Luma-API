@@ -1,10 +1,10 @@
 import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
 import { z } from 'zod';
 import { config } from '../../config';
-import { stripeService } from '../../services/stripe';
+import { stripeService, stripe } from '../../services/stripe';
 import { logger } from '../../utils/logger';
 import { query, transaction } from '../../db';
-import { normalizeEmail, compareEmails } from '../../utils/email';
+import { normalizeEmail } from '../../utils/email';
 import { PRICING_BY_TIER, DEFAULT_FEATURES_BY_TIER } from '../../db/models/subscription';
 
 const app = new OpenAPIHono();
@@ -301,7 +301,7 @@ async function handleCheckoutSessionCompleted(session: any) {
     }
 
     const user = userResult.rows[0];
-    const lineItems = await stripeService.stripe.checkout.sessions.listLineItems(session.id, {
+    const lineItems = await stripe.checkout.sessions.listLineItems(session.id, {
       expand: ['data.price'],
       limit: 10,
     });
@@ -463,8 +463,6 @@ async function updateSubscriptionStatus(subscription: any, status: string) {
 }
 
 async function handleInvoicePaymentSucceeded(invoice: any) {
-  const customerEmail = normalizeEmail(invoice.customer_email || '');
-  
   await transaction(async (client) => {
     // Update subscription payment status if needed
     if (invoice.subscription) {

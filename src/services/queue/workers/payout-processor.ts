@@ -33,7 +33,7 @@ export function registerPayoutProcessor() {
         const event = eventResult[0];
         
         let destinationAccount: string | undefined;
-        let description: string;
+        let description: string = '';
 
         if (type === 'revenue_split') {
           const revenueSplits = event.revenue_split || [];

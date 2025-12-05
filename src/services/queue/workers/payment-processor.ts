@@ -1,6 +1,6 @@
 import { Job } from 'bullmq';
 import { QueueName, JobData, queueService } from '../index';
-import { stripeService } from '../../stripe';
+import { stripe } from '../../stripe';
 import { query, transaction } from '../../../db';
 import { logger } from '../../../utils/logger';
 
@@ -17,7 +17,7 @@ export function registerPaymentProcessor() {
       });
 
       try {
-        const paymentIntent = await stripeService.stripe.paymentIntents.retrieve(
+        const paymentIntent = await stripe.paymentIntents.retrieve(
           paymentIntentId
         );
 

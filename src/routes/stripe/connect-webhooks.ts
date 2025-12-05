@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { config } from '../../config';
 import { stripeService } from '../../services/stripe';
 import { logger } from '../../utils/logger';
-import { query, transaction } from '../../db';
+import { transaction } from '../../db';
 
 const app = new OpenAPIHono();
 

@@ -99,7 +99,7 @@ export class RedisService {
   async expire(key: string, ttl: number): Promise<boolean> {
     try {
       const result = await this.client.expire(key, ttl);
-      return result === 1;
+      return Boolean(result);
     } catch (error) {
       logger.error('Redis EXPIRE error:', { key, error });
       return false;
@@ -126,7 +126,8 @@ export class RedisService {
 
   async hget(key: string, field: string): Promise<string | null> {
     try {
-      return await this.client.hGet(key, field);
+      const value = await this.client.hGet(key, field);
+      return value ?? null;
     } catch (error) {
       logger.error('Redis HGET error:', { key, field, error });
       return null;

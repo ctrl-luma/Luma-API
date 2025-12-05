@@ -3,7 +3,7 @@ import { config } from '../../config';
 import { logger } from '../../utils/logger';
 
 export const stripe = new Stripe(config.stripe.secretKey, {
-  apiVersion: '2024-11-20.acacia',
+  apiVersion: '2025-10-29.clover',
   typescript: true,
 });
 
@@ -147,6 +147,43 @@ export class StripeService {
       return account;
     } catch (error) {
       logger.error('Failed to retrieve account', error);
+      throw error;
+    }
+  }
+
+  async createCheckoutSession(params: {
+    customer: string;
+    price?: string;
+    successUrl: string;
+    cancelUrl: string;
+    metadata?: Record<string, string>;
+    mode?: 'payment' | 'subscription';
+  }) {
+    try {
+      const session = await stripe.checkout.sessions.create({
+        customer: params.customer,
+        line_items: params.price ? [
+          {
+            price: params.price,
+            quantity: 1,
+          },
+        ] : undefined,
+        mode: params.mode || 'subscription',
+        success_url: params.successUrl,
+        cancel_url: params.cancelUrl,
+        metadata: params.metadata,
+        allow_promotion_codes: true,
+        billing_address_collection: 'required',
+      });
+      
+      logger.info('Checkout session created', { 
+        sessionId: session.id,
+        customer: params.customer 
+      });
+      
+      return session;
+    } catch (error) {
+      logger.error('Failed to create checkout session', error);
       throw error;
     }
   }

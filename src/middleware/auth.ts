@@ -35,7 +35,7 @@ export const auth = (): MiddlewareHandler => {
         role: payload.role,
       });
 
-      await next();
+      return await next();
     } catch (error) {
       logger.error('Auth middleware error', error);
       return c.json({ error: 'Unauthorized' }, 401);
@@ -55,7 +55,7 @@ export const requireRole = (roles: string[]): MiddlewareHandler => {
       return c.json({ error: 'Forbidden' }, 403);
     }
 
-    await next();
+    return await next();
   };
 };
 

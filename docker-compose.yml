@@ -4,6 +4,7 @@ services:
   postgres:
     image: postgres:17-alpine
     container_name: luma_postgres
+    restart: unless-stopped
     environment:
       POSTGRES_DB: luma_db
       POSTGRES_USER: luma
@@ -22,6 +23,7 @@ services:
   redis:
     image: redis:8-alpine
     container_name: luma_redis
+    restart: unless-stopped
     ports:
       - "6379:6379"
     volumes:
@@ -36,6 +38,7 @@ services:
   pgadmin:
     image: dpage/pgadmin4:latest
     container_name: luma_pgadmin
+    restart: unless-stopped
     environment:
       PGADMIN_DEFAULT_EMAIL: admin@luma.io
       PGADMIN_DEFAULT_PASSWORD: admin
@@ -49,6 +52,7 @@ services:
   redis-commander:
     image: rediscommander/redis-commander:latest
     container_name: luma_redis_commander
+    restart: unless-stopped
     environment:
       - REDIS_HOSTS=local:redis:6379
     ports:

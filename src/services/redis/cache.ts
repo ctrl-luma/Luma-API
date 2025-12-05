@@ -61,8 +61,7 @@ export class CacheService {
     }
   }
 
-  async invalidate(pattern: string, options?: CacheOptions): Promise<void> {
-    const prefix = options?.prefix || this.keyPrefix;
+  async invalidate(_pattern: string, _options?: CacheOptions): Promise<void> {
     logger.warn('Cache invalidation not implemented for pattern matching');
   }
 

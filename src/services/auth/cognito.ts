@@ -2,7 +2,6 @@ import {
   CognitoIdentityProviderClient,
   AdminCreateUserCommand,
   AdminGetUserCommand,
-  AdminUpdateUserAttributesCommand,
   AdminDeleteUserCommand,
   AdminSetUserPasswordCommand,
   AdminInitiateAuthCommand,
@@ -11,12 +10,11 @@ import {
   AdminRemoveUserFromGroupCommand,
   AdminListGroupsForUserCommand,
   CreateGroupCommand,
-  GetGroupCommand,
   ListUsersCommand,
   AdminDisableUserCommand,
   AdminEnableUserCommand,
   AdminResetUserPasswordCommand,
-  AdminUpdateUserAttributesCommand as UpdateAttributesCommand,
+  AdminUpdateUserAttributesCommand,
   MessageActionType,
 } from '@aws-sdk/client-cognito-identity-provider';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
@@ -136,7 +134,7 @@ export class CognitoService {
         Value: value,
       }));
 
-      const command = new UpdateAttributesCommand({
+      const command = new AdminUpdateUserAttributesCommand({
         UserPoolId: this.userPoolId,
         Username: username,
         UserAttributes: userAttributes,
