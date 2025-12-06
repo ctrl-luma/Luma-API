@@ -5,6 +5,7 @@ import {
   AdminDeleteUserCommand,
   AdminSetUserPasswordCommand,
   AdminInitiateAuthCommand,
+  InitiateAuthCommand,
   AdminRespondToAuthChallengeCommand,
   AdminAddUserToGroupCommand,
   AdminRemoveUserFromGroupCommand,
@@ -54,12 +55,18 @@ export class CognitoService {
         userPoolId: this.userPoolId,
         tokenUse: 'id',
         clientId: this.clientId,
+        jwksCache: {
+          cacheTime: 600000, // 10 minutes
+        },
       });
 
       this.accessTokenVerifier = CognitoJwtVerifier.create({
         userPoolId: this.userPoolId,
         tokenUse: 'access',
         clientId: this.clientId,
+        jwksCache: {
+          cacheTime: 600000, // 10 minutes
+        },
       });
     }
   }
@@ -266,14 +273,14 @@ export class CognitoService {
 
   async refreshTokens(refreshToken: string) {
     try {
-      // For refresh token flow, we don't have the username, so we can't calculate SECRET_HASH
-      // This is a limitation of Cognito when using client secret with refresh tokens
-      const command = new AdminInitiateAuthCommand({
-        UserPoolId: this.userPoolId,
+      // Use InitiateAuthCommand instead of AdminInitiateAuthCommand for refresh tokens
+      // This doesn't require USERNAME for SECRET_HASH calculation
+      const command = new InitiateAuthCommand({
         ClientId: this.clientId,
         AuthFlow: 'REFRESH_TOKEN_AUTH',
         AuthParameters: {
           REFRESH_TOKEN: refreshToken,
+          SECRET_HASH: this.calculateSecretHash(this.clientId), // Use clientId as username for refresh
         },
       });
 

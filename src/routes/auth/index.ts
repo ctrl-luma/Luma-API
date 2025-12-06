@@ -18,6 +18,9 @@ const LoginResponseSchema = z.object({
   user: z.object({
     id: z.string(),
     email: z.string(),
+    firstName: z.string().optional(),
+    lastName: z.string().optional(),
+    phone: z.string().optional(),
     organizationId: z.string(),
     role: z.string(),
   }),
@@ -75,6 +78,9 @@ app.openapi(loginRoute, async (c) => {
       user: {
         id: user.id,
         email: user.email,
+        firstName: user.first_name || undefined,
+        lastName: user.last_name || undefined,
+        phone: user.phone || undefined,
         organizationId: user.organization_id,
         role: user.role,
       },
@@ -267,30 +273,104 @@ const changePasswordRoute = createRoute({
   },
 });
 
-app.openapi(changePasswordRoute, async (c) => {
-  const user = c.get('user');
-  if (!user) {
+// Get current user endpoint
+const getCurrentUserRoute = createRoute({
+  method: 'get',
+  path: '/auth/me',
+  summary: 'Get current user information',
+  tags: ['Authentication'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: {
+      description: 'Current user information',
+      content: {
+        'application/json': {
+          schema: z.object({
+            id: z.string(),
+            email: z.string(),
+            firstName: z.string().optional(),
+            lastName: z.string().optional(),
+            phone: z.string().optional(),
+            organizationId: z.string(),
+            role: z.string(),
+          }),
+        },
+      },
+    },
+    401: {
+      description: 'Unauthorized',
+    },
+  },
+});
+
+app.openapi(getCurrentUserRoute, async (c) => {
+  const authHeader = c.req.header('Authorization');
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return c.json({ error: 'Unauthorized' }, 401);
   }
 
-  const body = await c.req.json();
-  const validated = ChangePasswordRequestSchema.parse(body);
+  const token = authHeader.substring(7);
 
   try {
+    const payload = await authService.verifyToken(token);
+    
+    const dbUser = await authService.getUserById(payload.userId);
+    
+    if (!dbUser) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    logger.debug('Current user fetched', { userId: payload.userId });
+
+    return c.json({
+      id: dbUser.id,
+      email: dbUser.email,
+      firstName: dbUser.first_name || undefined,
+      lastName: dbUser.last_name || undefined,
+      phone: dbUser.phone || undefined,
+      organizationId: dbUser.organization_id,
+      role: dbUser.role,
+    });
+  } catch (error) {
+    logger.error('Get current user error', { error });
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+});
+
+app.openapi(changePasswordRoute, async (c) => {
+  const authHeader = c.req.header('Authorization');
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    const payload = await authService.verifyToken(token);
+    
+    const body = await c.req.json();
+    const validated = ChangePasswordRequestSchema.parse(body);
+
     await authService.changePassword(
-      user.userId,
+      payload.userId,
       validated.currentPassword,
       validated.newPassword
     );
 
-    logger.info('Password changed', { userId: user.userId });
+    logger.info('Password changed', { userId: payload.userId });
 
     return c.json({ message: 'Password changed successfully' });
   } catch (error: any) {
-    logger.error('Password change error', { error, userId: user.userId });
+    logger.error('Password change error', { error });
     
     if (error.message === 'Current password is incorrect') {
       return c.json({ error: 'Current password is incorrect' }, 400);
+    }
+    
+    if (error.message === 'Invalid token' || error.message === 'Token expired') {
+      return c.json({ error: 'Unauthorized' }, 401);
     }
     
     return c.json({ error: 'Failed to change password' }, 500);

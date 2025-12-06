@@ -1,0 +1,24 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: luma-db-migration
+  namespace: dev
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: migrate
+        image: ghcr.io/ctrl-luma/luma-api:dev  # Use your latest image
+        command: ["sh", "-c"]
+        args:
+          - |
+            echo "Running database migrations..."
+            npm run db:migrate
+        envFrom:
+        - secretRef:
+            name: luma-api-env
+      initContainers:
+      - name: wait-for-db
+        image: busybox:1.28
+        command: ['sh', '-c', 'until nc -z postgres-service 5432; do echo waiting for postgres; sleep 2; done;']

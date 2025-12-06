@@ -1,5 +1,5 @@
 -- Create custom plan requests table
-CREATE TABLE custom_plan_requests (
+CREATE TABLE IF NOT EXISTS custom_plan_requests (
   id SERIAL PRIMARY KEY,
   user_id UUID NOT NULL REFERENCES users(id),
   organization_id UUID NOT NULL REFERENCES organizations(id),
@@ -18,13 +18,17 @@ CREATE TABLE custom_plan_requests (
 );
 
 -- Add indexes
-CREATE INDEX idx_custom_plan_requests_user_id ON custom_plan_requests(user_id);
-CREATE INDEX idx_custom_plan_requests_organization_id ON custom_plan_requests(organization_id);
-CREATE INDEX idx_custom_plan_requests_status ON custom_plan_requests(status);
-CREATE INDEX idx_custom_plan_requests_created_at ON custom_plan_requests(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_custom_plan_requests_user_id ON custom_plan_requests(user_id);
+CREATE INDEX IF NOT EXISTS idx_custom_plan_requests_organization_id ON custom_plan_requests(organization_id);
+CREATE INDEX IF NOT EXISTS idx_custom_plan_requests_status ON custom_plan_requests(status);
+CREATE INDEX IF NOT EXISTS idx_custom_plan_requests_created_at ON custom_plan_requests(created_at DESC);
 
 -- Add trigger to update updated_at
-CREATE TRIGGER update_custom_plan_requests_updated_at
-  BEFORE UPDATE ON custom_plan_requests
-  FOR EACH ROW
-  EXECUTE FUNCTION update_updated_at_column();
+DO $$ BEGIN
+    CREATE TRIGGER update_custom_plan_requests_updated_at
+      BEFORE UPDATE ON custom_plan_requests
+      FOR EACH ROW
+      EXECUTE FUNCTION update_updated_at_column();
+EXCEPTION
+    WHEN duplicate_object THEN null;
+END $$;

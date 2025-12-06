@@ -8,14 +8,24 @@ import { config } from './config';
 import { errorHandler } from './middleware/error-handler';
 import { requestId } from './middleware/request-id';
 import { testConnection } from './db';
+import { initializeDatabase } from './db/migrate';
 import { logger as winstonLogger } from './utils/logger';
 import { redisService } from './services/redis';
 import { registerAllWorkers } from './services/queue/workers';
 import authRoutes from './routes/auth';
+import organizationRoutes from './routes/organizations';
 import stripeWebhookRoutes from './routes/stripe/webhooks';
 import stripeConnectWebhookRoutes from './routes/stripe/connect-webhooks';
 
 const app = new OpenAPIHono();
+
+// Register security scheme
+app.openAPIRegistry.registerComponent('securitySchemes', 'bearerAuth', {
+  type: 'http',
+  scheme: 'bearer',
+  bearerFormat: 'JWT',
+  description: 'JWT Authorization header using the Bearer scheme',
+});
 
 app.use('*', logger());
 app.use('*', requestId());
@@ -66,6 +76,7 @@ app.get('/swagger', swaggerUI({ url: '/openapi.json' }));
 
 // Mount routes
 app.route('/', authRoutes);
+app.route('/', organizationRoutes);
 app.route('/', stripeWebhookRoutes);
 app.route('/', stripeConnectWebhookRoutes);
 
@@ -76,6 +87,7 @@ const port = config.server.port;
 async function startServer() {
   try {
     await testConnection();
+    await initializeDatabase();
     await redisService.connect();
     registerAllWorkers();
     
