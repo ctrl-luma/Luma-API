@@ -63,3 +63,8 @@ The API follows a modular architecture:
 - `/src/middleware` - Express middleware
 - `/src/utils` - Utility functions
 - `/src/types` - TypeScript type definitions
+
+
+TO clear redis cache
+ docker exec -it luma_redis redis-cli FLUSHALL
+ 

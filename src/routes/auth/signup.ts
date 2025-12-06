@@ -55,6 +55,7 @@ const SignupResponseSchema = z.object({
   stripeOnboardingUrl: z.string().optional(),
   stripeCheckoutUrl: z.string().optional(),
   customPlanRequested: z.boolean().optional(),
+  paymentIntentClientSecret: z.string().optional(),
 });
 
 const signupRoute = createRoute({
@@ -94,17 +95,52 @@ app.openapi(signupRoute, async (c) => {
   const validated = SignupRequestSchema.parse(body);
 
   if (!validated.acceptTerms || !validated.acceptPrivacy) {
-    return c.json({ error: 'Must accept terms and privacy policy' }, 400);
+    return c.json({ 
+      error: 'TERMS_NOT_ACCEPTED',
+      message: 'You must accept the terms of service and privacy policy to create an account' 
+    }, 400);
   }
 
   const normalizedEmail = normalizeEmail(validated.email);
   
   try {
+    // Check if user already exists in database
     const existingUser = await authService.getUserByEmail(normalizedEmail);
     if (existingUser) {
-      return c.json({ error: 'Email already exists' }, 409);
+      logger.info('Signup attempt with existing email - found in database', { 
+        email: normalizedEmail,
+        userId: existingUser.id,
+        organizationId: existingUser.organization_id,
+        createdAt: existingUser.created_at,
+        cognitoUserId: existingUser.cognito_user_id
+      });
+      return c.json({ 
+        error: 'EMAIL_EXISTS',
+        message: 'An account with this email address already exists. Please sign in or use a different email.'
+      }, 409);
+    }
+    
+    // Check if user exists in Cognito
+    if (cognitoService) {
+      try {
+        const cognitoUser = await cognitoService.getUser(normalizedEmail);
+        if (cognitoUser) {
+          logger.info('Email exists in Cognito but not in database', { email: normalizedEmail });
+          return c.json({ 
+            error: 'EMAIL_EXISTS_COGNITO',
+            message: 'An account with this email exists but is not fully set up. Please contact support.'
+          }, 409);
+        }
+      } catch (error: any) {
+        // User not found in Cognito is expected, continue
+        if (error.name !== 'UserNotFoundException') {
+          logger.error('Error checking Cognito user', error);
+        }
+      }
     }
 
+    let paymentIntentClientSecret: string | undefined;
+    
     const result = await transaction(async (client) => {
       // 1. Create organization
       const orgResult = await client.query(
@@ -153,16 +189,16 @@ app.openapi(signupRoute, async (c) => {
       let cognitoUserId: string | undefined;
       if (cognitoService) {
         try {
+          // Format phone number for Cognito (E.164 format)
+          const formattedPhone = validated.phone ? `+1${validated.phone.replace(/\D/g, '')}` : undefined;
+          
           const cognitoUser = await cognitoService.createUser({
             email: normalizedEmail,
             temporaryPassword: validated.password,
             attributes: {
-              'custom:user_id': user.id,
-              'custom:organization_id': organization.id,
-              'custom:role': DB_ROLES.OWNER,
               'given_name': validated.firstName,
               'family_name': validated.lastName,
-              ...(validated.phone && { phone_number: validated.phone }),
+              ...(formattedPhone && { phone_number: formattedPhone }),
             },
           });
 
@@ -179,7 +215,12 @@ app.openapi(signupRoute, async (c) => {
           );
           user.cognito_user_id = cognitoUserId;
         } catch (error) {
-          logger.error('Failed to create Cognito user', error);
+          logger.error('Failed to create Cognito user', { 
+            error,
+            email: normalizedEmail,
+            errorName: (error as any)?.name,
+            errorMessage: (error as any)?.message 
+          });
           throw new Error('Failed to create authentication account');
         }
       }
@@ -191,9 +232,35 @@ app.openapi(signupRoute, async (c) => {
       let subscriptionStatus = 'active';
       let stripeSubscriptionId = null;
       
-      // For pro tier, status will be pending until payment
-      if (validated.subscriptionTier === 'pro') {
+      // For pro tier, create incomplete subscription
+      if (validated.subscriptionTier === 'pro' && config.stripe.proPriceId) {
+        const stripeSubscription = await stripeService.createSubscription({
+          customer: stripeCustomer.id,
+          items: [{ price: config.stripe.proPriceId }],
+          payment_behavior: 'default_incomplete',
+          expand: ['latest_invoice.payment_intent'],
+          metadata: {
+            user_id: user.id,
+            organization_id: organization.id,
+          },
+        });
+        
+        stripeSubscriptionId = stripeSubscription.id;
         subscriptionStatus = 'pending_payment';
+        
+        // Get the client secret for the payment
+        const clientSecret = await stripeService.getSubscriptionPaymentIntent(stripeSubscriptionId);
+        if (clientSecret) {
+          paymentIntentClientSecret = clientSecret;
+          logger.info('Payment intent client secret retrieved', {
+            subscriptionId: stripeSubscriptionId
+          });
+        } else {
+          logger.error('Failed to get payment intent client secret', {
+            subscriptionId: stripeSubscriptionId,
+            subscriptionStatus: stripeSubscription.status
+          });
+        }
       } else if (validated.subscriptionTier === 'enterprise') {
         subscriptionStatus = 'pending_approval';
       }
@@ -220,30 +287,8 @@ app.openapi(signupRoute, async (c) => {
       const subscription = subscriptionResult.rows[0];
 
       // 6. Handle tier-specific flows
-      let stripeAccountId = null;
-      
-      // Only create Stripe Connect account for starter tier (immediate onboarding)
-      if (validated.subscriptionTier === 'starter') {
-        const stripeAccount = await stripeService.createConnectedAccount({
-          type: 'express',
-          email: validated.email,
-          business_type: 'company',
-          metadata: {
-            organization_id: organization.id,
-            user_id: user.id,
-          },
-        });
-        stripeAccountId = stripeAccount.id;
-      }
-
-      // Update organization with Stripe account ID if created
-      if (stripeAccountId) {
-        await client.query(
-          `UPDATE organizations SET stripe_account_id = $1 WHERE id = $2`,
-          [stripeAccountId, organization.id]
-        );
-        organization.stripe_account_id = stripeAccountId;
-      }
+      // Note: Stripe Connect account creation has been disabled
+      // If you need Connect accounts, enable Stripe Connect in your Stripe Dashboard first
       
       // 7. Handle custom plan request
       if (validated.subscriptionTier === 'enterprise') {
@@ -263,40 +308,16 @@ app.openapi(signupRoute, async (c) => {
         );
       }
 
-      return { user, organization, subscription };
+      return { user, organization, subscription, paymentIntentClientSecret };
     });
 
-    // 8. Generate auth tokens
-    const tokens = await authService.generateTokens(result.user);
+    // 8. Authenticate user with Cognito to get tokens
+    const tokens = await authService.login(normalizedEmail, validated.password);
 
     // 9. Generate appropriate URLs based on tier
-    let stripeOnboardingUrl: string | undefined;
-    let stripeCheckoutUrl: string | undefined;
     let customPlanRequested = false;
     
-    if (validated.subscriptionTier === 'starter') {
-      // Generate Stripe Connect onboarding link for starter
-      const accountLink = await stripeService.createAccountLink(
-        result.organization.stripe_account_id!,
-        `${config.frontend.url}/onboarding/refresh`,
-        `${config.frontend.url}/onboarding/complete`
-      );
-      stripeOnboardingUrl = accountLink.url;
-    } else if (validated.subscriptionTier === 'pro' && config.stripe.proPriceId) {
-      // Create checkout session for Pro tier
-      const checkoutSession = await stripeService.createCheckoutSession({
-        customer: result.user.stripe_customer_id!,
-        price: config.stripe.proPriceId,
-        successUrl: `${config.frontend.url}/subscription/success?session_id={CHECKOUT_SESSION_ID}`,
-        cancelUrl: `${config.frontend.url}/subscription/cancel`,
-        metadata: {
-          user_id: result.user.id,
-          organization_id: result.organization.id,
-          subscription_id: result.subscription.id,
-        },
-      });
-      stripeCheckoutUrl = checkoutSession.url || undefined;
-    } else if (validated.subscriptionTier === 'enterprise') {
+    if (validated.subscriptionTier === 'enterprise') {
       customPlanRequested = true;
     }
 
@@ -339,21 +360,79 @@ app.openapi(signupRoute, async (c) => {
         trialEndsAt: result.subscription.trial_end?.toISOString() || null,
       },
       tokens,
-      ...(stripeOnboardingUrl && { stripeOnboardingUrl }),
-      ...(stripeCheckoutUrl && { stripeCheckoutUrl }),
+      ...(paymentIntentClientSecret && { paymentIntentClientSecret }),
       ...(customPlanRequested && { customPlanRequested }),
     }, 201);
 
   } catch (error: any) {
-    logger.error('Signup error', { error, email: validated.email });
+    logger.error('Signup error', { 
+      error: {
+        message: error.message,
+        code: error.code,
+        detail: error.detail,
+        hint: error.hint,
+        position: error.position,
+        routine: error.routine,
+        file: error.file,
+        line: error.line,
+        stack: error.stack
+      },
+      email: validated.email 
+    });
     
-    if (error.message.includes('already exists')) {
-      return c.json({ error: 'Email already exists' }, 409);
+    // PostgreSQL error codes
+    if (error.code === '42703') {
+      return c.json({ 
+        error: 'DATABASE_SCHEMA_ERROR',
+        message: 'The database schema is not properly set up. Please contact support.',
+        details: 'Missing column: ' + (error.message.match(/column "(\w+)"/) || [])[1]
+      }, 500);
+    }
+    
+    if (error.code === '23505') {
+      const detail = error.detail || '';
+      if (detail.includes('email')) {
+        return c.json({ 
+          error: 'EMAIL_EXISTS',
+          message: 'An account with this email address already exists.'
+        }, 409);
+      } else if (detail.includes('stripe_customer_id')) {
+        return c.json({ 
+          error: 'STRIPE_CUSTOMER_EXISTS',
+          message: 'This Stripe customer ID is already associated with another account.'
+        }, 409);
+      }
+      return c.json({ 
+        error: 'DUPLICATE_ENTRY',
+        message: 'A unique constraint was violated. Please try again.'
+      }, 409);
+    }
+    
+    if (error.message && error.message.includes('already exists')) {
+      return c.json({ 
+        error: 'EMAIL_EXISTS',
+        message: 'An account with this email address already exists.'
+      }, 409);
+    }
+    
+    if (error.message && error.message.includes('Failed to create authentication account')) {
+      return c.json({ 
+        error: 'COGNITO_ERROR',
+        message: 'Failed to create authentication account. Please try again later.'
+      }, 500);
+    }
+    
+    if (error.name === 'InvalidParameterException') {
+      return c.json({ 
+        error: 'INVALID_INPUT',
+        message: error.message || 'Invalid input parameters provided.'
+      }, 400);
     }
     
     return c.json({ 
-      error: 'Failed to create account',
-      message: error.message 
+      error: 'SIGNUP_FAILED',
+      message: 'An unexpected error occurred during signup. Please try again.',
+      ...(process.env.NODE_ENV === 'development' && { debug: error.message })
     }, 500);
   }
 });

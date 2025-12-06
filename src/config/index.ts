@@ -1,14 +1,8 @@
 import dotenv from 'dotenv';
 import { z } from 'zod';
-import { existsSync } from 'fs';
 
-// Load environment-specific .env file
-const envFile = `.env.${process.env.NODE_ENV || 'local'}`;
-if (existsSync(envFile)) {
-  dotenv.config({ path: envFile });
-} else {
-  dotenv.config({ path: '.env.local' });
-}
+// Load .env file
+dotenv.config({ path: '.env' });
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'local']).default('development'),

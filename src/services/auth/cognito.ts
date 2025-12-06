@@ -18,6 +18,7 @@ import {
   MessageActionType,
 } from '@aws-sdk/client-cognito-identity-provider';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
+import { createHmac } from 'crypto';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
 
@@ -35,6 +36,7 @@ export class CognitoService {
   private client: CognitoIdentityProviderClient;
   private userPoolId: string;
   private clientId: string;
+  private clientSecret: string;
   private idTokenVerifier: any;
   private accessTokenVerifier: any;
 
@@ -45,6 +47,7 @@ export class CognitoService {
 
     this.userPoolId = config.aws.cognito.userPoolId || '';
     this.clientId = config.aws.cognito.clientId || '';
+    this.clientSecret = config.aws.cognito.clientSecret || '';
 
     if (this.userPoolId && this.clientId) {
       this.idTokenVerifier = CognitoJwtVerifier.create({
@@ -59,6 +62,13 @@ export class CognitoService {
         clientId: this.clientId,
       });
     }
+  }
+
+  private calculateSecretHash(username: string): string {
+    const message = username + this.clientId;
+    const hmac = createHmac('sha256', this.clientSecret);
+    hmac.update(message);
+    return hmac.digest('base64');
   }
 
   async createUser(params: {
@@ -185,13 +195,16 @@ export class CognitoService {
 
   async authenticateUser(username: string, password: string) {
     try {
+      const secretHash = this.calculateSecretHash(username);
+      
       const command = new AdminInitiateAuthCommand({
         UserPoolId: this.userPoolId,
         ClientId: this.clientId,
-        AuthFlow: 'ADMIN_NO_SRP_AUTH',
+        AuthFlow: 'ADMIN_USER_PASSWORD_AUTH',
         AuthParameters: {
           USERNAME: username,
           PASSWORD: password,
+          SECRET_HASH: secretHash,
         },
       });
 
@@ -223,6 +236,8 @@ export class CognitoService {
     session: string
   ) {
     try {
+      const secretHash = this.calculateSecretHash(username);
+      
       const command = new AdminRespondToAuthChallengeCommand({
         UserPoolId: this.userPoolId,
         ClientId: this.clientId,
@@ -230,6 +245,7 @@ export class CognitoService {
         ChallengeResponses: {
           USERNAME: username,
           NEW_PASSWORD: newPassword,
+          SECRET_HASH: secretHash,
         },
         Session: session,
       });
@@ -250,6 +266,8 @@ export class CognitoService {
 
   async refreshTokens(refreshToken: string) {
     try {
+      // For refresh token flow, we don't have the username, so we can't calculate SECRET_HASH
+      // This is a limitation of Cognito when using client secret with refresh tokens
       const command = new AdminInitiateAuthCommand({
         UserPoolId: this.userPoolId,
         ClientId: this.clientId,

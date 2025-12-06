@@ -314,9 +314,9 @@ async function handleCheckoutSessionCompleted(session: any) {
 
     // Determine tier from price ID (you'll need to map your Stripe price IDs)
     let tier: 'starter' | 'pro' | 'enterprise' = 'starter';
-    if (priceId === process.env.STRIPE_PRICE_PRO) {
+    if (priceId === config.stripe.proPriceId) {
       tier = 'pro';
-    } else if (priceId === process.env.STRIPE_PRICE_ENTERPRISE) {
+    } else if (priceId === config.stripe.enterprisePriceId) {
       tier = 'enterprise';
     }
 

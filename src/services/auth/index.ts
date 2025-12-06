@@ -63,9 +63,6 @@ export class AuthService {
           email: params.email,
           temporaryPassword: params.password,
           attributes: {
-            'custom:user_id': user.id,
-            'custom:organization_id': user.organization_id,
-            'custom:role': user.role,
             'given_name': params.firstName || '',
             'family_name': params.lastName || '',
           },
@@ -151,11 +148,17 @@ export class AuthService {
       try {
         const cognitoPayload = await cognitoService.verifyIdToken(token);
         
+        // Get user data from database
+        const user = await this.getUserByEmail(cognitoPayload.email);
+        if (!user) {
+          throw new Error('User not found');
+        }
+        
         return {
-          userId: cognitoPayload['custom:user_id'],
+          userId: user.id,
           email: cognitoPayload.email,
-          organizationId: cognitoPayload['custom:organization_id'],
-          role: cognitoPayload['custom:role'],
+          organizationId: user.organization_id,
+          role: user.role,
           type: 'access',
         };
       } catch (error) {
@@ -237,8 +240,15 @@ export class AuthService {
 
   async getUserByEmail(email: string): Promise<User | null> {
     const normalized = normalizeEmail(email);
+    
+    logger.info('Checking for user by email', { 
+      originalEmail: email,
+      normalizedEmail: normalized 
+    });
+    
     const cached = await cacheService.get<User>(CacheKeys.userByEmail(normalized));
     if (cached) {
+      logger.info('User found in cache', { email: normalized, userId: cached.id });
       return cached;
     }
 
@@ -246,6 +256,12 @@ export class AuthService {
       `SELECT * FROM users WHERE email = $1`,
       [normalized]
     );
+    
+    logger.info('Database query result', { 
+      email: normalized,
+      found: result.length > 0,
+      resultCount: result.length 
+    });
 
     if (result.length === 0) {
       return null;
@@ -255,6 +271,34 @@ export class AuthService {
     await cacheService.set(CacheKeys.userByEmail(normalized), user, { ttl: 3600 });
 
     return user;
+  }
+
+  async isEmailInUse(email: string): Promise<boolean> {
+    const normalized = normalizeEmail(email);
+    
+    // Check local database first
+    const user = await this.getUserByEmail(normalized);
+    if (user) {
+      return true;
+    }
+
+    // Check Cognito if configured
+    if (config.aws.cognito.userPoolId) {
+      try {
+        // Use filter to search for the email
+        const cognitoUser = await cognitoService.getUser(normalized);
+        return cognitoUser !== null;
+      } catch (error: any) {
+        // If user not found, that's what we expect
+        if (error.name === 'UserNotFoundException') {
+          return false;
+        }
+        logger.error('Failed to check email in Cognito', error);
+        // Fall back to database check only
+      }
+    }
+
+    return false;
   }
 
   private async updateLastLogin(userId: string): Promise<void> {

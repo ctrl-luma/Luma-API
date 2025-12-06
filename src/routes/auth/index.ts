@@ -95,6 +95,64 @@ const RefreshTokenRequestSchema = z.object({
   refreshToken: z.string(),
 });
 
+const EmailCheckRequestSchema = z.object({
+  email: z.string().email(),
+});
+
+const EmailCheckResponseSchema = z.object({
+  inUse: z.boolean(),
+});
+
+const checkEmailRoute = createRoute({
+  method: 'post',
+  path: '/auth/check-email',
+  summary: 'Check if email is already in use',
+  tags: ['Authentication'],
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: EmailCheckRequestSchema,
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Email check result',
+      content: {
+        'application/json': {
+          schema: EmailCheckResponseSchema,
+        },
+      },
+    },
+    500: {
+      description: 'Internal server error',
+      content: {
+        'application/json': {
+          schema: z.object({
+            error: z.string(),
+          }),
+        },
+      },
+    },
+  },
+});
+
+app.openapi(checkEmailRoute, async (c) => {
+  const body = await c.req.json();
+  const validated = EmailCheckRequestSchema.parse(body);
+
+  try {
+    const inUse = await authService.isEmailInUse(validated.email);
+    
+    return c.json({ inUse }, 200);
+  } catch (error) {
+    logger.error('Email check error', error);
+    return c.json({ error: 'Email check failed' }, 500);
+  }
+});
+
 const refreshRoute = createRoute({
   method: 'post',
   path: '/auth/refresh',

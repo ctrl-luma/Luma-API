@@ -19,9 +19,15 @@ const app = new OpenAPIHono();
 
 app.use('*', logger());
 app.use('*', requestId());
+// Debug CORS
+const corsOrigins = config.cors.origin.split(',').map(origin => origin.trim());
+winstonLogger.info('CORS Origins configured:', corsOrigins);
+
 app.use('*', cors({
-  origin: config.cors.origin.split(','),
+  origin: corsOrigins,
   credentials: true,
+  allowHeaders: ['Content-Type', 'Authorization'],
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
 }));
 app.use('*', prettyJSON());
 

@@ -8,6 +8,8 @@ CREATE TYPE event_status AS ENUM ('draft', 'active', 'completed', 'cancelled');
 CREATE TYPE transaction_status AS ENUM ('pending', 'processing', 'completed', 'failed', 'refunded');
 CREATE TYPE payout_status AS ENUM ('pending', 'processing', 'paid', 'failed');
 CREATE TYPE payment_method AS ENUM ('card', 'cash', 'tap_to_pay');
+CREATE TYPE subscription_status AS ENUM ('trialing', 'active', 'canceled', 'past_due', 'incomplete', 'incomplete_expired', 'pending_payment', 'pending_approval');
+CREATE TYPE subscription_tier AS ENUM ('starter', 'pro', 'enterprise');
 
 -- Organizations table
 CREATE TABLE organizations (
@@ -29,7 +31,11 @@ CREATE TABLE users (
     last_name VARCHAR(100),
     password_hash VARCHAR(255),
     organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE,
-    role user_role NOT NULL DEFAULT 'bartender',
+    role user_role NOT NULL DEFAULT 'user',
+    cognito_user_id VARCHAR(255) UNIQUE,
+    stripe_customer_id VARCHAR(255) UNIQUE,
+    terms_accepted_at TIMESTAMP WITH TIME ZONE,
+    privacy_accepted_at TIMESTAMP WITH TIME ZONE,
     is_active BOOLEAN DEFAULT TRUE,
     last_login TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
@@ -39,6 +45,8 @@ CREATE TABLE users (
 -- Create indexes for users
 CREATE INDEX idx_users_email ON users(email);
 CREATE INDEX idx_users_organization ON users(organization_id);
+CREATE INDEX idx_users_cognito ON users(cognito_user_id);
+CREATE INDEX idx_users_stripe_customer ON users(stripe_customer_id);
 
 -- Events table
 CREATE TABLE events (
@@ -202,6 +210,56 @@ CREATE INDEX idx_audit_logs_user ON audit_logs(user_id);
 CREATE INDEX idx_audit_logs_entity ON audit_logs(entity_type, entity_id);
 CREATE INDEX idx_audit_logs_created_at ON audit_logs(created_at);
 
+-- Subscriptions table
+CREATE TABLE subscriptions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    stripe_subscription_id VARCHAR(255) UNIQUE,
+    stripe_customer_id VARCHAR(255),
+    tier subscription_tier NOT NULL DEFAULT 'starter',
+    status subscription_status NOT NULL DEFAULT 'active',
+    current_period_start TIMESTAMP WITH TIME ZONE,
+    current_period_end TIMESTAMP WITH TIME ZONE,
+    trial_start TIMESTAMP WITH TIME ZONE,
+    trial_end TIMESTAMP WITH TIME ZONE,
+    cancel_at TIMESTAMP WITH TIME ZONE,
+    canceled_at TIMESTAMP WITH TIME ZONE,
+    monthly_price DECIMAL(10, 2),
+    transaction_fee_rate DECIMAL(5, 4),
+    features JSONB DEFAULT '{}',
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create indexes for subscriptions
+CREATE INDEX idx_subscriptions_user ON subscriptions(user_id);
+CREATE INDEX idx_subscriptions_organization ON subscriptions(organization_id);
+CREATE INDEX idx_subscriptions_stripe_subscription ON subscriptions(stripe_subscription_id);
+CREATE INDEX idx_subscriptions_status ON subscriptions(status);
+CREATE INDEX idx_subscriptions_tier ON subscriptions(tier);
+
+-- Custom plan requests table
+CREATE TABLE custom_plan_requests (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    business_description TEXT,
+    expected_volume TEXT,
+    use_case TEXT,
+    additional_requirements TEXT,
+    status VARCHAR(50) DEFAULT 'pending',
+    admin_notes TEXT,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create indexes for custom plan requests
+CREATE INDEX idx_custom_plan_requests_user ON custom_plan_requests(user_id);
+CREATE INDEX idx_custom_plan_requests_organization ON custom_plan_requests(organization_id);
+CREATE INDEX idx_custom_plan_requests_status ON custom_plan_requests(status);
+
 -- Create updated_at trigger function
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
@@ -231,4 +289,10 @@ CREATE TRIGGER update_orders_updated_at BEFORE UPDATE ON orders
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER update_payouts_updated_at BEFORE UPDATE ON payouts
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_subscriptions_updated_at BEFORE UPDATE ON subscriptions
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_custom_plan_requests_updated_at BEFORE UPDATE ON custom_plan_requests
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
