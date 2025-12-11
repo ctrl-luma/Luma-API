@@ -1,7 +1,7 @@
 import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
 import { z } from 'zod';
 import { authService } from '../../services/auth';
-import { stripeService } from '../../services/stripe';
+import { stripeService, stripe } from '../../services/stripe';
 import { cognitoService } from '../../services/auth/cognito';
 import { query, transaction } from '../../db';
 import { logger } from '../../utils/logger';
@@ -9,6 +9,10 @@ import { normalizeEmail } from '../../utils/email';
 import { DEFAULT_FEATURES_BY_TIER, PRICING_BY_TIER } from '../../db/models/subscription';
 import { DB_ROLES, mapDbRoleToCognitoGroup } from '../../constants/auth';
 import { config } from '../../config';
+// sendWelcomeEmail is now sent via queue - import kept for reference
+// import { sendWelcomeEmail } from '../../services/email/template-sender';
+import { queueService, QueueName } from '../../services/queue';
+import Stripe from 'stripe';
 
 const app = new OpenAPIHono();
 
@@ -56,6 +60,7 @@ const SignupResponseSchema = z.object({
   stripeCheckoutUrl: z.string().optional(),
   customPlanRequested: z.boolean().optional(),
   paymentIntentClientSecret: z.string().optional(),
+  stripeSubscriptionId: z.string().optional(),
 });
 
 const signupRoute = createRoute({
@@ -169,8 +174,9 @@ app.openapi(signupRoute, async (c) => {
         `INSERT INTO users (
           email, password_hash, first_name, last_name, phone,
           organization_id, role, stripe_customer_id,
-          terms_accepted_at, privacy_accepted_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+          terms_accepted_at, privacy_accepted_at,
+          email_alerts, marketing_emails, weekly_reports
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW(), $9, $10, $11)
         RETURNING *`,
         [
           normalizedEmail,
@@ -181,6 +187,9 @@ app.openapi(signupRoute, async (c) => {
           organization.id,
           DB_ROLES.OWNER,
           stripeCustomer.id,
+          true, // email_alerts: true
+          true, // marketing_emails: true  
+          true, // weekly_reports: true
         ]
       );
       const user = userResult.rows[0];
@@ -232,33 +241,31 @@ app.openapi(signupRoute, async (c) => {
       let subscriptionStatus = 'active';
       let stripeSubscriptionId = null;
       
-      // For pro tier, create incomplete subscription
+      // For pro tier, create subscription with immediate payment
       if (validated.subscriptionTier === 'pro' && config.stripe.proPriceId) {
-        const stripeSubscription = await stripeService.createSubscription({
+        // Create subscription - this will create an invoice with a payment intent
+        const subscription = await stripe.subscriptions.create({
           customer: stripeCustomer.id,
           items: [{ price: config.stripe.proPriceId }],
           payment_behavior: 'default_incomplete',
-          expand: ['latest_invoice.payment_intent'],
-          metadata: {
-            user_id: user.id,
-            organization_id: organization.id,
+          payment_settings: {
+            save_default_payment_method: 'on_subscription',
           },
+          expand: ['latest_invoice.confirmation_secret'],
         });
         
-        stripeSubscriptionId = stripeSubscription.id;
-        subscriptionStatus = 'pending_payment';
+        stripeSubscriptionId = subscription.id;
+        subscriptionStatus = subscription.status || 'incomplete';
         
-        // Get the client secret for the payment
-        const clientSecret = await stripeService.getSubscriptionPaymentIntent(stripeSubscriptionId);
-        if (clientSecret) {
-          paymentIntentClientSecret = clientSecret;
-          logger.info('Payment intent client secret retrieved', {
-            subscriptionId: stripeSubscriptionId
-          });
+        // Get the client secret from the invoice's confirmation_secret (new Stripe pattern)
+        const invoice = subscription.latest_invoice as Stripe.Invoice;
+        
+        if (invoice && (invoice as any).confirmation_secret?.client_secret) {
+          paymentIntentClientSecret = (invoice as any).confirmation_secret.client_secret;
         } else {
-          logger.error('Failed to get payment intent client secret', {
-            subscriptionId: stripeSubscriptionId,
-            subscriptionStatus: stripeSubscription.status
+          logger.error('No confirmation secret found on subscription invoice', {
+            subscriptionId: subscription.id,
+            invoiceId: invoice?.id
           });
         }
       } else if (validated.subscriptionTier === 'enterprise') {
@@ -269,8 +276,9 @@ app.openapi(signupRoute, async (c) => {
         `INSERT INTO subscriptions (
           user_id, organization_id, stripe_customer_id,
           tier, status, stripe_subscription_id,
-          monthly_price, transaction_fee_rate, features
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          monthly_price, transaction_fee_rate, features,
+          metadata
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         RETURNING *`,
         [
           user.id,
@@ -282,6 +290,7 @@ app.openapi(signupRoute, async (c) => {
           pricing.monthly_price,
           pricing.transaction_fee_rate,
           features,
+          validated.subscriptionTier === 'pro' ? { price_id: config.stripe.proPriceId } : {},
         ]
       );
       const subscription = subscriptionResult.rows[0];
@@ -308,8 +317,9 @@ app.openapi(signupRoute, async (c) => {
         );
       }
 
-      return { user, organization, subscription, paymentIntentClientSecret };
+      return { user, organization, subscription, stripeSubscriptionId, paymentIntentClientSecret };
     });
+
 
     // 8. Authenticate user with Cognito to get tokens
     const tokens = await authService.login(normalizedEmail, validated.password);
@@ -341,7 +351,63 @@ app.openapi(signupRoute, async (c) => {
       email: validated.email,
     });
 
-    return c.json({
+    // Send welcome email asynchronously
+    try {
+      logger.info('Attempting to queue welcome email', {
+        userId: result.user.id,
+        email: result.user.email,
+        firstName: result.user.first_name,
+        organizationName: result.organization.name,
+        subscriptionTier: result.subscription.tier,
+        queueServiceExists: !!queueService,
+      });
+
+      const jobData = {
+        type: 'welcome' as const,
+        to: result.user.email,
+        data: {
+          firstName: result.user.first_name,
+          organizationName: result.organization.name,
+          subscriptionTier: result.subscription.tier,
+        },
+      };
+
+      logger.info('Email job data prepared', {
+        jobData,
+        queueName: QueueName.EMAIL_NOTIFICATIONS,
+      });
+
+      const job = await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, jobData, {
+        attempts: 3,
+        backoff: {
+          type: 'exponential',
+          delay: 2000,
+        },
+      });
+      
+      logger.info('Welcome email queued successfully', {
+        userId: result.user.id,
+        email: result.user.email,
+        jobId: job?.id,
+        jobName: job?.name,
+      });
+    } catch (emailError: any) {
+      // Don't fail the signup if email fails - log and continue
+      logger.error('Failed to queue welcome email', {
+        error: {
+          message: emailError?.message || 'Unknown error',
+          stack: emailError?.stack,
+          name: emailError?.name,
+          code: emailError?.code,
+          details: emailError,
+        },
+        userId: result.user.id,
+        email: result.user.email,
+        queueServiceExists: !!queueService,
+      });
+    }
+
+    const response = {
       user: {
         id: result.user.id,
         email: result.user.email,
@@ -360,9 +426,12 @@ app.openapi(signupRoute, async (c) => {
         trialEndsAt: result.subscription.trial_end?.toISOString() || null,
       },
       tokens,
-      ...(paymentIntentClientSecret && { paymentIntentClientSecret }),
+      ...(result.paymentIntentClientSecret && { paymentIntentClientSecret: result.paymentIntentClientSecret }),
+      ...(result.stripeSubscriptionId && { stripeSubscriptionId: result.stripeSubscriptionId }),
       ...(customPlanRequested && { customPlanRequested }),
-    }, 201);
+    };
+    
+    return c.json(response, 201);
 
   } catch (error: any) {
     logger.error('Signup error', { 

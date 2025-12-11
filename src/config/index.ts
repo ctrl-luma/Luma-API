@@ -16,15 +16,23 @@ const envSchema = z.object({
   REDIS_URL: z.string().default('redis://localhost:6379'),
   
   STRIPE_SECRET_KEY: z.string(),
+  STRIPE_PUBLISHABLE_KEY: z.string(),
   STRIPE_WEBHOOK_SECRET: z.string(),
   STRIPE_CONNECT_WEBHOOK_SECRET: z.string().optional(),
   STRIPE_PRO_PRICE_ID: z.string().optional(),
   STRIPE_ENTERPRISE_PRICE_ID: z.string().optional(),
   
   AWS_REGION: z.string().optional(),
+  AWS_ACCESS_KEY_ID: z.string().optional(),
+  AWS_SECRET_ACCESS_KEY: z.string().optional(),
   COGNITO_USER_POOL_ID: z.string().optional(),
   COGNITO_CLIENT_ID: z.string().optional(),
   COGNITO_CLIENT_SECRET: z.string().optional(),
+  
+  EMAIL_DEFAULT_FROM: z.string().optional(),
+  CONTACT_URL: z.string().optional(),
+  DASHBOARD_URL: z.string().optional(),
+  SITE_URL: z.string().optional(),
   
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly']).default('info'),
   
@@ -58,6 +66,7 @@ export const config = {
   },
   stripe: {
     secretKey: env.STRIPE_SECRET_KEY,
+    publishableKey: env.STRIPE_PUBLISHABLE_KEY,
     webhookSecret: env.STRIPE_WEBHOOK_SECRET,
     connectWebhookSecret: env.STRIPE_CONNECT_WEBHOOK_SECRET,
     proPriceId: env.STRIPE_PRO_PRICE_ID,
@@ -65,11 +74,19 @@ export const config = {
   },
   aws: {
     region: env.AWS_REGION,
+    accessKeyId: env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
     cognito: {
       userPoolId: env.COGNITO_USER_POOL_ID,
       clientId: env.COGNITO_CLIENT_ID,
       clientSecret: env.COGNITO_CLIENT_SECRET,
     },
+  },
+  email: {
+    defaultFrom: env.EMAIL_DEFAULT_FROM,
+    contactUrl: env.CONTACT_URL,
+    dashboardUrl: env.DASHBOARD_URL,
+    siteUrl: env.SITE_URL,
   },
   logging: {
     level: env.LOG_LEVEL,

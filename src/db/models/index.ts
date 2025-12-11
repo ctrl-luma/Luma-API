@@ -23,6 +23,9 @@ export interface User {
   terms_accepted_at: Date | null;
   privacy_accepted_at: Date | null;
   last_login: Date | null;
+  email_alerts: boolean;
+  marketing_emails: boolean;
+  weekly_reports: boolean;
   created_at: Date;
   updated_at: Date;
 }
@@ -165,6 +168,52 @@ export interface AuditLog {
   ip_address: string | null;
   user_agent: string | null;
   created_at: Date;
+}
+
+export type ConnectOnboardingState = 'not_started' | 'incomplete' | 'pending_verification' | 'active' | 'restricted' | 'disabled';
+export type StripeAccountType = 'standard' | 'express' | 'custom';
+
+export interface StripeConnectedAccount {
+  id: string;
+  organization_id: string;
+  stripe_account_id: string;
+  account_type: StripeAccountType;
+
+  // Status / capability snapshot from Stripe
+  charges_enabled: boolean;
+  payouts_enabled: boolean;
+  details_submitted: boolean;
+
+  // Requirements tracking (cached from Stripe)
+  requirements_currently_due: string[];
+  requirements_eventually_due: string[];
+  requirements_past_due: string[];
+  requirements_disabled_reason: string | null;
+
+  // Derived onboarding state for easy UI logic
+  onboarding_state: ConnectOnboardingState;
+
+  // Account profile snapshot (non-sensitive, for display)
+  country: string;
+  default_currency: string;
+  business_type: string | null;
+  business_name: string | null;
+
+  // External payout info (lightweight, display only)
+  external_account_last4: string | null;
+  external_account_bank_name: string | null;
+  external_account_type: string | null;
+
+  // TOS acceptance tracking
+  tos_acceptance_date: Date | null;
+  tos_acceptance_ip: string | null;
+  tos_acceptance_user_agent: string | null;
+
+  // Operational timestamps
+  onboarding_completed_at: Date | null;
+  last_stripe_sync_at: Date | null;
+  created_at: Date;
+  updated_at: Date;
 }
 
 export * from './subscription';

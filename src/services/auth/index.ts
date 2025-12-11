@@ -1,4 +1,5 @@
 import bcrypt from 'bcrypt';
+import crypto from 'crypto';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
 import { query } from '../../db';
@@ -42,8 +43,8 @@ export class AuthService {
     const userResult = await query<User>(
       `INSERT INTO users (
         email, password_hash, first_name, last_name,
-        organization_id, role
-      ) VALUES ($1, $2, $3, $4, $5, $6)
+        organization_id, role, email_alerts, marketing_emails, weekly_reports
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       RETURNING *`,
       [
         params.email,
@@ -51,7 +52,10 @@ export class AuthService {
         params.firstName,
         params.lastName,
         params.organizationId,
-        params.role || 'bartender'
+        params.role || 'bartender',
+        true, // email_alerts
+        true, // marketing_emails
+        true  // weekly_reports
       ]
     );
 
@@ -124,18 +128,35 @@ export class AuthService {
     throw new Error('Local token generation not supported. Please use Cognito.');
   }
 
-  async refreshTokens(refreshToken: string): Promise<AuthTokens> {
+  async refreshTokens(refreshToken: string, username?: string): Promise<AuthTokens> {
+    logger.info('AuthService.refreshTokens called', {
+      hasRefreshToken: !!refreshToken,
+      hasUsername: !!username,
+      username
+    });
+    
     if (config.aws.cognito.userPoolId) {
       try {
-        const cognitoAuth = await cognitoService.refreshTokens(refreshToken);
+        logger.info('Calling cognitoService.refreshTokens...');
+        const cognitoAuth = await cognitoService.refreshTokens(refreshToken, username);
+        
+        logger.info('Cognito refresh successful', {
+          hasIdToken: !!cognitoAuth.idToken,
+          hasAccessToken: !!cognitoAuth.accessToken,
+          expiresIn: cognitoAuth.expiresIn
+        });
         
         return {
           accessToken: cognitoAuth.idToken!,
           refreshToken: refreshToken,
           expiresIn: cognitoAuth.expiresIn!,
         };
-      } catch (error) {
-        logger.error('Failed to refresh Cognito tokens', error);
+      } catch (error: any) {
+        logger.error('Failed to refresh Cognito tokens', {
+          error: error.message || error,
+          errorName: error.name,
+          stack: error.stack
+        });
         throw new Error('Invalid refresh token');
       }
     }
@@ -214,7 +235,44 @@ export class AuthService {
       [userId]
     );
 
+    // Invalidate user cache
+    await cacheService.del(CacheKeys.user(userId));
+    if (user.email) {
+      await cacheService.del(CacheKeys.userByEmail(user.email));
+    }
+
     logger.info('Password changed', { userId });
+  }
+
+  async setNewPassword(userId: string, newPassword: string): Promise<void> {
+    const user = await this.getUserById(userId);
+    if (!user) {
+      throw new Error('User not found');
+    }
+
+    if (config.aws.cognito.userPoolId) {
+      try {
+        await cognitoService.setUserPassword(user.email, newPassword, true);
+      } catch (error: any) {
+        logger.error('Failed to set user password in Cognito', error);
+        throw error;
+      }
+    }
+
+    const newPasswordHash = await bcrypt.hash(newPassword, 10);
+    
+    await query(
+      `UPDATE users SET password_hash = $1 WHERE id = $2`,
+      [newPasswordHash, userId]
+    );
+
+    // Invalidate user cache
+    await cacheService.del(CacheKeys.user(userId));
+    if (user.email) {
+      await cacheService.del(CacheKeys.userByEmail(user.email));
+    }
+
+    logger.info('Password set for user', { userId });
   }
 
   async getUserById(userId: string): Promise<User | null> {
@@ -306,6 +364,118 @@ export class AuthService {
       `UPDATE users SET last_login = NOW() WHERE id = $1`,
       [userId]
     );
+  }
+
+  async createPasswordResetToken(email: string): Promise<string | null> {
+    const normalized = normalizeEmail(email);
+    const user = await this.getUserByEmail(normalized);
+    
+    if (!user) {
+      logger.info('Password reset requested for non-existent email', { email: normalized });
+      return null;
+    }
+
+    // Generate a secure random token
+    const tokenId = crypto.randomUUID();
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+    // Token expires in 10 minutes
+    const expiresAt = new Date();
+    expiresAt.setMinutes(expiresAt.getMinutes() + 10);
+
+    // Store hashed token in database
+    await query(
+      `INSERT INTO password_reset_tokens (id, user_id, token_hash, expires_at)
+       VALUES ($1, $2, $3, $4)`,
+      [tokenId, user.id, tokenHash, expiresAt]
+    );
+
+    logger.info('Password reset token created', { 
+      userId: user.id, 
+      email: normalized,
+      tokenId,
+      expiresAt 
+    });
+
+    // Return the token ID (not the raw token)
+    return tokenId;
+  }
+
+  async validatePasswordResetToken(tokenId: string): Promise<User | null> {
+    try {
+      // Find the token
+      const tokenResult = await query<any>(
+        `SELECT prt.*, u.* 
+         FROM password_reset_tokens prt
+         JOIN users u ON prt.user_id = u.id
+         WHERE prt.id = $1 
+           AND prt.used_at IS NULL 
+           AND prt.expires_at > NOW()`,
+        [tokenId]
+      );
+
+      if (tokenResult.length === 0) {
+        logger.warn('Invalid or expired password reset token', { tokenId });
+        return null;
+      }
+
+      const user = {
+        id: tokenResult[0].user_id,
+        email: tokenResult[0].email,
+        first_name: tokenResult[0].first_name,
+        last_name: tokenResult[0].last_name,
+        organization_id: tokenResult[0].organization_id,
+        role: tokenResult[0].role,
+        is_active: tokenResult[0].is_active,
+        password_hash: tokenResult[0].password_hash,
+        phone: tokenResult[0].phone,
+        created_at: tokenResult[0].created_at,
+        updated_at: tokenResult[0].updated_at,
+        last_login: tokenResult[0].last_login
+      } as User;
+
+      return user;
+    } catch (error) {
+      logger.error('Failed to validate password reset token', { error, tokenId });
+      return null;
+    }
+  }
+
+  async resetPassword(tokenId: string, newPassword: string): Promise<boolean> {
+    try {
+      // Validate token and get user
+      const user = await this.validatePasswordResetToken(tokenId);
+      
+      if (!user) {
+        return false;
+      }
+
+      // Set the new password
+      await this.setNewPassword(user.id, newPassword);
+
+      // Mark token as used
+      await query(
+        `UPDATE password_reset_tokens 
+         SET used_at = NOW() 
+         WHERE id = $1`,
+        [tokenId]
+      );
+
+      // Invalidate all other reset tokens for this user
+      await query(
+        `UPDATE password_reset_tokens 
+         SET used_at = NOW() 
+         WHERE user_id = $1 AND id != $2 AND used_at IS NULL`,
+        [user.id, tokenId]
+      );
+
+      logger.info('Password reset successful', { userId: user.id, tokenId });
+      return true;
+    } catch (error) {
+      logger.error('Failed to reset password', { error, tokenId });
+      return false;
+    }
   }
 }
 

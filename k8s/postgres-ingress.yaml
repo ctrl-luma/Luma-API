@@ -1,0 +1,60 @@
+# PostgreSQL External Access via nginx-ingress TCP Passthrough
+#
+# This method routes through your existing nginx ingress on standard ports:
+#   - db.lumapos.co:5432      -> prod PostgreSQL
+#   - dev.db.lumapos.co:5433  -> dev PostgreSQL
+#
+# =============================================================================
+# INSTALLATION (run these commands in order):
+# =============================================================================
+#
+# 1. Apply the TCP ConfigMap:
+#    kubectl apply -f postgres-ingress.yaml
+#
+# 2. Patch the ingress controller deployment to use TCP ConfigMap and add ports:
+#    (First, check your ingress namespace - it might be 'ingress-nginx' or 'cattle-system')
+#
+#    kubectl get namespaces | grep -E "ingress|nginx"
+#
+#    Then run (replace NAMESPACE with your actual namespace):
+#
+#    kubectl patch deployment ingress-nginx-controller -n NAMESPACE --type=json -p='[
+#      {"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--tcp-services-configmap=ingress-nginx/tcp-services"},
+#      {"op": "add", "path": "/spec/template/spec/containers/0/ports/-", "value": {"containerPort": 5432, "name": "pg-prod", "protocol": "TCP"}},
+#      {"op": "add", "path": "/spec/template/spec/containers/0/ports/-", "value": {"containerPort": 5433, "name": "pg-dev", "protocol": "TCP"}}
+#    ]'
+#
+# 3. Patch the ingress service to expose the ports:
+#
+#    kubectl patch service ingress-nginx-controller -n NAMESPACE --type=json -p='[
+#      {"op": "add", "path": "/spec/ports/-", "value": {"name": "pg-prod", "port": 5432, "targetPort": 5432, "protocol": "TCP"}},
+#      {"op": "add", "path": "/spec/ports/-", "value": {"name": "pg-dev", "port": 5433, "targetPort": 5433, "protocol": "TCP"}}
+#    ]'
+#
+# 4. Verify ports are exposed:
+#    kubectl get svc ingress-nginx-controller -n NAMESPACE
+#
+# =============================================================================
+# ROUTE 53 Configuration:
+# =============================================================================
+#   - db.lumapos.co -> Your server IP (clients connect on port 5432)
+#   - dev.db.lumapos.co -> Your server IP (clients connect on port 5433)
+#
+# =============================================================================
+# CONNECTION STRINGS:
+# =============================================================================
+#   Prod: postgresql://luma:PASSWORD@db.lumapos.co:5432/luma_db
+#   Dev:  postgresql://luma:PASSWORD@dev.db.lumapos.co:5433/luma_db
+#
+# =============================================================================
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tcp-services
+  namespace: ingress-nginx
+data:
+  # External port -> namespace/service:internal-port
+  "5432": "prod/postgres:5432"
+  "5433": "dev/postgres:5432"

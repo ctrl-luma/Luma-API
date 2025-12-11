@@ -3,7 +3,8 @@ import { z } from 'zod';
 import { config } from '../../config';
 import { stripeService } from '../../services/stripe';
 import { logger } from '../../utils/logger';
-import { transaction } from '../../db';
+import { transaction, query } from '../../db';
+import { syncAccountFromStripe } from './connect';
 
 const app = new OpenAPIHono();
 
@@ -98,47 +99,51 @@ app.openapi(connectWebhookRoute, async (c) => {
 });
 
 async function handleAccountUpdated(account: any, connectedAccountId: string | undefined) {
+  const accountId = connectedAccountId || account.id;
+
+  // Find the organization by stripe_account_id
+  const orgRows = await query<{ id: string; name: string }>(
+    'SELECT id, name FROM organizations WHERE stripe_account_id = $1',
+    [accountId]
+  );
+
+  if (orgRows.length === 0) {
+    logger.warn('Organization not found for account update', { accountId });
+    return;
+  }
+
+  const org = orgRows[0];
+
+  // Use the centralized sync function to update all account data
+  await syncAccountFromStripe(account, org.id);
+
+  // Log the audit event
   await transaction(async (client) => {
-    // Update organization's Stripe onboarding status
-    const result = await client.query(
-      `UPDATE organizations 
-       SET stripe_onboarding_completed = $1,
-           updated_at = NOW()
-       WHERE stripe_account_id = $2
-       RETURNING id, name`,
+    await client.query(
+      `INSERT INTO audit_logs (
+        organization_id, action, entity_type, entity_id, changes
+      ) VALUES ($1, $2, $3, $4, $5)`,
       [
-        account.charges_enabled && account.payouts_enabled,
-        connectedAccountId || account.id,
+        org.id,
+        'connect_account.updated',
+        'organization',
+        org.id,
+        {
+          charges_enabled: account.charges_enabled,
+          payouts_enabled: account.payouts_enabled,
+          details_submitted: account.details_submitted,
+          requirements: account.requirements,
+        },
       ]
     );
+  });
 
-    if (result.rows.length > 0) {
-      const org = result.rows[0];
-      
-      await client.query(
-        `INSERT INTO audit_logs (
-          organization_id, action, entity_type, entity_id, changes
-        ) VALUES ($1, $2, $3, $4, $5)`,
-        [
-          org.id,
-          'connect_account.updated',
-          'organization',
-          org.id,
-          {
-            charges_enabled: account.charges_enabled,
-            payouts_enabled: account.payouts_enabled,
-            requirements: account.requirements,
-          },
-        ]
-      );
-
-      logger.info('Connected account updated', {
-        accountId: connectedAccountId || account.id,
-        organizationId: org.id,
-        chargesEnabled: account.charges_enabled,
-        payoutsEnabled: account.payouts_enabled,
-      });
-    }
+  logger.info('Connected account updated via webhook', {
+    accountId,
+    organizationId: org.id,
+    chargesEnabled: account.charges_enabled,
+    payoutsEnabled: account.payouts_enabled,
+    detailsSubmitted: account.details_submitted,
   });
 }
 

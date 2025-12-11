@@ -1,6 +1,7 @@
 import { Job } from 'bullmq';
 import { QueueName, JobData, queueService } from '../index';
 import { logger } from '../../../utils/logger';
+import { sendOrderConfirmationEmail, sendReceiptEmail, sendPayoutEmail, sendWelcomeEmail } from '../../email/template-sender';
 
 export function registerEmailNotifications() {
   return queueService.registerWorker(
@@ -16,6 +17,10 @@ export function registerEmailNotifications() {
 
       try {
         switch (type) {
+          case 'welcome':
+            await sendWelcomeEmail(to, data as { firstName: string; organizationName: string; subscriptionTier: string });
+            break;
+
           case 'order_confirmation':
             await sendOrderConfirmation(to, data);
             break;
@@ -42,13 +47,13 @@ export function registerEmailNotifications() {
 }
 
 async function sendOrderConfirmation(to: string, data: Record<string, any>) {
-  logger.info('Sending order confirmation email', { to, orderId: data.orderId });
+  await sendOrderConfirmationEmail(to, data);
 }
 
 async function sendReceipt(to: string, data: Record<string, any>) {
-  logger.info('Sending receipt email', { to, orderId: data.orderId });
+  await sendReceiptEmail(to, data);
 }
 
 async function sendPayoutConfirmation(to: string, data: Record<string, any>) {
-  logger.info('Sending payout confirmation email', { to, payoutId: data.payoutId });
+  await sendPayoutEmail(to, data);
 }

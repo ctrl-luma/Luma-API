@@ -271,28 +271,67 @@ export class CognitoService {
     }
   }
 
-  async refreshTokens(refreshToken: string) {
+  async refreshTokens(refreshToken: string, username?: string) {
+    logger.info('CognitoService.refreshTokens called', {
+      hasRefreshToken: !!refreshToken,
+      hasUsername: !!username,
+      username,
+      hasClientSecret: !!this.clientSecret
+    });
+    
     try {
-      // Use InitiateAuthCommand instead of AdminInitiateAuthCommand for refresh tokens
-      // This doesn't require USERNAME for SECRET_HASH calculation
+      const authParameters: Record<string, string> = {
+        REFRESH_TOKEN: refreshToken,
+      };
+      
+      // If username is provided, calculate SECRET_HASH
+      if (username && this.clientSecret) {
+        authParameters.SECRET_HASH = this.calculateSecretHash(username);
+        logger.info('Added SECRET_HASH to refresh request', {
+          username,
+          secretHashLength: authParameters.SECRET_HASH.length
+        });
+      } else {
+        logger.warn('No SECRET_HASH added to refresh request', {
+          hasUsername: !!username,
+          hasClientSecret: !!this.clientSecret
+        });
+      }
+      
       const command = new InitiateAuthCommand({
         ClientId: this.clientId,
         AuthFlow: 'REFRESH_TOKEN_AUTH',
-        AuthParameters: {
-          REFRESH_TOKEN: refreshToken,
-          SECRET_HASH: this.calculateSecretHash(this.clientId), // Use clientId as username for refresh
-        },
+        AuthParameters: authParameters,
       });
 
+      logger.info('Sending refresh token request to Cognito...');
       const response = await this.client.send(command);
+      
+      logger.info('Cognito refresh response received', {
+        hasIdToken: !!response.AuthenticationResult?.IdToken,
+        hasAccessToken: !!response.AuthenticationResult?.AccessToken,
+        hasRefreshToken: !!response.AuthenticationResult?.RefreshToken,
+        expiresIn: response.AuthenticationResult?.ExpiresIn,
+        tokenType: response.AuthenticationResult?.TokenType
+      });
 
       return {
         idToken: response.AuthenticationResult?.IdToken,
         accessToken: response.AuthenticationResult?.AccessToken,
         expiresIn: response.AuthenticationResult?.ExpiresIn,
       };
-    } catch (error) {
-      logger.error('Failed to refresh tokens', error);
+    } catch (error: any) {
+      logger.error('Failed to refresh tokens in CognitoService', {
+        errorName: error.name,
+        errorMessage: error.message,
+        errorCode: error.Code,
+        errorType: error.__type,
+        fullError: JSON.stringify(error, null, 2)
+      });
+      
+      if (error.name === 'NotAuthorizedException') {
+        throw new Error('Refresh token expired or invalid');
+      }
       throw error;
     }
   }

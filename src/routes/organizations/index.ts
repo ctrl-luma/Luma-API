@@ -207,9 +207,9 @@ app.openapi(updateOrganizationRoute, async (c) => {
       return c.json({ error: 'Forbidden' }, 403);
     }
 
-    // Only owners can update organization
-    if (payload.role !== 'owner') {
-      return c.json({ error: 'Only organization owners can update organization details' }, 403);
+    // Only owners and admins can update organization
+    if (payload.role !== 'owner' && payload.role !== 'admin') {
+      return c.json({ error: 'Only organization owners and admins can update organization details' }, 403);
     }
 
     // Build update query

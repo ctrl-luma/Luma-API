@@ -16,6 +16,10 @@ import authRoutes from './routes/auth';
 import organizationRoutes from './routes/organizations';
 import stripeWebhookRoutes from './routes/stripe/webhooks';
 import stripeConnectWebhookRoutes from './routes/stripe/connect-webhooks';
+import stripeConnectRoutes from './routes/stripe/connect';
+import contactRoutes from './routes/contact';
+import marketingRoutes from './routes/marketing';
+import { billingRoutes } from './routes/billing';
 
 const app = new OpenAPIHono();
 
@@ -37,7 +41,7 @@ app.use('*', cors({
   origin: corsOrigins,
   credentials: true,
   allowHeaders: ['Content-Type', 'Authorization'],
-  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }));
 app.use('*', prettyJSON());
 
@@ -79,6 +83,10 @@ app.route('/', authRoutes);
 app.route('/', organizationRoutes);
 app.route('/', stripeWebhookRoutes);
 app.route('/', stripeConnectWebhookRoutes);
+app.route('/', stripeConnectRoutes);
+app.route('/contact', contactRoutes);
+app.route('/marketing', marketingRoutes);
+app.route('/', billingRoutes);
 
 app.onError(errorHandler);
 

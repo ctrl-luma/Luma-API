@@ -470,7 +470,7 @@ async function handleInvoicePaymentSucceeded(invoice: any) {
         `UPDATE subscriptions 
          SET status = 'active',
              updated_at = NOW()
-         WHERE stripe_subscription_id = $1 AND status = 'past_due'`,
+         WHERE stripe_subscription_id = $1 AND status IN ('incomplete', 'past_due', 'pending_payment')`,
         [invoice.subscription]
       );
     }

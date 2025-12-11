@@ -288,6 +288,32 @@ export class StripeService {
     }
   }
 
+  async createSetupIntent(params: {
+    customer: string;
+    payment_method_types?: string[];
+    metadata?: Record<string, string>;
+    usage?: 'on_session' | 'off_session';
+  }) {
+    try {
+      const setupIntent = await stripe.setupIntents.create({
+        customer: params.customer,
+        payment_method_types: params.payment_method_types || ['card'],
+        metadata: params.metadata,
+        usage: params.usage || 'off_session',
+      });
+
+      logger.info('Setup intent created', {
+        setupIntentId: setupIntent.id,
+        customer: params.customer,
+      });
+
+      return setupIntent;
+    } catch (error) {
+      logger.error('Failed to create setup intent', error);
+      throw error;
+    }
+  }
+
   constructWebhookEvent(payload: string | Buffer, signature: string, secret: string) {
     try {
       return stripe.webhooks.constructEvent(payload, signature, secret);
@@ -301,24 +327,28 @@ export class StripeService {
     customer: string;
     items: Array<{ price: string; quantity?: number }>;
     payment_behavior?: 'default_incomplete' | 'error_if_incomplete' | 'allow_incomplete' | 'pending_if_incomplete';
+    payment_settings?: {
+      payment_method_types?: string[];
+      save_default_payment_method?: 'on_subscription' | 'off_session';
+    };
     expand?: string[];
     metadata?: Record<string, string>;
     trial_period_days?: number;
+    trial_end?: number;
   }) {
     try {
+      // For subscriptions requiring immediate payment, we use default_incomplete
+      // which creates the subscription in incomplete status with an open invoice
       const subscription = await stripe.subscriptions.create({
         customer: params.customer,
         items: params.items,
         payment_behavior: params.payment_behavior || 'default_incomplete',
+        payment_settings: (params.payment_settings || {
+          save_default_payment_method: 'on_subscription',
+        }) as Stripe.SubscriptionCreateParams.PaymentSettings,
         expand: params.expand || ['latest_invoice.payment_intent', 'pending_setup_intent'],
         metadata: params.metadata,
         trial_period_days: params.trial_period_days,
-        payment_settings: {
-          save_default_payment_method: 'on_subscription',
-          payment_method_types: ['card'],
-        },
-        // This ensures the invoice is finalized and payment intent is created
-        collection_method: 'charge_automatically',
       });
 
       logger.info('Subscription created', {
@@ -361,89 +391,120 @@ export class StripeService {
 
   async getSubscriptionPaymentIntent(subscriptionId: string): Promise<string | null> {
     try {
-      // First retrieve the subscription
+      // According to Stripe docs, when using default_incomplete, the payment intent
+      // is automatically created and attached to the invoice
       const subscription = await stripe.subscriptions.retrieve(subscriptionId, {
-        expand: ['latest_invoice']
+        expand: ['latest_invoice.payment_intent']
+      });
+
+      logger.info('Retrieved subscription', {
+        subscriptionId,
+        status: subscription.status,
+        hasLatestInvoice: !!subscription.latest_invoice
       });
 
       if (!subscription.latest_invoice || typeof subscription.latest_invoice === 'string') {
-        logger.error('No latest invoice found for subscription', { subscriptionId });
+        logger.error('No expanded latest invoice found', { subscriptionId });
         return null;
       }
 
-      // Get the full invoice object
-      const invoice = await stripe.invoices.retrieve(subscription.latest_invoice.id, {
-        expand: ['payment_intent']
-      }) as any; // Type assertion for expanded properties
+      const invoice = subscription.latest_invoice as any;
 
-      logger.info('Retrieved invoice', {
+      logger.info('Invoice details', {
         invoiceId: invoice.id,
         status: invoice.status,
         hasPaymentIntent: !!invoice.payment_intent,
-        paymentIntentType: typeof invoice.payment_intent
+        amountDue: invoice.amount_due
       });
 
-      // Check if invoice already has a payment intent
-      if (invoice.payment_intent && 
-          typeof invoice.payment_intent !== 'string' &&
-          invoice.payment_intent.client_secret) {
-        return invoice.payment_intent.client_secret;
-      }
-
-      // If no payment intent exists, we need to create one
-      if (!invoice.payment_intent && (invoice.status === 'open' || invoice.status === 'draft')) {
-        logger.info('Creating payment intent for invoice', { 
-          invoiceId: invoice.id,
-          status: invoice.status 
+      // The payment intent should exist on the invoice
+      if (invoice.payment_intent) {
+        const paymentIntent = typeof invoice.payment_intent === 'string'
+          ? await stripe.paymentIntents.retrieve(invoice.payment_intent)
+          : invoice.payment_intent as Stripe.PaymentIntent;
+        
+        logger.info('Found payment intent', {
+          paymentIntentId: paymentIntent.id,
+          status: paymentIntent.status,
+          clientSecretExists: !!paymentIntent.client_secret
         });
-
-        // For open invoices, we need to create a payment intent
-        if (invoice.status === 'open') {
-          // Retrieve the payment intent from the invoice
-          const updatedInvoice = await stripe.invoices.retrieve(invoice.id) as any;
-          
-          // If still no payment intent, the subscription might need different handling
-          logger.info('Invoice details after retrieval', {
-            invoiceId: updatedInvoice.id,
-            hasPaymentIntent: !!updatedInvoice.payment_intent,
-            amountDue: updatedInvoice.amount_due,
-            amountPaid: updatedInvoice.amount_paid,
-            attemptCount: updatedInvoice.attempt_count
-          });
-
-          // Get the subscription's payment method collection status
-          const paymentIntent = await stripe.paymentIntents.create({
-            amount: updatedInvoice.amount_due,
-            currency: updatedInvoice.currency,
-            customer: updatedInvoice.customer as string,
-            metadata: {
-              invoice_id: updatedInvoice.id,
-              subscription_id: subscriptionId
-            },
-            setup_future_usage: 'off_session',
-            automatic_payment_methods: {
-              enabled: true
-            }
-          });
-
-          return paymentIntent.client_secret;
-        } else {
-          // For draft invoices, finalize first
-          const finalizedInvoice = await stripe.invoices.finalizeInvoice(invoice.id, {
-            expand: ['payment_intent']
-          }) as any;
-          
-          if (finalizedInvoice.payment_intent && 
-              typeof finalizedInvoice.payment_intent !== 'string' &&
-              finalizedInvoice.payment_intent.client_secret) {
-            return finalizedInvoice.payment_intent.client_secret;
-          }
-        }
+        
+        return paymentIntent.client_secret || null;
       }
+
+      // If we reach here, something is wrong with the subscription setup
+      logger.error('Invoice has no payment intent - this indicates a problem with subscription creation', {
+        invoiceId: invoice.id,
+        subscriptionId
+      });
 
       return null;
+    } catch (error: any) {
+      logger.error('Failed to get subscription payment intent', { 
+        error: error.message,
+        code: error.code,
+        type: error.type,
+        subscriptionId
+      });
+      throw error;
+    }
+  }
+
+  async getCustomerInvoices(customerId: string, params: {
+    limit?: number;
+    starting_after?: string;
+    status?: string;
+  } = {}) {
+    try {
+      const listParams: any = {
+        customer: customerId,
+        limit: params.limit || 10,
+        expand: ['data.payment_intent'],
+      };
+
+      if (params.starting_after) {
+        listParams.starting_after = params.starting_after;
+      }
+
+      // First, let's get ALL invoices to see what we have
+      const allInvoices = await stripe.invoices.list({
+        customer: customerId,
+        limit: 100,
+      });
+
+      logger.info('ALL customer invoices for debugging', {
+        customerId,
+        totalInvoices: allInvoices.data.length,
+        invoiceDetails: allInvoices.data.map(inv => ({
+          id: inv.id,
+          status: inv.status,
+          created: new Date(inv.created * 1000).toISOString(),
+          amount_paid: inv.amount_paid,
+          amount_due: inv.amount_due,
+          paid: (inv as any).paid,
+          number: inv.number,
+          hosted_invoice_url: inv.hosted_invoice_url,
+        }))
+      });
+
+      // Now get the filtered list
+      if (params.status) {
+        listParams.status = params.status;
+      }
+
+      const invoices = await stripe.invoices.list(listParams);
+
+      logger.info('Retrieved filtered customer invoices', {
+        customerId,
+        count: invoices.data.length,
+        hasMore: invoices.has_more,
+        filter: params.status || 'none',
+        requestedLimit: params.limit
+      });
+
+      return invoices;
     } catch (error) {
-      logger.error('Failed to get subscription payment intent', error);
+      logger.error('Failed to retrieve customer invoices', error);
       throw error;
     }
   }
