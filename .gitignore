@@ -47,3 +47,6 @@ dump.rdb
 *.pem
 *.key
 *.crt
+
+# Kubernetes configs (may contain secrets)
+k8s/
