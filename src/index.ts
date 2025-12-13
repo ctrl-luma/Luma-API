@@ -1,4 +1,5 @@
 import { serve } from '@hono/node-server';
+import { createServer } from 'http';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { prettyJSON } from 'hono/pretty-json';
@@ -12,6 +13,7 @@ import { initializeDatabase } from './db/migrate';
 import { logger as winstonLogger } from './utils/logger';
 import { redisService } from './services/redis';
 import { registerAllWorkers } from './services/queue/workers';
+import { socketService } from './services/socket';
 import authRoutes from './routes/auth';
 import organizationRoutes from './routes/organizations';
 import stripeWebhookRoutes from './routes/stripe/webhooks';
@@ -98,13 +100,18 @@ async function startServer() {
     await initializeDatabase();
     await redisService.connect();
     registerAllWorkers();
-    
-    serve({
+
+    // Create HTTP server and initialize Socket.IO
+    const server = serve({
       fetch: app.fetch,
       port,
     });
-    
+
+    // Initialize Socket.IO with the HTTP server
+    socketService.initialize(server as any);
+
     winstonLogger.info(`Server is running on port ${port}`);
+    winstonLogger.info(`Socket.IO initialized on path ${config.socketio.path}`);
   } catch (error) {
     winstonLogger.error('Failed to start server', error);
     process.exit(1);

@@ -221,12 +221,25 @@ app.openapi(getConnectStatusRoute, async (c) => {
 
     const connectedAccount = rows[0];
 
-    // Optionally refresh from Stripe if last sync was more than 5 minutes ago
+    // Force refresh if pending_stripe_sync flag is set (user returned from Stripe)
+    // Otherwise, optionally refresh if last sync was more than 5 minutes ago
     const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
-    if (!connectedAccount.last_stripe_sync_at || connectedAccount.last_stripe_sync_at < fiveMinutesAgo) {
+    const shouldRefresh = connectedAccount.pending_stripe_sync ||
+                          !connectedAccount.last_stripe_sync_at ||
+                          connectedAccount.last_stripe_sync_at < fiveMinutesAgo;
+
+    if (shouldRefresh) {
       try {
         const stripeAccount = await stripeService.retrieveAccount(connectedAccount.stripe_account_id);
         await syncAccountFromStripe(stripeAccount, payload.organizationId);
+
+        // Clear the pending_stripe_sync flag if it was set
+        if (connectedAccount.pending_stripe_sync) {
+          await query(
+            'UPDATE stripe_connected_accounts SET pending_stripe_sync = FALSE WHERE organization_id = $1',
+            [payload.organizationId]
+          );
+        }
 
         // Re-fetch updated data
         const updatedRows = await query<StripeConnectedAccount>(
@@ -346,8 +359,14 @@ app.openapi(createConnectedAccountRoute, async (c) => {
       const existingAccount = existingRows[0];
       const accountLink = await stripeService.createAccountLink(
         existingAccount.stripe_account_id,
-        `${config.email.dashboardUrl}/`,
-        `${config.email.dashboardUrl}/`
+        `${config.email.dashboardUrl}/connect`,
+        `${config.email.dashboardUrl}/connect`
+      );
+
+      // Set flag so next status check will force refresh from Stripe
+      await query(
+        'UPDATE stripe_connected_accounts SET pending_stripe_sync = TRUE WHERE organization_id = $1',
+        [payload.organizationId]
       );
 
       return c.json({
@@ -390,8 +409,14 @@ app.openapi(createConnectedAccountRoute, async (c) => {
     // Create onboarding link
     const accountLink = await stripeService.createAccountLink(
       account.id,
-      `${config.frontend.url}/stripe/connect/refresh`,
-      `${config.frontend.url}/stripe/connect/return`
+      `${config.email.dashboardUrl}/connect`,
+      `${config.email.dashboardUrl}/connect`
+    );
+
+    // Set flag so next status check will force refresh from Stripe
+    await query(
+      'UPDATE stripe_connected_accounts SET pending_stripe_sync = TRUE WHERE organization_id = $1',
+      [payload.organizationId]
     );
 
     logger.info('Created new connected account', {
@@ -468,8 +493,14 @@ app.openapi(createOnboardingLinkRoute, async (c) => {
 
     const accountLink = await stripeService.createAccountLink(
       connectedAccount.stripe_account_id,
-      `${config.frontend.url}/stripe/connect/refresh`,
-      `${config.frontend.url}/stripe/connect/return`
+      `${config.email.dashboardUrl}/connect`,
+      `${config.email.dashboardUrl}/connect`
+    );
+
+    // Set flag so next status check will force refresh from Stripe
+    await query(
+      'UPDATE stripe_connected_accounts SET pending_stripe_sync = TRUE WHERE organization_id = $1',
+      [payload.organizationId]
     );
 
     logger.info('Generated onboarding link', {

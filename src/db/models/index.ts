@@ -214,6 +214,9 @@ export interface StripeConnectedAccount {
   last_stripe_sync_at: Date | null;
   created_at: Date;
   updated_at: Date;
+
+  // Cache invalidation flag - set when user goes to Stripe, cleared on next status fetch
+  pending_stripe_sync: boolean;
 }
 
 export * from './subscription';

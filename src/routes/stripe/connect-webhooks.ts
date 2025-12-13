@@ -4,7 +4,8 @@ import { config } from '../../config';
 import { stripeService } from '../../services/stripe';
 import { logger } from '../../utils/logger';
 import { transaction, query } from '../../db';
-import { syncAccountFromStripe } from './connect';
+import { syncAccountFromStripe, deriveOnboardingState } from './connect';
+import { socketService, SocketEvents } from '../../services/socket';
 
 const app = new OpenAPIHono();
 
@@ -117,6 +118,22 @@ async function handleAccountUpdated(account: any, connectedAccountId: string | u
   // Use the centralized sync function to update all account data
   await syncAccountFromStripe(account, org.id);
 
+  // Derive the onboarding state for the socket event
+  const onboardingState = deriveOnboardingState(account);
+
+  // Emit socket event to notify connected clients in real-time
+  socketService.emitToOrganization(org.id, SocketEvents.CONNECT_STATUS_UPDATED, {
+    organizationId: org.id,
+    onboardingState,
+    chargesEnabled: account.charges_enabled,
+    payoutsEnabled: account.payouts_enabled,
+    detailsSubmitted: account.details_submitted,
+    requirementsCurrentlyDue: account.requirements?.currently_due || [],
+    requirementsPastDue: account.requirements?.past_due || [],
+    disabledReason: account.requirements?.disabled_reason || null,
+    timestamp: new Date().toISOString(),
+  });
+
   // Log the audit event
   await transaction(async (client) => {
     await client.query(
@@ -144,6 +161,7 @@ async function handleAccountUpdated(account: any, connectedAccountId: string | u
     chargesEnabled: account.charges_enabled,
     payoutsEnabled: account.payouts_enabled,
     detailsSubmitted: account.details_submitted,
+    socketEventEmitted: true,
   });
 }
 

@@ -2,7 +2,7 @@ import { Server as SocketIOServer } from 'socket.io';
 import { Server as HTTPServer } from 'http';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
-import { redisService } from '../redis';
+import { authService } from '../auth';
 
 export interface SocketUser {
   userId: string;
@@ -55,11 +55,17 @@ export class SocketService {
   }
 
   private async validateToken(token: string): Promise<SocketUser | null> {
-    const cached = await redisService.get(`socket:token:${token}`);
-    if (cached) {
-      return JSON.parse(cached);
+    try {
+      const payload = await authService.verifyToken(token);
+      return {
+        userId: payload.userId,
+        organizationId: payload.organizationId,
+        role: payload.role,
+      };
+    } catch (error) {
+      logger.debug('Socket token validation failed', { error });
+      return null;
     }
-    return null;
   }
 
   private setupEventHandlers() {
@@ -175,4 +181,6 @@ export const SocketEvents = {
   REVENUE_UPDATE: 'revenue:update',
   STAFF_JOINED: 'staff:joined',
   STAFF_LEFT: 'staff:left',
+  // Stripe Connect events
+  CONNECT_STATUS_UPDATED: 'connect:status_updated',
 } as const;
