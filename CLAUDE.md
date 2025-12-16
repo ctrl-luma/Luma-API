@@ -39,6 +39,7 @@ await cacheService.del(CacheKeys.userByEmail(userEmail));
 - **Stripe Service** (`src/services/stripe/`): Payment processing, webhooks
 - **Cache Service** (`src/services/redis/cache.ts`): Redis caching layer
 - **Queue Service** (`src/services/queue/`): Background job processing
+- **Image Service** (`src/services/images/index.ts`): Profile picture uploads to file server
 
 ### Database
 - **Location**: `src/db/`
@@ -88,6 +89,10 @@ STRIPE_CONNECT_WEBHOOK_SECRET=whsec_xxx
 
 # CORS
 CORS_ORIGIN=http://localhost:3001,http://localhost:3333,https://portal.lumapos.co
+
+# Image File Server (profile pictures)
+IMAGE_FILE_SERVER_URL=https://images.lumapos.co  # or https://dev.images.lumapos.co for dev
+IMAGE_MAX_SIZE_BYTES=5242880  # 5MB default
 ```
 
 ## Key Features
@@ -132,12 +137,15 @@ users (
   role VARCHAR,
   is_active BOOLEAN DEFAULT true,
   cognito_user_id VARCHAR,
-  
+
   -- Notification Preferences (added in migration 006)
   email_alerts BOOLEAN DEFAULT true,
-  marketing_emails BOOLEAN DEFAULT true, 
+  marketing_emails BOOLEAN DEFAULT true,
   weekly_reports BOOLEAN DEFAULT true,
-  
+
+  -- Profile Picture (added in migration 010)
+  avatar_image_id VARCHAR,  -- ID of image stored on file server
+
   created_at TIMESTAMP DEFAULT NOW(),
   updated_at TIMESTAMP DEFAULT NOW()
 )
@@ -164,6 +172,8 @@ password_reset_tokens (
 - `GET /auth/me` - Get current user info
 - `PATCH /auth/profile` - Update user profile
 - `PATCH /auth/notification-preferences` - Update notification settings
+- `POST /auth/avatar` - Upload or replace profile picture (multipart/form-data)
+- `DELETE /auth/avatar` - Delete profile picture
 - `POST /auth/forgot-password` - Request password reset
 - `POST /auth/reset-password` - Complete password reset
 - `POST /auth/validate-reset-token` - Check if reset token is valid
@@ -184,6 +194,37 @@ Users have three notification settings:
 - **weeklyReports**: Business performance summaries
 
 Default values for new users: All set to `true`
+
+### Profile Picture Upload
+
+Users can upload profile pictures which are stored on a separate image file server.
+
+**Architecture**:
+- Backend writes images to PVC mounted at `/data/images/<id>`
+- nginx serves images publicly at `IMAGE_FILE_SERVER_URL/images/<id>`
+- Image IDs are stored in the `users.avatar_image_id` column
+
+**Upload Flow**:
+1. User sends `POST /auth/avatar` with multipart form data containing `file` field
+2. Backend validates file type and size
+3. If user has existing avatar, the same ID is used (overwrite)
+4. File is written atomically (temp file + rename) to prevent serving partial uploads
+5. User's `avatar_image_id` is updated in database
+6. Cache is invalidated
+7. Response includes `avatarUrl` pointing to the public URL
+
+**Constraints**:
+- **Allowed types**: `image/png`, `image/jpeg`, `image/webp`, `image/gif`
+- **Max size**: Configured via `IMAGE_MAX_SIZE_BYTES` (default 5MB)
+- **Storage path**: `/data/images/<id>` (PVC mount point)
+
+**User responses include avatarUrl**:
+- `POST /auth/login` - Returns `user.avatarUrl`
+- `GET /auth/me` - Returns `avatarUrl`
+- `PATCH /auth/profile` - Returns `avatarUrl`
+- `POST /auth/avatar` - Returns `avatarUrl` and `avatarImageId`
+
+**Delete**: `DELETE /auth/avatar` removes the image file and clears `avatar_image_id`
 
 ### Password Reset Flow
 

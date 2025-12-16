@@ -42,6 +42,10 @@ const envSchema = z.object({
   
   BULL_REDIS_HOST: z.string().default('localhost'),
   BULL_REDIS_PORT: z.string().transform(Number).default('6379'),
+
+  IMAGE_FILE_SERVER_URL: z.string().url().optional(),
+  IMAGE_MAX_SIZE_BYTES: z.string().transform(Number).default('5242880'), // 5MB default
+  IMAGE_STORAGE_PATH: z.string().default('/data/images'),
 });
 
 const env = envSchema.parse(process.env);
@@ -102,6 +106,11 @@ export const config = {
       host: env.BULL_REDIS_HOST,
       port: env.BULL_REDIS_PORT,
     },
+  },
+  images: {
+    fileServerUrl: env.IMAGE_FILE_SERVER_URL,
+    maxSizeBytes: env.IMAGE_MAX_SIZE_BYTES,
+    storagePath: env.IMAGE_STORAGE_PATH,
   },
 } as const;
 

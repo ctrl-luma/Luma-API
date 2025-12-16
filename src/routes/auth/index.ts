@@ -8,6 +8,7 @@ import { config } from '../../config';
 import signupRoutes from './signup';
 import { sendPasswordResetEmail } from '../../services/email/template-sender';
 import { cacheService, CacheKeys } from '../../services/redis/cache';
+import { imageService } from '../../services/images';
 
 const app = new OpenAPIHono();
 
@@ -31,6 +32,7 @@ const LoginResponseSchema = z.object({
     emailAlerts: z.boolean(),
     marketingEmails: z.boolean(),
     weeklyReports: z.boolean(),
+    avatarUrl: z.string().nullable(),
   }),
   tokens: z.object({
     accessToken: z.string(),
@@ -94,6 +96,7 @@ app.openapi(loginRoute, async (c) => {
         emailAlerts: user.email_alerts,
         marketingEmails: user.marketing_emails,
         weeklyReports: user.weekly_reports,
+        avatarUrl: imageService.getUrl(user.avatar_image_id),
       },
       tokens,
     });
@@ -327,6 +330,7 @@ const getCurrentUserRoute = createRoute({
             emailAlerts: z.boolean(),
             marketingEmails: z.boolean(),
             weeklyReports: z.boolean(),
+            avatarUrl: z.string().nullable(),
           }),
         },
       },
@@ -368,6 +372,7 @@ app.openapi(getCurrentUserRoute, async (c) => {
       emailAlerts: dbUser.email_alerts,
       marketingEmails: dbUser.marketing_emails,
       weeklyReports: dbUser.weekly_reports,
+      avatarUrl: imageService.getUrl(dbUser.avatar_image_id),
     });
   } catch (error) {
     logger.error('Get current user error', { error });
@@ -452,6 +457,7 @@ const updateProfileRoute = createRoute({
             emailAlerts: z.boolean(),
             marketingEmails: z.boolean(),
             weeklyReports: z.boolean(),
+            avatarUrl: z.string().nullable(),
           }),
         },
       },
@@ -549,9 +555,9 @@ app.openapi(updateProfileRoute, async (c) => {
     await cacheService.del(CacheKeys.user(payload.userId));
     await cacheService.del(CacheKeys.userByEmail(updatedUser.email));
 
-    logger.info('User profile updated', { 
-      userId: payload.userId, 
-      updatedFields: Object.keys(validated) 
+    logger.info('User profile updated', {
+      userId: payload.userId,
+      updatedFields: Object.keys(validated)
     });
 
     return c.json({
@@ -565,6 +571,7 @@ app.openapi(updateProfileRoute, async (c) => {
       emailAlerts: updatedUser.email_alerts,
       marketingEmails: updatedUser.marketing_emails,
       weeklyReports: updatedUser.weekly_reports,
+      avatarUrl: imageService.getUrl(updatedUser.avatar_image_id),
     });
   } catch (error: any) {
     logger.error('Update profile error', { error });
@@ -918,6 +925,239 @@ app.openapi(updateNotificationPreferencesRoute, async (c) => {
     }
     
     return c.json({ error: 'Failed to update notification preferences' }, 500);
+  }
+});
+
+// Upload profile picture endpoint
+const uploadAvatarRoute = createRoute({
+  method: 'post',
+  path: '/auth/avatar',
+  summary: 'Upload or replace profile picture',
+  tags: ['Authentication'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    body: {
+      content: {
+        'multipart/form-data': {
+          schema: z.object({
+            file: z.any().openapi({ type: 'string', format: 'binary' }),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Profile picture uploaded successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            avatarUrl: z.string(),
+            avatarImageId: z.string(),
+          }),
+        },
+      },
+    },
+    400: {
+      description: 'Invalid file or file too large',
+    },
+    401: {
+      description: 'Unauthorized',
+    },
+    503: {
+      description: 'Image service not configured',
+    },
+  },
+});
+
+app.openapi(uploadAvatarRoute, async (c) => {
+  // Check if image service is configured
+  if (!imageService.isConfigured()) {
+    logger.warn('Avatar upload attempted but image service not configured');
+    return c.json({ error: 'Image upload service not available' }, 503);
+  }
+
+  const authHeader = c.req.header('Authorization');
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    const payload = await authService.verifyToken(token);
+
+    // Get the uploaded file from multipart form data
+    const formData = await c.req.formData();
+    const file = formData.get('file');
+
+    if (!file || !(file instanceof File)) {
+      return c.json({ error: 'No file provided' }, 400);
+    }
+
+    // Validate content type
+    const contentType = file.type;
+    if (!imageService.allowedTypes.includes(contentType)) {
+      return c.json({
+        error: `Invalid file type: ${contentType}. Allowed types: ${imageService.allowedTypes.join(', ')}`
+      }, 400);
+    }
+
+    // Get file buffer
+    const buffer = await file.arrayBuffer();
+
+    // Validate file size
+    if (buffer.byteLength > imageService.maxSizeBytes) {
+      const maxMB = Math.round(imageService.maxSizeBytes / 1024 / 1024);
+      return c.json({
+        error: `File too large. Maximum size: ${maxMB}MB`
+      }, 400);
+    }
+
+    // Get current user to check for existing avatar
+    const currentUser = await authService.getUserById(payload.userId);
+    if (!currentUser) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    // If user has existing avatar, replace it (same ID for overwrite)
+    const existingAvatarId = currentUser.avatar_image_id;
+
+    // Upload the image (will replace if existingAvatarId is provided)
+    const uploadResult = await imageService.upload(buffer, contentType, existingAvatarId || undefined);
+
+    // Update user's avatar_image_id in database
+    await query(
+      `UPDATE users SET avatar_image_id = $1, updated_at = NOW() WHERE id = $2`,
+      [uploadResult.id, payload.userId]
+    );
+
+    // Invalidate user cache
+    await cacheService.del(CacheKeys.user(payload.userId));
+    await cacheService.del(CacheKeys.userByEmail(currentUser.email));
+
+    logger.info('Profile picture uploaded', {
+      userId: payload.userId,
+      avatarImageId: uploadResult.id,
+      sizeBytes: uploadResult.sizeBytes,
+      wasReplacement: !!existingAvatarId,
+    });
+
+    return c.json({
+      avatarUrl: uploadResult.url,
+      avatarImageId: uploadResult.id,
+    });
+  } catch (error: any) {
+    logger.error('Upload avatar error', { error });
+
+    if (error.code === 'INVALID_TYPE') {
+      return c.json({ error: error.message }, 400);
+    }
+
+    if (error.code === 'FILE_TOO_LARGE') {
+      return c.json({ error: error.message }, 400);
+    }
+
+    if (error.code === 'STORAGE_ERROR') {
+      return c.json({ error: 'Failed to save image' }, 500);
+    }
+
+    if (error.message === 'Invalid token' || error.message === 'Token expired') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    return c.json({ error: 'Failed to upload profile picture' }, 500);
+  }
+});
+
+// Delete profile picture endpoint
+const deleteAvatarRoute = createRoute({
+  method: 'delete',
+  path: '/auth/avatar',
+  summary: 'Delete profile picture',
+  tags: ['Authentication'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: {
+      description: 'Profile picture deleted successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            message: z.string(),
+          }),
+        },
+      },
+    },
+    401: {
+      description: 'Unauthorized',
+    },
+    404: {
+      description: 'No profile picture to delete',
+    },
+  },
+});
+
+app.openapi(deleteAvatarRoute, async (c) => {
+  const authHeader = c.req.header('Authorization');
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    const payload = await authService.verifyToken(token);
+
+    // Get current user
+    const currentUser = await authService.getUserById(payload.userId);
+    if (!currentUser) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    // Check if user has an avatar
+    if (!currentUser.avatar_image_id) {
+      return c.json({ error: 'No profile picture to delete' }, 404);
+    }
+
+    // Delete the image file (if image service is configured)
+    if (imageService.isConfigured()) {
+      try {
+        await imageService.delete(currentUser.avatar_image_id);
+      } catch (error) {
+        // Log but don't fail - the file might already be deleted
+        logger.warn('Failed to delete avatar file', {
+          avatarImageId: currentUser.avatar_image_id,
+          error
+        });
+      }
+    }
+
+    // Update user's avatar_image_id to null in database
+    await query(
+      `UPDATE users SET avatar_image_id = NULL, updated_at = NOW() WHERE id = $1`,
+      [payload.userId]
+    );
+
+    // Invalidate user cache
+    await cacheService.del(CacheKeys.user(payload.userId));
+    await cacheService.del(CacheKeys.userByEmail(currentUser.email));
+
+    logger.info('Profile picture deleted', {
+      userId: payload.userId,
+      deletedAvatarId: currentUser.avatar_image_id,
+    });
+
+    return c.json({ message: 'Profile picture deleted successfully' });
+  } catch (error: any) {
+    logger.error('Delete avatar error', { error });
+
+    if (error.message === 'Invalid token' || error.message === 'Token expired') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    return c.json({ error: 'Failed to delete profile picture' }, 500);
   }
 });
 

@@ -26,6 +26,7 @@ export interface User {
   email_alerts: boolean;
   marketing_emails: boolean;
   weekly_reports: boolean;
+  avatar_image_id: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -168,6 +169,45 @@ export interface AuditLog {
   ip_address: string | null;
   user_agent: string | null;
   created_at: Date;
+}
+
+export interface Catalog {
+  id: string;
+  organization_id: string;
+  name: string;
+  description: string | null;
+  location: string | null;
+  date: string | null;
+  is_active: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface Category {
+  id: string;
+  organization_id: string;
+  name: string;
+  description: string | null;
+  sort_order: number;
+  is_active: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface Product {
+  id: string;
+  catalog_id: string;
+  organization_id: string;
+  name: string;
+  description: string | null;
+  price: number;
+  image_id: string | null;
+  image_url: string | null;
+  category_id: string | null;
+  is_active: boolean;
+  sort_order: number;
+  created_at: Date;
+  updated_at: Date;
 }
 
 export type ConnectOnboardingState = 'not_started' | 'incomplete' | 'pending_verification' | 'active' | 'restricted' | 'disabled';

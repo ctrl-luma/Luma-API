@@ -40,6 +40,9 @@ tmp/
 temp/
 *.tmp
 
+# Uploaded images (local development)
+data/
+
 # Redis dump
 dump.rdb
 

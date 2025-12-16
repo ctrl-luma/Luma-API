@@ -508,6 +508,271 @@ export class StripeService {
       throw error;
     }
   }
+
+  // Connected Account Balance & Payouts Methods
+  async getConnectedAccountBalance(stripeAccountId: string) {
+    try {
+      const balance = await stripe.balance.retrieve({}, {
+        stripeAccount: stripeAccountId,
+      });
+
+      logger.info('Retrieved connected account balance', {
+        stripeAccountId,
+        availableCount: balance.available.length,
+        pendingCount: balance.pending.length,
+      });
+
+      return balance;
+    } catch (error) {
+      logger.error('Failed to retrieve connected account balance', { stripeAccountId, error });
+      throw error;
+    }
+  }
+
+  async listConnectedAccountPayouts(
+    stripeAccountId: string,
+    params: {
+      status?: 'pending' | 'paid' | 'failed' | 'canceled';
+      limit?: number;
+      starting_after?: string;
+      ending_before?: string;
+    } = {}
+  ) {
+    try {
+      const payouts = await stripe.payouts.list(
+        {
+          status: params.status,
+          limit: params.limit || 10,
+          starting_after: params.starting_after,
+          ending_before: params.ending_before,
+        },
+        {
+          stripeAccount: stripeAccountId,
+        }
+      );
+
+      logger.info('Retrieved connected account payouts', {
+        stripeAccountId,
+        count: payouts.data.length,
+        hasMore: payouts.has_more,
+      });
+
+      return payouts;
+    } catch (error) {
+      logger.error('Failed to list connected account payouts', { stripeAccountId, error });
+      throw error;
+    }
+  }
+
+  async retrieveConnectedAccountPayout(stripeAccountId: string, payoutId: string) {
+    try {
+      const payout = await stripe.payouts.retrieve(payoutId, {
+        stripeAccount: stripeAccountId,
+      });
+
+      logger.info('Retrieved connected account payout', {
+        stripeAccountId,
+        payoutId,
+        status: payout.status,
+      });
+
+      return payout;
+    } catch (error) {
+      logger.error('Failed to retrieve connected account payout', { stripeAccountId, payoutId, error });
+      throw error;
+    }
+  }
+
+  async createConnectedAccountPayout(
+    stripeAccountId: string,
+    params: {
+      amount: number; // in dollars
+      currency?: string;
+      description?: string;
+      destination?: string;
+      method?: 'standard' | 'instant';
+      metadata?: Record<string, string>;
+    }
+  ) {
+    try {
+      const payout = await stripe.payouts.create(
+        {
+          amount: Math.round(params.amount * 100), // Convert to cents
+          currency: params.currency || 'usd',
+          description: params.description,
+          destination: params.destination,
+          method: params.method || 'standard',
+          metadata: params.metadata,
+        },
+        {
+          stripeAccount: stripeAccountId,
+        }
+      );
+
+      logger.info('Created connected account payout', {
+        stripeAccountId,
+        payoutId: payout.id,
+        amount: params.amount,
+        method: params.method || 'standard',
+        status: payout.status,
+      });
+
+      return payout;
+    } catch (error) {
+      logger.error('Failed to create connected account payout', { stripeAccountId, params, error });
+      throw error;
+    }
+  }
+
+  async listConnectedAccountExternalAccounts(
+    stripeAccountId: string,
+    params: { limit?: number } = {}
+  ) {
+    try {
+      const accounts = await stripe.accounts.listExternalAccounts(
+        stripeAccountId,
+        {
+          limit: params.limit || 10,
+        }
+      );
+
+      logger.info('Retrieved connected account external accounts', {
+        stripeAccountId,
+        count: accounts.data.length,
+      });
+
+      return accounts;
+    } catch (error) {
+      logger.error('Failed to list connected account external accounts', { stripeAccountId, error });
+      throw error;
+    }
+  }
+
+  async listConnectedAccountCharges(
+    stripeAccountId: string,
+    params: {
+      limit?: number;
+      starting_after?: string;
+      ending_before?: string;
+      created?: {
+        gte?: number;
+        lte?: number;
+      };
+    } = {}
+  ) {
+    try {
+      const charges = await stripe.charges.list(
+        {
+          limit: params.limit || 25,
+          starting_after: params.starting_after,
+          ending_before: params.ending_before,
+          created: params.created,
+        },
+        {
+          stripeAccount: stripeAccountId,
+        }
+      );
+
+      logger.info('Retrieved connected account charges', {
+        stripeAccountId,
+        count: charges.data.length,
+        hasMore: charges.has_more,
+      });
+
+      return charges;
+    } catch (error) {
+      logger.error('Failed to list connected account charges', { stripeAccountId, error });
+      throw error;
+    }
+  }
+
+  async listConnectedAccountPaymentIntents(
+    stripeAccountId: string,
+    params: {
+      limit?: number;
+      starting_after?: string;
+      ending_before?: string;
+      created?: {
+        gte?: number;
+        lte?: number;
+      };
+    } = {}
+  ) {
+    try {
+      const paymentIntents = await stripe.paymentIntents.list(
+        {
+          limit: params.limit || 25,
+          starting_after: params.starting_after,
+          ending_before: params.ending_before,
+          created: params.created,
+        },
+        {
+          stripeAccount: stripeAccountId,
+        }
+      );
+
+      logger.info('Retrieved connected account payment intents', {
+        stripeAccountId,
+        count: paymentIntents.data.length,
+        hasMore: paymentIntents.has_more,
+      });
+
+      return paymentIntents;
+    } catch (error) {
+      logger.error('Failed to list connected account payment intents', { stripeAccountId, error });
+      throw error;
+    }
+  }
+
+  async retrieveConnectedAccountCharge(stripeAccountId: string, chargeId: string) {
+    try {
+      const charge = await stripe.charges.retrieve(chargeId, {
+        stripeAccount: stripeAccountId,
+      });
+
+      return charge;
+    } catch (error) {
+      logger.error('Failed to retrieve connected account charge', { stripeAccountId, chargeId, error });
+      throw error;
+    }
+  }
+
+  async createConnectedAccountRefund(
+    stripeAccountId: string,
+    params: {
+      charge?: string;
+      payment_intent?: string;
+      amount?: number;
+      reason?: 'duplicate' | 'fraudulent' | 'requested_by_customer';
+      metadata?: Record<string, string>;
+    }
+  ) {
+    try {
+      const refund = await stripe.refunds.create(
+        {
+          charge: params.charge,
+          payment_intent: params.payment_intent,
+          amount: params.amount ? Math.round(params.amount * 100) : undefined,
+          reason: params.reason,
+          metadata: params.metadata,
+        },
+        {
+          stripeAccount: stripeAccountId,
+        }
+      );
+
+      logger.info('Created connected account refund', {
+        stripeAccountId,
+        refundId: refund.id,
+        amount: refund.amount / 100,
+      });
+
+      return refund;
+    } catch (error) {
+      logger.error('Failed to create connected account refund', { stripeAccountId, params, error });
+      throw error;
+    }
+  }
 }
 
 export const stripeService = new StripeService();

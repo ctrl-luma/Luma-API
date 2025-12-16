@@ -1,5 +1,4 @@
 import { serve } from '@hono/node-server';
-import { createServer } from 'http';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { prettyJSON } from 'hono/pretty-json';
@@ -22,6 +21,10 @@ import stripeConnectRoutes from './routes/stripe/connect';
 import contactRoutes from './routes/contact';
 import marketingRoutes from './routes/marketing';
 import { billingRoutes } from './routes/billing';
+import catalogRoutes from './routes/catalogs';
+import productRoutes from './routes/products';
+import categoryRoutes from './routes/categories';
+import imageRoutes from './routes/images';
 
 const app = new OpenAPIHono();
 
@@ -89,6 +92,10 @@ app.route('/', stripeConnectRoutes);
 app.route('/contact', contactRoutes);
 app.route('/marketing', marketingRoutes);
 app.route('/', billingRoutes);
+app.route('/', catalogRoutes);
+app.route('/', productRoutes);
+app.route('/', categoryRoutes);
+app.route('/', imageRoutes);
 
 app.onError(errorHandler);
 
