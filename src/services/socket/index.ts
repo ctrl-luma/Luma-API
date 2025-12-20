@@ -183,4 +183,19 @@ export const SocketEvents = {
   STAFF_LEFT: 'staff:left',
   // Stripe Connect events
   CONNECT_STATUS_UPDATED: 'connect:status_updated',
+  // User/Profile events
+  USER_UPDATED: 'user:updated',
+  ORGANIZATION_UPDATED: 'organization:updated',
+  // Catalog events
+  CATALOG_UPDATED: 'catalog:updated',
+  CATALOG_CREATED: 'catalog:created',
+  CATALOG_DELETED: 'catalog:deleted',
+  // Product events
+  PRODUCT_UPDATED: 'product:updated',
+  PRODUCT_CREATED: 'product:created',
+  PRODUCT_DELETED: 'product:deleted',
+  // Category events
+  CATEGORY_UPDATED: 'category:updated',
+  CATEGORY_CREATED: 'category:created',
+  CATEGORY_DELETED: 'category:deleted',
 } as const;

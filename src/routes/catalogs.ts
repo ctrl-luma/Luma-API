@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { query } from '../db';
 import { Catalog } from '../db/models';
 import { logger } from '../utils/logger';
+import { socketService, SocketEvents } from '../services/socket';
 
 const app = new OpenAPIHono();
 
@@ -214,6 +215,12 @@ app.openapi(createCatalogRoute, async (c) => {
     const row = rows[0];
     logger.info('Catalog created', { catalogId: row.id, organizationId: payload.organizationId });
 
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.CATALOG_CREATED, {
+      catalogId: row.id,
+      name: row.name,
+    });
+
     return c.json({
       id: row.id,
       name: row.name,
@@ -327,6 +334,12 @@ app.openapi(updateCatalogRoute, async (c) => {
     const row = rows[0];
     logger.info('Catalog updated', { catalogId: row.id });
 
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.CATALOG_UPDATED, {
+      catalogId: row.id,
+      name: row.name,
+    });
+
     return c.json({
       id: row.id,
       name: row.name,
@@ -382,6 +395,12 @@ app.openapi(deleteCatalogRoute, async (c) => {
     }
 
     logger.info('Catalog deleted', { catalogId: id });
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.CATALOG_DELETED, {
+      catalogId: id,
+    });
+
     return c.json({ success: true });
   } catch (error: any) {
     if (error.message === 'Unauthorized' || error.message === 'Invalid token') {

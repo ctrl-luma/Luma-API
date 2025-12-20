@@ -36,7 +36,7 @@ const envSchema = z.object({
   
   LOG_LEVEL: z.enum(['error', 'warn', 'info', 'http', 'verbose', 'debug', 'silly']).default('info'),
   
-  CORS_ORIGIN: z.string().default('http://localhost:3001,http://localhost:3002,http://localhost:3333'),
+  CORS_ORIGIN: z.string().default('http://localhost:3001,http://localhost:3002,http://localhost:3333,http://localhost:3336'),
   
   SOCKET_IO_PATH: z.string().default('/socket.io'),
   

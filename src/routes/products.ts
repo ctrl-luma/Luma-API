@@ -4,6 +4,7 @@ import { query } from '../db';
 import { Product, Catalog } from '../db/models';
 import { logger } from '../utils/logger';
 import { imageService } from '../services/images';
+import { socketService, SocketEvents } from '../services/socket';
 
 const app = new OpenAPIHono();
 
@@ -316,6 +317,13 @@ app.openapi(createProductRoute, async (c) => {
     const row = rows[0];
     logger.info('Product created', { productId: row.id, catalogId });
 
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.PRODUCT_CREATED, {
+      productId: row.id,
+      catalogId,
+      name: row.name,
+    });
+
     // Get category name if categoryId was provided
     let categoryName: string | null = null;
     if (row.category_id) {
@@ -457,6 +465,13 @@ app.openapi(updateProductRoute, async (c) => {
     const row = rows[0];
     logger.info('Product updated', { productId: row.id });
 
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.PRODUCT_UPDATED, {
+      productId: row.id,
+      catalogId,
+      name: row.name,
+    });
+
     return c.json({
       id: row.id,
       catalogId: row.catalog_id,
@@ -519,6 +534,13 @@ app.openapi(deleteProductRoute, async (c) => {
     }
 
     logger.info('Product deleted', { productId, catalogId });
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.PRODUCT_DELETED, {
+      productId,
+      catalogId,
+    });
+
     return c.json({ success: true });
   } catch (error: any) {
     if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
