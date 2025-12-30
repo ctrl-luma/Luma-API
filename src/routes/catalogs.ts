@@ -8,6 +8,8 @@ import { socketService, SocketEvents } from '../services/socket';
 const app = new OpenAPIHono();
 
 // Schema definitions
+const layoutTypeSchema = z.enum(['grid', 'list', 'large-grid', 'compact']);
+
 const catalogSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -15,6 +17,11 @@ const catalogSchema = z.object({
   location: z.string().nullable(),
   date: z.string().nullable(),
   isActive: z.boolean(),
+  showTipScreen: z.boolean(),
+  promptForEmail: z.boolean(),
+  tipPercentages: z.array(z.number()),
+  allowCustomTip: z.boolean(),
+  layoutType: layoutTypeSchema,
   productCount: z.number(),
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -26,6 +33,11 @@ const createCatalogSchema = z.object({
   location: z.string().nullable().optional(),
   date: z.string().nullable().optional(),
   isActive: z.boolean().optional().default(true),
+  showTipScreen: z.boolean().optional().default(true),
+  promptForEmail: z.boolean().optional().default(true),
+  tipPercentages: z.array(z.number()).optional().default([15, 18, 20, 25]),
+  allowCustomTip: z.boolean().optional().default(true),
+  layoutType: layoutTypeSchema.optional().default('grid'),
 });
 
 const updateCatalogSchema = z.object({
@@ -34,6 +46,11 @@ const updateCatalogSchema = z.object({
   location: z.string().nullable().optional(),
   date: z.string().nullable().optional(),
   isActive: z.boolean().optional(),
+  showTipScreen: z.boolean().optional(),
+  promptForEmail: z.boolean().optional(),
+  tipPercentages: z.array(z.number()).optional(),
+  allowCustomTip: z.boolean().optional(),
+  layoutType: layoutTypeSchema.optional(),
 });
 
 // Helper to verify token and get user info
@@ -72,7 +89,7 @@ app.openapi(listCatalogsRoute, async (c) => {
 
     const rows = await query<Catalog & { product_count: number }>(
       `SELECT c.*,
-        (SELECT COUNT(*) FROM products WHERE catalog_id = c.id)::int as product_count
+        (SELECT COUNT(*) FROM catalog_products WHERE catalog_id = c.id)::int as product_count
        FROM catalogs c
        WHERE c.organization_id = $1
        ORDER BY c.created_at DESC`,
@@ -86,6 +103,11 @@ app.openapi(listCatalogsRoute, async (c) => {
       location: row.location,
       date: row.date,
       isActive: row.is_active,
+      showTipScreen: row.show_tip_screen,
+      promptForEmail: (row as any).prompt_for_email ?? true,
+      tipPercentages: (row as any).tip_percentages ?? [15, 18, 20, 25],
+      allowCustomTip: (row as any).allow_custom_tip ?? true,
+      layoutType: (row as any).layout_type || 'grid',
       productCount: row.product_count || 0,
       createdAt: row.created_at.toISOString(),
       updatedAt: row.updated_at.toISOString(),
@@ -133,7 +155,7 @@ app.openapi(getCatalogRoute, async (c) => {
 
     const rows = await query<Catalog & { product_count: number }>(
       `SELECT c.*,
-        (SELECT COUNT(*) FROM products WHERE catalog_id = c.id)::int as product_count
+        (SELECT COUNT(*) FROM catalog_products WHERE catalog_id = c.id)::int as product_count
        FROM catalogs c
        WHERE c.id = $1 AND c.organization_id = $2`,
       [id, payload.organizationId]
@@ -151,6 +173,11 @@ app.openapi(getCatalogRoute, async (c) => {
       location: row.location,
       date: row.date,
       isActive: row.is_active,
+      showTipScreen: row.show_tip_screen,
+      promptForEmail: (row as any).prompt_for_email ?? true,
+      tipPercentages: (row as any).tip_percentages ?? [15, 18, 20, 25],
+      allowCustomTip: (row as any).allow_custom_tip ?? true,
+      layoutType: (row as any).layout_type || 'grid',
       productCount: row.product_count || 0,
       createdAt: row.created_at.toISOString(),
       updatedAt: row.updated_at.toISOString(),
@@ -199,8 +226,8 @@ app.openapi(createCatalogRoute, async (c) => {
     const body = await c.req.json();
 
     const rows = await query<Catalog>(
-      `INSERT INTO catalogs (organization_id, name, description, location, date, is_active)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO catalogs (organization_id, name, description, location, date, is_active, show_tip_screen, prompt_for_email, tip_percentages, allow_custom_tip, layout_type)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
       [
         payload.organizationId,
@@ -209,6 +236,11 @@ app.openapi(createCatalogRoute, async (c) => {
         body.location || null,
         body.date || null,
         body.isActive ?? true,
+        body.showTipScreen ?? true,
+        body.promptForEmail ?? true,
+        JSON.stringify(body.tipPercentages ?? [15, 18, 20, 25]),
+        body.allowCustomTip ?? true,
+        body.layoutType || 'grid',
       ]
     );
 
@@ -228,6 +260,11 @@ app.openapi(createCatalogRoute, async (c) => {
       location: row.location,
       date: row.date,
       isActive: row.is_active,
+      showTipScreen: row.show_tip_screen,
+      promptForEmail: (row as any).prompt_for_email ?? true,
+      tipPercentages: (row as any).tip_percentages ?? [15, 18, 20, 25],
+      allowCustomTip: (row as any).allow_custom_tip ?? true,
+      layoutType: (row as any).layout_type || 'grid',
       productCount: 0,
       createdAt: row.created_at.toISOString(),
       updatedAt: row.updated_at.toISOString(),
@@ -311,6 +348,31 @@ app.openapi(updateCatalogRoute, async (c) => {
       values.push(body.isActive);
       paramCount++;
     }
+    if (body.showTipScreen !== undefined) {
+      updates.push(`show_tip_screen = $${paramCount}`);
+      values.push(body.showTipScreen);
+      paramCount++;
+    }
+    if (body.promptForEmail !== undefined) {
+      updates.push(`prompt_for_email = $${paramCount}`);
+      values.push(body.promptForEmail);
+      paramCount++;
+    }
+    if (body.tipPercentages !== undefined) {
+      updates.push(`tip_percentages = $${paramCount}`);
+      values.push(JSON.stringify(body.tipPercentages));
+      paramCount++;
+    }
+    if (body.allowCustomTip !== undefined) {
+      updates.push(`allow_custom_tip = $${paramCount}`);
+      values.push(body.allowCustomTip);
+      paramCount++;
+    }
+    if (body.layoutType !== undefined) {
+      updates.push(`layout_type = $${paramCount}`);
+      values.push(body.layoutType);
+      paramCount++;
+    }
 
     if (updates.length === 0) {
       return c.json({ error: 'No fields to update' }, 400);
@@ -323,7 +385,7 @@ app.openapi(updateCatalogRoute, async (c) => {
       `UPDATE catalogs
        SET ${updates.join(', ')}
        WHERE id = $${paramCount} AND organization_id = $${paramCount + 1}
-       RETURNING *, (SELECT COUNT(*) FROM products WHERE catalog_id = catalogs.id)::int as product_count`,
+       RETURNING *, (SELECT COUNT(*) FROM catalog_products WHERE catalog_id = catalogs.id)::int as product_count`,
       values
     );
 
@@ -347,6 +409,11 @@ app.openapi(updateCatalogRoute, async (c) => {
       location: row.location,
       date: row.date,
       isActive: row.is_active,
+      showTipScreen: row.show_tip_screen,
+      promptForEmail: (row as any).prompt_for_email ?? true,
+      tipPercentages: (row as any).tip_percentages ?? [15, 18, 20, 25],
+      allowCustomTip: (row as any).allow_custom_tip ?? true,
+      layoutType: (row as any).layout_type || 'grid',
       productCount: row.product_count || 0,
       createdAt: row.created_at.toISOString(),
       updatedAt: row.updated_at.toISOString(),

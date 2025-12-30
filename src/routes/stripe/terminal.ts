@@ -456,4 +456,125 @@ app.openapi(getPaymentIntentRoute, async (c) => {
   }
 });
 
+// ============================================
+// POST /stripe/terminal/payment-intent/:id/send-receipt - Send receipt email
+// ============================================
+const sendReceiptRoute = createRoute({
+  method: 'post',
+  path: '/stripe/terminal/payment-intent/{paymentIntentId}/send-receipt',
+  summary: 'Send receipt email for a completed payment',
+  description: 'Sends a Stripe receipt email to the specified email address for a completed payment',
+  tags: ['Stripe Terminal'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    params: z.object({
+      paymentIntentId: z.string(),
+    }),
+    body: {
+      content: {
+        'application/json': {
+          schema: z.object({
+            email: z.string().email(),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Receipt sent successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            success: z.boolean(),
+            receiptUrl: z.string().nullable(),
+          }),
+        },
+      },
+    },
+    400: { description: 'Invalid request or payment not completed' },
+    401: { description: 'Unauthorized' },
+    404: { description: 'Payment intent not found' },
+  },
+});
+
+app.openapi(sendReceiptRoute, async (c) => {
+  try {
+    const { paymentIntentId } = c.req.param();
+    const { connectedAccount, payload } = await getConnectedAccount(c.req.header('Authorization'));
+    const { email } = await c.req.json();
+
+    // Get the payment intent with the charge
+    const paymentIntent = await stripe.paymentIntents.retrieve(
+      paymentIntentId,
+      {
+        expand: ['latest_charge'],
+      },
+      {
+        stripeAccount: connectedAccount.stripe_account_id,
+      }
+    );
+
+    if (paymentIntent.status !== 'succeeded') {
+      return c.json({ error: 'Payment must be completed before sending receipt' }, 400);
+    }
+
+    if (!paymentIntent.latest_charge || typeof paymentIntent.latest_charge !== 'object') {
+      return c.json({ error: 'No charge found for this payment' }, 400);
+    }
+
+    const chargeId = paymentIntent.latest_charge.id;
+
+    // Update the charge with the receipt email - this triggers Stripe to send the email
+    const updatedCharge = await stripe.charges.update(
+      chargeId,
+      {
+        receipt_email: email,
+      },
+      {
+        stripeAccount: connectedAccount.stripe_account_id,
+      }
+    );
+
+    // Also save/update customer in our database
+    try {
+      await query(
+        `INSERT INTO customers (organization_id, email)
+         VALUES ($1, $2)
+         ON CONFLICT (organization_id, email) DO NOTHING`,
+        [payload.organizationId, email.toLowerCase()]
+      );
+    } catch (dbError) {
+      // Log but don't fail the request
+      logger.error('Failed to save customer email', { error: dbError, email });
+    }
+
+    logger.info('Receipt email sent', {
+      paymentIntentId,
+      chargeId,
+      email,
+      accountId: connectedAccount.stripe_account_id,
+    });
+
+    return c.json({
+      success: true,
+      receiptUrl: updatedCharge.receipt_url,
+    });
+  } catch (error: any) {
+    logger.error('Error sending receipt', { error: error.message });
+
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    if (error.type === 'StripeInvalidRequestError') {
+      if (error.message?.includes('No such payment_intent') || error.message?.includes('No such charge')) {
+        return c.json({ error: 'Payment not found' }, 404);
+      }
+      return c.json({ error: error.message }, 400);
+    }
+
+    return c.json({ error: 'Failed to send receipt' }, 500);
+  }
+});
+
 export default app;

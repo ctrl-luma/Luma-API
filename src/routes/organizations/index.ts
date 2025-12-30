@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { query } from '../../db';
 import { Organization } from '../../db/models';
 import { logger } from '../../utils/logger';
+import { socketService, SocketEvents } from '../../services/socket';
 
 const app = new OpenAPIHono();
 
@@ -138,9 +139,9 @@ app.openapi(getOrganizationRoute, async (c) => {
   }
 });
 
-// Update organization
+// Update organization (supports both PUT and PATCH)
 const updateOrganizationRoute = createRoute({
-  method: 'put',
+  method: 'patch',
   path: '/organizations/{id}',
   summary: 'Update organization details',
   tags: ['Organizations'],
@@ -224,8 +225,9 @@ app.openapi(updateOrganizationRoute, async (c) => {
     }
 
     if (body.settings !== undefined) {
-      updates.push(`settings = $${paramCount}`);
-      values.push(body.settings);
+      // Merge new settings with existing settings instead of replacing
+      updates.push(`settings = COALESCE(settings, '{}'::jsonb) || $${paramCount}::jsonb`);
+      values.push(JSON.stringify(body.settings));
       paramCount++;
     }
 
@@ -251,10 +253,18 @@ app.openapi(updateOrganizationRoute, async (c) => {
 
     const org = rows[0];
 
-    logger.info('Organization updated', { 
+    logger.info('Organization updated', {
       organizationId: org.id,
       userId: payload.userId,
       updates: Object.keys(body),
+    });
+
+    // Emit socket event to notify all connected clients in this org
+    socketService.emitToOrganization(org.id, SocketEvents.ORGANIZATION_UPDATED, {
+      organizationId: org.id,
+      settings: org.settings,
+      updatedBy: payload.userId,
+      timestamp: new Date().toISOString(),
     });
 
     return c.json({

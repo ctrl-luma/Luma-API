@@ -171,6 +171,8 @@ export interface AuditLog {
   created_at: Date;
 }
 
+export type CatalogLayoutType = 'grid' | 'list' | 'large-grid' | 'compact';
+
 export interface Catalog {
   id: string;
   organization_id: string;
@@ -179,15 +181,19 @@ export interface Catalog {
   location: string | null;
   date: string | null;
   is_active: boolean;
+  show_tip_screen: boolean;
+  layout_type: CatalogLayoutType; // Controls product display layout in mobile app
   created_at: Date;
   updated_at: Date;
 }
 
 export interface Category {
   id: string;
+  catalog_id: string; // Categories are catalog-specific
   organization_id: string;
   name: string;
   description: string | null;
+  icon: string | null; // Icon identifier/name for UI display
   sort_order: number;
   is_active: boolean;
   created_at: Date;
@@ -196,16 +202,39 @@ export interface Category {
 
 export interface Product {
   id: string;
-  catalog_id: string;
   organization_id: string;
   name: string;
   description: string | null;
-  price: number;
   image_id: string | null;
   image_url: string | null;
+  created_at: Date;
+  updated_at: Date;
+  // Removed: catalog_id, price, category_id, is_active, sort_order
+  // These are now in CatalogProduct join table
+}
+
+export interface CatalogProduct {
+  id: string;
+  catalog_id: string;
+  product_id: string;
   category_id: string | null;
-  is_active: boolean;
+  price: number; // Price for this product in this specific catalog
   sort_order: number;
+  is_active: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface Customer {
+  id: string;
+  organization_id: string;
+  email: string;
+  name: string | null;
+  phone: string | null;
+  total_orders: number;
+  total_spent: number;
+  last_order_at: Date | null;
+  metadata: Record<string, any>;
   created_at: Date;
   updated_at: Date;
 }

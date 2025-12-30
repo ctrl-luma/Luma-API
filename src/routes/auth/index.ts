@@ -82,6 +82,13 @@ app.openapi(loginRoute, async (c) => {
       return c.json({ error: 'Invalid credentials' }, 401);
     }
 
+    // Fetch organization data
+    const orgRows = await query<{ id: string; name: string; settings: any }>(
+      'SELECT id, name, settings FROM organizations WHERE id = $1',
+      [user.organization_id]
+    );
+    const org = orgRows[0];
+
     logger.info('User logged in', { userId: user.id, email: user.email });
 
     return c.json({
@@ -98,15 +105,19 @@ app.openapi(loginRoute, async (c) => {
         weeklyReports: user.weekly_reports,
         avatarUrl: imageService.getUrl(user.avatar_image_id),
       },
+      organization: org ? {
+        id: org.id,
+        name: org.name,
+      } : null,
       tokens,
     });
   } catch (error: any) {
     logger.error('Login error', { error, email: validated.email });
-    
+
     if (error.message === 'Invalid credentials') {
       return c.json({ error: 'Invalid credentials' }, 401);
     }
-    
+
     return c.json({ error: 'Login failed' }, 500);
   }
 });
@@ -1025,7 +1036,10 @@ app.openapi(uploadAvatarRoute, async (c) => {
     const existingAvatarId = currentUser.avatar_image_id;
 
     // Upload the image (will replace if existingAvatarId is provided)
-    const uploadResult = await imageService.upload(buffer, contentType, existingAvatarId || undefined);
+    const uploadResult = await imageService.upload(buffer, contentType, {
+      existingId: existingAvatarId || undefined,
+      imageType: 'avatar',
+    });
 
     // Update user's avatar_image_id in database
     await query(

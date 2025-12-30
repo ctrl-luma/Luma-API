@@ -3,14 +3,18 @@ import { z } from 'zod';
 import { query } from '../db';
 import { Category } from '../db/models';
 import { logger } from '../utils/logger';
+import { socketService, SocketEvents } from '../services/socket';
 
 const app = new OpenAPIHono();
 
-// Schema definitions
+// Schema definitions (updated for catalog-specific categories)
+// Note: layoutType has been moved to catalogs table (migration 017)
 const categorySchema = z.object({
   id: z.string(),
+  catalogId: z.string(),
   name: z.string(),
   description: z.string().nullable(),
+  icon: z.string().nullable(),
   sortOrder: z.number(),
   isActive: z.boolean(),
   productCount: z.number(),
@@ -21,12 +25,14 @@ const categorySchema = z.object({
 const createCategorySchema = z.object({
   name: z.string().min(1),
   description: z.string().nullable().optional(),
+  icon: z.string().nullable().optional(),
   isActive: z.boolean().optional().default(true),
 });
 
 const updateCategorySchema = z.object({
   name: z.string().min(1).optional(),
   description: z.string().nullable().optional(),
+  icon: z.string().nullable().optional(),
   sortOrder: z.number().optional(),
   isActive: z.boolean().optional(),
 });
@@ -45,13 +51,29 @@ async function verifyAuth(authHeader: string | undefined) {
   return authService.verifyToken(token);
 }
 
-// List categories for organization
+// Helper to verify catalog ownership
+async function verifyCatalogOwnership(catalogId: string, organizationId: string) {
+  const rows = await query(
+    'SELECT id FROM catalogs WHERE id = $1 AND organization_id = $2',
+    [catalogId, organizationId]
+  );
+  if (rows.length === 0) {
+    throw new Error('Catalog not found');
+  }
+}
+
+// List categories for a catalog
 const listCategoriesRoute = createRoute({
   method: 'get',
-  path: '/categories',
-  summary: 'List all categories for the organization',
+  path: '/catalogs/{catalogId}/categories',
+  summary: 'List all categories for a catalog',
   tags: ['Categories'],
   security: [{ bearerAuth: [] }],
+  request: {
+    params: z.object({
+      catalogId: z.string().uuid(),
+    }),
+  },
   responses: {
     200: {
       description: 'List of categories',
@@ -62,26 +84,32 @@ const listCategoriesRoute = createRoute({
       },
     },
     401: { description: 'Unauthorized' },
+    404: { description: 'Catalog not found' },
   },
 });
 
 app.openapi(listCategoriesRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+    const { catalogId } = c.req.param();
+
+    await verifyCatalogOwnership(catalogId, payload.organizationId);
 
     const rows = await query<Category & { product_count: number }>(
       `SELECT c.*,
-        (SELECT COUNT(*) FROM products WHERE category_id = c.id)::int as product_count
+        (SELECT COUNT(*) FROM catalog_products WHERE category_id = c.id)::int as product_count
        FROM categories c
-       WHERE c.organization_id = $1
+       WHERE c.catalog_id = $1
        ORDER BY c.sort_order ASC, c.created_at DESC`,
-      [payload.organizationId]
+      [catalogId]
     );
 
     return c.json(rows.map(row => ({
       id: row.id,
+      catalogId: row.catalog_id,
       name: row.name,
       description: row.description,
+      icon: row.icon,
       sortOrder: row.sort_order,
       isActive: row.is_active,
       productCount: row.product_count || 0,
@@ -92,6 +120,9 @@ app.openapi(listCategoriesRoute, async (c) => {
     if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
       return c.json({ error: 'Unauthorized' }, 401);
     }
+    if (error.message === 'Catalog not found') {
+      return c.json({ error: 'Catalog not found' }, 404);
+    }
     logger.error('Error listing categories', { error });
     return c.json({ error: 'Failed to list categories' }, 500);
   }
@@ -100,12 +131,13 @@ app.openapi(listCategoriesRoute, async (c) => {
 // Get single category
 const getCategoryRoute = createRoute({
   method: 'get',
-  path: '/categories/{id}',
+  path: '/catalogs/{catalogId}/categories/{id}',
   summary: 'Get a category by ID',
   tags: ['Categories'],
   security: [{ bearerAuth: [] }],
   request: {
     params: z.object({
+      catalogId: z.string().uuid(),
       id: z.string().uuid(),
     }),
   },
@@ -124,17 +156,19 @@ const getCategoryRoute = createRoute({
 });
 
 app.openapi(getCategoryRoute, async (c) => {
-  const { id } = c.req.param();
+  const { catalogId, id } = c.req.param();
 
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
 
+    await verifyCatalogOwnership(catalogId, payload.organizationId);
+
     const rows = await query<Category & { product_count: number }>(
       `SELECT c.*,
-        (SELECT COUNT(*) FROM products WHERE category_id = c.id)::int as product_count
+        (SELECT COUNT(*) FROM catalog_products WHERE category_id = c.id)::int as product_count
        FROM categories c
-       WHERE c.id = $1 AND c.organization_id = $2`,
-      [id, payload.organizationId]
+       WHERE c.id = $1 AND c.catalog_id = $2`,
+      [id, catalogId]
     );
 
     if (!rows[0]) {
@@ -144,8 +178,10 @@ app.openapi(getCategoryRoute, async (c) => {
     const row = rows[0];
     return c.json({
       id: row.id,
+      catalogId: row.catalog_id,
       name: row.name,
       description: row.description,
+      icon: row.icon,
       sortOrder: row.sort_order,
       isActive: row.is_active,
       productCount: row.product_count || 0,
@@ -156,7 +192,10 @@ app.openapi(getCategoryRoute, async (c) => {
     if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
       return c.json({ error: 'Unauthorized' }, 401);
     }
-    logger.error('Error fetching category', { error, categoryId: id });
+    if (error.message === 'Catalog not found') {
+      return c.json({ error: 'Catalog not found' }, 404);
+    }
+    logger.error('Error fetching category', { error, id });
     return c.json({ error: 'Failed to fetch category' }, 500);
   }
 });
@@ -164,11 +203,14 @@ app.openapi(getCategoryRoute, async (c) => {
 // Create category
 const createCategoryRoute = createRoute({
   method: 'post',
-  path: '/categories',
+  path: '/catalogs/{catalogId}/categories',
   summary: 'Create a new category',
   tags: ['Categories'],
   security: [{ bearerAuth: [] }],
   request: {
+    params: z.object({
+      catalogId: z.string().uuid(),
+    }),
     body: {
       content: {
         'application/json': {
@@ -187,41 +229,57 @@ const createCategoryRoute = createRoute({
       },
     },
     401: { description: 'Unauthorized' },
+    404: { description: 'Catalog not found' },
   },
 });
 
 app.openapi(createCategoryRoute, async (c) => {
+  const { catalogId } = c.req.param();
+
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
 
+    await verifyCatalogOwnership(catalogId, payload.organizationId);
+
     // Get max sort order
     const maxOrderResult = await query<{ max: number }>(
-      'SELECT COALESCE(MAX(sort_order), -1) as max FROM categories WHERE organization_id = $1',
-      [payload.organizationId]
+      'SELECT COALESCE(MAX(sort_order), -1) as max FROM categories WHERE catalog_id = $1',
+      [catalogId]
     );
     const sortOrder = (maxOrderResult[0]?.max ?? -1) + 1;
 
     const rows = await query<Category>(
-      `INSERT INTO categories (organization_id, name, description, sort_order, is_active)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO categories (catalog_id, organization_id, name, description, icon, sort_order, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING *`,
       [
+        catalogId,
         payload.organizationId,
         body.name,
         body.description || null,
+        body.icon || null,
         sortOrder,
         body.isActive ?? true,
       ]
     );
 
     const row = rows[0];
-    logger.info('Category created', { categoryId: row.id, organizationId: payload.organizationId });
+    logger.info('Category created', { categoryId: row.id, catalogId });
+
+    // Emit socket event
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.CATEGORY_CREATED, {
+      categoryId: row.id,
+      catalogId,
+      name: row.name,
+    });
 
     return c.json({
       id: row.id,
+      catalogId: row.catalog_id,
       name: row.name,
       description: row.description,
+      icon: row.icon,
       sortOrder: row.sort_order,
       isActive: row.is_active,
       productCount: 0,
@@ -232,20 +290,24 @@ app.openapi(createCategoryRoute, async (c) => {
     if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
       return c.json({ error: 'Unauthorized' }, 401);
     }
-    logger.error('Error creating category', { error });
+    if (error.message === 'Catalog not found') {
+      return c.json({ error: 'Catalog not found' }, 404);
+    }
+    logger.error('Error creating category', { error, catalogId });
     return c.json({ error: 'Failed to create category' }, 500);
   }
 });
 
 // Update category
 const updateCategoryRoute = createRoute({
-  method: 'put',
-  path: '/categories/{id}',
+  method: 'patch',
+  path: '/catalogs/{catalogId}/categories/{id}',
   summary: 'Update a category',
   tags: ['Categories'],
   security: [{ bearerAuth: [] }],
   request: {
     params: z.object({
+      catalogId: z.string().uuid(),
       id: z.string().uuid(),
     }),
     body: {
@@ -271,11 +333,13 @@ const updateCategoryRoute = createRoute({
 });
 
 app.openapi(updateCategoryRoute, async (c) => {
-  const { id } = c.req.param();
+  const { catalogId, id } = c.req.param();
 
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
+
+    await verifyCatalogOwnership(catalogId, payload.organizationId);
 
     // Build update query dynamically
     const updates: string[] = [];
@@ -290,6 +354,11 @@ app.openapi(updateCategoryRoute, async (c) => {
     if (body.description !== undefined) {
       updates.push(`description = $${paramCount}`);
       values.push(body.description);
+      paramCount++;
+    }
+    if (body.icon !== undefined) {
+      updates.push(`icon = $${paramCount}`);
+      values.push(body.icon);
       paramCount++;
     }
     if (body.sortOrder !== undefined) {
@@ -308,13 +377,14 @@ app.openapi(updateCategoryRoute, async (c) => {
     }
 
     updates.push(`updated_at = NOW()`);
-    values.push(id, payload.organizationId);
+    values.push(id, catalogId);
 
     const rows = await query<Category & { product_count: number }>(
       `UPDATE categories
        SET ${updates.join(', ')}
-       WHERE id = $${paramCount} AND organization_id = $${paramCount + 1}
-       RETURNING *, (SELECT COUNT(*) FROM products WHERE category_id = categories.id)::int as product_count`,
+       WHERE id = $${paramCount} AND catalog_id = $${paramCount + 1}
+       RETURNING *,
+         (SELECT COUNT(*) FROM catalog_products WHERE category_id = categories.id)::int as product_count`,
       values
     );
 
@@ -325,10 +395,19 @@ app.openapi(updateCategoryRoute, async (c) => {
     const row = rows[0];
     logger.info('Category updated', { categoryId: row.id });
 
+    // Emit socket event
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.CATEGORY_UPDATED, {
+      categoryId: row.id,
+      catalogId,
+      name: row.name,
+    });
+
     return c.json({
       id: row.id,
+      catalogId: row.catalog_id,
       name: row.name,
       description: row.description,
+      icon: row.icon,
       sortOrder: row.sort_order,
       isActive: row.is_active,
       productCount: row.product_count || 0,
@@ -339,7 +418,10 @@ app.openapi(updateCategoryRoute, async (c) => {
     if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
       return c.json({ error: 'Unauthorized' }, 401);
     }
-    logger.error('Error updating category', { error, categoryId: id });
+    if (error.message === 'Catalog not found') {
+      return c.json({ error: 'Catalog not found' }, 404);
+    }
+    logger.error('Error updating category', { error, id });
     return c.json({ error: 'Failed to update category' }, 500);
   }
 });
@@ -347,56 +429,72 @@ app.openapi(updateCategoryRoute, async (c) => {
 // Delete category
 const deleteCategoryRoute = createRoute({
   method: 'delete',
-  path: '/categories/{id}',
+  path: '/catalogs/{catalogId}/categories/{id}',
   summary: 'Delete a category',
   tags: ['Categories'],
   security: [{ bearerAuth: [] }],
   request: {
     params: z.object({
+      catalogId: z.string().uuid(),
       id: z.string().uuid(),
     }),
   },
   responses: {
-    200: { description: 'Category deleted' },
+    204: { description: 'Category deleted' },
     401: { description: 'Unauthorized' },
     404: { description: 'Category not found' },
   },
 });
 
 app.openapi(deleteCategoryRoute, async (c) => {
-  const { id } = c.req.param();
+  const { catalogId, id } = c.req.param();
 
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
 
+    await verifyCatalogOwnership(catalogId, payload.organizationId);
+
     const result = await query(
-      `DELETE FROM categories WHERE id = $1 AND organization_id = $2 RETURNING id`,
-      [id, payload.organizationId]
+      'DELETE FROM categories WHERE id = $1 AND catalog_id = $2 RETURNING id',
+      [id, catalogId]
     );
 
     if (result.length === 0) {
       return c.json({ error: 'Category not found' }, 404);
     }
 
-    logger.info('Category deleted', { categoryId: id });
-    return c.json({ success: true });
+    logger.info('Category deleted', { categoryId: id, catalogId });
+
+    // Emit socket event
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.CATEGORY_DELETED, {
+      categoryId: id,
+      catalogId,
+    });
+
+    return c.body(null, 204);
   } catch (error: any) {
     if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
       return c.json({ error: 'Unauthorized' }, 401);
     }
-    logger.error('Error deleting category', { error, categoryId: id });
+    if (error.message === 'Catalog not found') {
+      return c.json({ error: 'Catalog not found' }, 404);
+    }
+    logger.error('Error deleting category', { error, id });
     return c.json({ error: 'Failed to delete category' }, 500);
   }
 });
 
 // Reorder categories
 const reorderCategoriesRoute = createRoute({
-  method: 'put',
-  path: '/categories/reorder',
+  method: 'post',
+  path: '/catalogs/{catalogId}/categories/reorder',
   summary: 'Reorder categories',
   tags: ['Categories'],
   security: [{ bearerAuth: [] }],
   request: {
+    params: z.object({
+      catalogId: z.string().uuid(),
+    }),
     body: {
       content: {
         'application/json': {
@@ -408,30 +506,43 @@ const reorderCategoriesRoute = createRoute({
   responses: {
     200: { description: 'Categories reordered' },
     401: { description: 'Unauthorized' },
+    404: { description: 'Catalog not found' },
   },
 });
 
 app.openapi(reorderCategoriesRoute, async (c) => {
+  const { catalogId } = c.req.param();
+
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
 
-    // Update sort_order for each category
+    await verifyCatalogOwnership(catalogId, payload.organizationId);
+
+    // Update sort order for each category
     for (let i = 0; i < body.categoryIds.length; i++) {
       await query(
-        `UPDATE categories SET sort_order = $1, updated_at = NOW()
-         WHERE id = $2 AND organization_id = $3`,
-        [i, body.categoryIds[i], payload.organizationId]
+        'UPDATE categories SET sort_order = $1, updated_at = NOW() WHERE id = $2 AND catalog_id = $3',
+        [i, body.categoryIds[i], catalogId]
       );
     }
 
-    logger.info('Categories reordered', { organizationId: payload.organizationId });
+    logger.info('Categories reordered', { catalogId, count: body.categoryIds.length });
+
+    // Emit socket event
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.CATEGORIES_REORDERED, {
+      catalogId,
+    });
+
     return c.json({ success: true });
   } catch (error: any) {
     if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
       return c.json({ error: 'Unauthorized' }, 401);
     }
-    logger.error('Error reordering categories', { error });
+    if (error.message === 'Catalog not found') {
+      return c.json({ error: 'Catalog not found' }, 404);
+    }
+    logger.error('Error reordering categories', { error, catalogId });
     return c.json({ error: 'Failed to reorder categories' }, 500);
   }
 });

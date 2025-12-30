@@ -138,7 +138,7 @@ app.openapi(uploadImageRoute, async (c) => {
     }
 
     const buffer = await file.arrayBuffer();
-    const result = await imageService.upload(buffer, file.type);
+    const result = await imageService.upload(buffer, file.type, { imageType: 'product' });
 
     logger.info('Image uploaded', { imageId: result.id, size: result.sizeBytes });
 

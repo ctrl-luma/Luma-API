@@ -23,9 +23,11 @@ import contactRoutes from './routes/contact';
 import marketingRoutes from './routes/marketing';
 import { billingRoutes } from './routes/billing';
 import catalogRoutes from './routes/catalogs';
+import catalogProductRoutes from './routes/catalog-products';
 import productRoutes from './routes/products';
 import categoryRoutes from './routes/categories';
 import imageRoutes from './routes/images';
+import customerRoutes from './routes/customers';
 
 const app = new OpenAPIHono();
 
@@ -95,9 +97,11 @@ app.route('/contact', contactRoutes);
 app.route('/marketing', marketingRoutes);
 app.route('/', billingRoutes);
 app.route('/', catalogRoutes);
+app.route('/', catalogProductRoutes);
 app.route('/', productRoutes);
 app.route('/', categoryRoutes);
 app.route('/', imageRoutes);
+app.route('/', customerRoutes);
 
 app.onError(errorHandler);
 

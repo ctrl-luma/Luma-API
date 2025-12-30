@@ -1,6 +1,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as crypto from 'crypto';
+import sharp from 'sharp';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
 
@@ -11,6 +12,14 @@ const ALLOWED_MIME_TYPES = new Set([
   'image/webp',
   'image/gif',
 ]);
+
+// Image type configurations for resizing
+export type ImageType = 'product' | 'avatar';
+
+const IMAGE_SIZE_CONFIGS: Record<ImageType, { maxWidth: number; maxHeight: number; quality: number }> = {
+  product: { maxWidth: 1200, maxHeight: 1200, quality: 85 },
+  avatar: { maxWidth: 400, maxHeight: 400, quality: 90 },
+};
 
 
 // Base path for image storage (configurable, defaults to /data/images)
@@ -95,16 +104,89 @@ function validateFile(
 }
 
 /**
+ * Processes and resizes an image based on the image type
+ * - Resizes to fit within max dimensions while maintaining aspect ratio
+ * - Converts to WebP for better compression (except GIFs which keep animation)
+ * - Applies quality optimization
+ */
+async function processImage(
+  buffer: ArrayBuffer,
+  contentType: string,
+  imageType: ImageType = 'product'
+): Promise<{ data: Buffer; contentType: string }> {
+  const sizeConfig = IMAGE_SIZE_CONFIGS[imageType];
+  const inputBuffer = Buffer.from(buffer);
+
+  try {
+    // For GIFs, we keep the original to preserve animation
+    // but still resize if needed
+    if (contentType === 'image/gif') {
+      const metadata = await sharp(inputBuffer).metadata();
+
+      // If GIF is already within limits, return as-is
+      if (metadata.width && metadata.height &&
+          metadata.width <= sizeConfig.maxWidth &&
+          metadata.height <= sizeConfig.maxHeight) {
+        return { data: inputBuffer, contentType: 'image/gif' };
+      }
+
+      // Resize GIF (note: this will lose animation, so we just return original if too big)
+      // For proper GIF resizing with animation, would need gifsicle
+      logger.warn('GIF exceeds max dimensions but keeping original to preserve animation', {
+        width: metadata.width,
+        height: metadata.height,
+        maxWidth: sizeConfig.maxWidth,
+        maxHeight: sizeConfig.maxHeight,
+      });
+      return { data: inputBuffer, contentType: 'image/gif' };
+    }
+
+    // For other formats, resize and convert to WebP for better compression
+    const processed = await sharp(inputBuffer)
+      .resize(sizeConfig.maxWidth, sizeConfig.maxHeight, {
+        fit: 'inside', // Maintain aspect ratio, fit within bounds
+        withoutEnlargement: true, // Don't upscale small images
+      })
+      .webp({ quality: sizeConfig.quality })
+      .toBuffer();
+
+    logger.info('Image processed', {
+      imageType,
+      originalSize: buffer.byteLength,
+      processedSize: processed.byteLength,
+      compressionRatio: ((1 - processed.byteLength / buffer.byteLength) * 100).toFixed(1) + '%',
+    });
+
+    return { data: processed, contentType: 'image/webp' };
+  } catch (error) {
+    logger.error('Failed to process image', { error, imageType });
+    // If processing fails, return original
+    return { data: inputBuffer, contentType };
+  }
+}
+
+/**
  * Uploads a new image or replaces an existing one
  * Uses atomic write (temp file + rename) for safety
+ *
+ * @param buffer - The raw image buffer
+ * @param contentType - The MIME type of the image
+ * @param options - Optional configuration
+ * @param options.existingId - If provided, replaces the existing image
+ * @param options.imageType - Type of image for sizing ('product' | 'avatar'), defaults to 'product'
  */
 export async function uploadImage(
   buffer: ArrayBuffer,
   contentType: string,
-  existingId?: string
+  options?: { existingId?: string; imageType?: ImageType }
 ): Promise<UploadResult> {
+  const { existingId, imageType = 'product' } = options || {};
+
   // Validate file first
   validateFile(buffer, contentType);
+
+  // Process and resize the image
+  const processed = await processImage(buffer, contentType, imageType);
 
   // Ensure storage directories exist
   await ensureStorageDirectories();
@@ -118,24 +200,27 @@ export async function uploadImage(
   const tempPath = path.join(TEMP_STORAGE_PATH, `${imageId}_${crypto.randomBytes(4).toString('hex')}`);
 
   try {
-    // Write to temp file first
-    await fs.writeFile(tempPath, Buffer.from(buffer));
+    // Write processed image to temp file first
+    await fs.writeFile(tempPath, processed.data);
 
     // Atomic rename to final location
     await fs.rename(tempPath, finalPath);
 
     logger.info('Image uploaded successfully', {
       imageId,
-      contentType,
-      sizeBytes: buffer.byteLength,
+      originalContentType: contentType,
+      finalContentType: processed.contentType,
+      originalSize: buffer.byteLength,
+      finalSize: processed.data.byteLength,
+      imageType,
       isReplacement: !!existingId,
     });
 
     return {
       id: imageId,
       url: buildPublicUrl(imageId),
-      contentType,
-      sizeBytes: buffer.byteLength,
+      contentType: processed.contentType,
+      sizeBytes: processed.data.byteLength,
     };
   } catch (error) {
     // Clean up temp file if it exists
