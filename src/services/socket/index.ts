@@ -200,4 +200,5 @@ export const SocketEvents = {
   CATEGORY_UPDATED: 'category:updated',
   CATEGORY_CREATED: 'category:created',
   CATEGORY_DELETED: 'category:deleted',
+  CATEGORIES_REORDERED: 'categories:reordered',
 } as const;
