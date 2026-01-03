@@ -174,6 +174,8 @@ export const SocketEvents = {
   ORDER_CREATED: 'order:created',
   ORDER_UPDATED: 'order:updated',
   ORDER_COMPLETED: 'order:completed',
+  ORDER_FAILED: 'order:failed',
+  ORDER_REFUNDED: 'order:refunded',
   PAYMENT_RECEIVED: 'payment:received',
   TIP_UPDATED: 'tip:updated',
   EVENT_STARTED: 'event:started',

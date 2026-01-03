@@ -2,13 +2,21 @@ import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
 import { z } from 'zod';
 import { query } from '../db';
 import { Customer } from '../db/models';
-import { authMiddleware } from '../middleware/auth';
 import { logger } from '../utils/logger';
 
 const app = new OpenAPIHono();
 
-// Apply auth middleware to all routes
-app.use('*', authMiddleware);
+// Auth verification helper (same pattern as orders.ts)
+async function verifyAuth(authHeader: string | undefined) {
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    throw new Error('Unauthorized');
+  }
+
+  const token = authHeader.substring(7);
+  const { authService } = await import('../services/auth');
+  const payload = await authService.verifyToken(token);
+  return payload;
+}
 
 // List customers for organization
 const listCustomersRoute = createRoute({
@@ -45,16 +53,21 @@ const listCustomersRoute = createRoute({
         },
       },
     },
+    401: { description: 'Unauthorized' },
   },
 });
 
 app.openapi(listCustomersRoute, async (c) => {
-  const user = c.get('user' as never) as { organizationId: string };
-  const { search, limit, offset } = c.req.query();
-
   try {
+    const payload = await verifyAuth(c.req.header('Authorization'));
+    const { search, limit, offset } = c.req.query();
+
+    // Parse with defaults
+    const limitNum = parseInt(limit || '50', 10);
+    const offsetNum = parseInt(offset || '0', 10);
+
     let whereClause = 'WHERE organization_id = $1';
-    const params: any[] = [user.organizationId];
+    const params: any[] = [payload.organizationId];
     let paramCount = 2;
 
     if (search) {
@@ -71,7 +84,7 @@ app.openapi(listCustomersRoute, async (c) => {
     const total = parseInt(countResult[0]?.count || '0', 10);
 
     // Get customers
-    params.push(parseInt(limit, 10), parseInt(offset, 10));
+    params.push(limitNum, offsetNum);
     const customers = await query<Customer>(
       `SELECT * FROM customers ${whereClause}
        ORDER BY last_order_at DESC NULLS LAST, created_at DESC
@@ -92,8 +105,11 @@ app.openapi(listCustomersRoute, async (c) => {
       })),
       total,
     });
-  } catch (error) {
-    logger.error('Error listing customers', { error, organizationId: user.organizationId });
+  } catch (error: any) {
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    logger.error('Error listing customers', { error });
     return c.json({ error: 'Failed to list customers' }, 500);
   }
 });
@@ -137,18 +153,19 @@ const upsertCustomerRoute = createRoute({
         },
       },
     },
+    401: { description: 'Unauthorized' },
   },
 });
 
 app.openapi(upsertCustomerRoute, async (c) => {
-  const user = c.get('user' as never) as { organizationId: string };
-  const body = await c.req.json();
-
   try {
+    const payload = await verifyAuth(c.req.header('Authorization'));
+    const body = await c.req.json();
+
     // Check if customer exists
     const existing = await query<Customer>(
       'SELECT * FROM customers WHERE organization_id = $1 AND email = $2',
-      [user.organizationId, body.email.toLowerCase()]
+      [payload.organizationId, body.email.toLowerCase()]
     );
 
     let customer: Customer;
@@ -188,7 +205,7 @@ app.openapi(upsertCustomerRoute, async (c) => {
       const result = await query<Customer>(
         `INSERT INTO customers (organization_id, email, name, phone)
          VALUES ($1, $2, $3, $4) RETURNING *`,
-        [user.organizationId, body.email.toLowerCase(), body.name || null, body.phone || null]
+        [payload.organizationId, body.email.toLowerCase(), body.name || null, body.phone || null]
       );
       customer = result[0];
       isNew = true;
@@ -196,7 +213,7 @@ app.openapi(upsertCustomerRoute, async (c) => {
 
     logger.info('Customer upserted', {
       customerId: customer.id,
-      organizationId: user.organizationId,
+      organizationId: payload.organizationId,
       isNew,
     });
 
@@ -211,8 +228,11 @@ app.openapi(upsertCustomerRoute, async (c) => {
       createdAt: customer.created_at.toISOString(),
       isNew,
     });
-  } catch (error) {
-    logger.error('Error upserting customer', { error, organizationId: user.organizationId });
+  } catch (error: any) {
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    logger.error('Error upserting customer', { error });
     return c.json({ error: 'Failed to save customer' }, 500);
   }
 });
@@ -245,31 +265,35 @@ const searchCustomersRoute = createRoute({
         },
       },
     },
+    401: { description: 'Unauthorized' },
   },
 });
 
 app.openapi(searchCustomersRoute, async (c) => {
-  const user = c.get('user' as never) as { organizationId: string };
-  const { q, limit } = c.req.query();
-
   try {
+    const payload = await verifyAuth(c.req.header('Authorization'));
+    const { q, limit } = c.req.query();
+
     const customers = await query<Customer>(
       `SELECT id, email, name FROM customers
        WHERE organization_id = $1 AND email ILIKE $2
        ORDER BY last_order_at DESC NULLS LAST
        LIMIT $3`,
-      [user.organizationId, `%${q}%`, parseInt(limit, 10)]
+      [payload.organizationId, `%${q}%`, parseInt(limit, 10)]
     );
 
     return c.json({
-      customers: customers.map(c => ({
-        id: c.id,
-        email: c.email,
-        name: c.name,
+      customers: customers.map(customer => ({
+        id: customer.id,
+        email: customer.email,
+        name: customer.name,
       })),
     });
-  } catch (error) {
-    logger.error('Error searching customers', { error, organizationId: user.organizationId });
+  } catch (error: any) {
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    logger.error('Error searching customers', { error });
     return c.json({ error: 'Failed to search customers' }, 500);
   }
 });
@@ -306,15 +330,16 @@ const updateCustomerStatsRoute = createRoute({
         },
       },
     },
+    401: { description: 'Unauthorized' },
   },
 });
 
 app.openapi(updateCustomerStatsRoute, async (c) => {
-  const user = c.get('user' as never) as { organizationId: string };
-  const { id } = c.req.param();
-  const { orderTotal } = await c.req.json();
-
   try {
+    const payload = await verifyAuth(c.req.header('Authorization'));
+    const { id } = c.req.param();
+    const { orderTotal } = await c.req.json();
+
     await query(
       `UPDATE customers
        SET total_orders = total_orders + 1,
@@ -322,12 +347,15 @@ app.openapi(updateCustomerStatsRoute, async (c) => {
            last_order_at = NOW(),
            updated_at = NOW()
        WHERE id = $2 AND organization_id = $3`,
-      [orderTotal, id, user.organizationId]
+      [orderTotal, id, payload.organizationId]
     );
 
     return c.json({ success: true });
-  } catch (error) {
-    logger.error('Error updating customer stats', { error, customerId: id });
+  } catch (error: any) {
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    logger.error('Error updating customer stats', { error });
     return c.json({ error: 'Failed to update customer stats' }, 500);
   }
 });

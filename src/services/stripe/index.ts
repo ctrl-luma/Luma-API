@@ -108,6 +108,14 @@ export class StripeService {
           card_payments: { requested: true },
           transfers: { requested: true },
         },
+        settings: {
+          payouts: {
+            schedule: {
+              delay_days: 'minimum',
+              interval: 'manual',
+            },
+          },
+        },
         metadata: params.metadata,
       });
 
@@ -752,7 +760,7 @@ export class StripeService {
         {
           charge: params.charge,
           payment_intent: params.payment_intent,
-          amount: params.amount ? Math.round(params.amount * 100) : undefined,
+          amount: params.amount, // Already in cents from the API
           reason: params.reason,
           metadata: params.metadata,
         },

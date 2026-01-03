@@ -28,6 +28,7 @@ import productRoutes from './routes/products';
 import categoryRoutes from './routes/categories';
 import imageRoutes from './routes/images';
 import customerRoutes from './routes/customers';
+import orderRoutes from './routes/orders';
 
 const app = new OpenAPIHono();
 
@@ -87,6 +88,7 @@ app.doc('/openapi.json', {
 app.get('/swagger', swaggerUI({ url: '/openapi.json' }));
 
 // Mount routes
+app.route('/', orderRoutes);
 app.route('/', authRoutes);
 app.route('/', organizationRoutes);
 app.route('/', stripeWebhookRoutes);

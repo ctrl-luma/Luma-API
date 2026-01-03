@@ -68,6 +68,14 @@ app.openapi(connectWebhookRoute, async (c) => {
 
   try {
     switch (event.type) {
+      case 'payment_intent.succeeded':
+        await handlePaymentIntentSucceeded(event.data.object, event.account);
+        break;
+
+      case 'payment_intent.payment_failed':
+        await handlePaymentIntentFailed(event.data.object, event.account);
+        break;
+
       case 'account.updated':
         await handleAccountUpdated(event.data.object, event.account);
         break;
@@ -86,6 +94,10 @@ app.openapi(connectWebhookRoute, async (c) => {
 
       case 'transfer.created':
         await handleConnectTransferCreated(event.data.object, event.account);
+        break;
+
+      case 'charge.refunded':
+        await handleChargeRefunded(event.data.object, event.account);
         break;
 
       default:
@@ -313,20 +325,143 @@ async function checkAndCreateAutomaticPayout(
   try {
     // Check if automatic payouts are enabled for this account
     const account = await stripeService.retrieveAccount(connectedAccountId);
-    
+
     if (account.settings?.payouts?.schedule?.interval === 'manual') {
       // Create manual payout if balance exceeds threshold
       logger.info('Creating automatic payout for high balance', {
         accountId: connectedAccountId,
         amount: availableAmount / 100,
       });
-      
+
       // Note: Actual payout creation would happen through Stripe API
       // This is just logging the intention
     }
   } catch (error) {
     logger.error('Failed to check automatic payout', { error, accountId: connectedAccountId });
   }
+}
+
+async function handlePaymentIntentSucceeded(paymentIntent: any, connectedAccountId: string | undefined) {
+  await transaction(async (client) => {
+    // Update order status to completed
+    const result = await client.query(
+      `UPDATE orders
+       SET status = 'completed',
+           stripe_charge_id = $1,
+           updated_at = NOW()
+       WHERE stripe_payment_intent_id = $2
+       RETURNING id, order_number, organization_id, catalog_id, total_amount`,
+      [paymentIntent.latest_charge, paymentIntent.id]
+    );
+
+    if (result.rows.length > 0) {
+      const order = result.rows[0];
+
+      logger.info('Order marked as completed via Connect webhook', {
+        orderId: order.id,
+        orderNumber: order.order_number,
+        organizationId: order.organization_id,
+        catalogId: order.catalog_id,
+        paymentIntentId: paymentIntent.id,
+        chargeId: paymentIntent.latest_charge,
+        connectedAccountId,
+      });
+
+      // Emit socket event for real-time updates
+      socketService.emitToOrganization(order.organization_id, SocketEvents.ORDER_COMPLETED, {
+        orderId: order.id,
+        orderNumber: order.order_number,
+        amount: order.total_amount,
+        timestamp: new Date().toISOString(),
+      });
+    } else {
+      logger.warn('No order found to update for payment intent', {
+        paymentIntentId: paymentIntent.id,
+        connectedAccountId,
+      });
+    }
+  });
+}
+
+async function handlePaymentIntentFailed(paymentIntent: any, connectedAccountId: string | undefined) {
+  await transaction(async (client) => {
+    const result = await client.query(
+      `UPDATE orders
+       SET status = 'failed',
+           updated_at = NOW()
+       WHERE stripe_payment_intent_id = $1
+       RETURNING id, order_number, organization_id`,
+      [paymentIntent.id]
+    );
+
+    if (result.rows.length > 0) {
+      const order = result.rows[0];
+
+      logger.info('Order marked as failed via Connect webhook', {
+        orderId: order.id,
+        orderNumber: order.order_number,
+        paymentIntentId: paymentIntent.id,
+        connectedAccountId,
+        failureMessage: paymentIntent.last_payment_error?.message,
+      });
+
+      // Emit socket event for real-time updates
+      socketService.emitToOrganization(order.organization_id, SocketEvents.ORDER_FAILED, {
+        orderId: order.id,
+        orderNumber: order.order_number,
+        error: paymentIntent.last_payment_error?.message || 'Payment failed',
+        timestamp: new Date().toISOString(),
+      });
+    }
+  });
+}
+
+async function handleChargeRefunded(charge: any, connectedAccountId: string | undefined) {
+  const refundAmount = charge.amount_refunded / 100;
+  const isFullRefund = charge.refunded === true;
+
+  await transaction(async (client) => {
+    // Determine the new status based on refund type
+    const newStatus = isFullRefund ? 'refunded' : 'partially_refunded';
+
+    const result = await client.query(
+      `UPDATE orders
+       SET status = $1,
+           updated_at = NOW()
+       WHERE stripe_charge_id = $2
+       RETURNING id, order_number, organization_id, total_amount`,
+      [newStatus, charge.id]
+    );
+
+    if (result.rows.length > 0) {
+      const order = result.rows[0];
+
+      logger.info('Order refunded via Connect webhook', {
+        orderId: order.id,
+        orderNumber: order.order_number,
+        chargeId: charge.id,
+        refundAmount,
+        totalAmount: order.total_amount,
+        isFullRefund,
+        status: newStatus,
+        connectedAccountId,
+      });
+
+      // Emit socket event for real-time updates
+      socketService.emitToOrganization(order.organization_id, SocketEvents.ORDER_REFUNDED, {
+        orderId: order.id,
+        orderNumber: order.order_number,
+        refundAmount,
+        isFullRefund,
+        timestamp: new Date().toISOString(),
+      });
+    } else {
+      logger.warn('No order found for refunded charge', {
+        chargeId: charge.id,
+        connectedAccountId,
+      });
+    }
+  });
 }
 
 export default app;

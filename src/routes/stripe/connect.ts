@@ -5,6 +5,7 @@ import { StripeConnectedAccount, ConnectOnboardingState } from '../../db/models'
 import { stripeService } from '../../services/stripe';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
+import { socketService, SocketEvents } from '../../services/socket';
 import Stripe from 'stripe';
 
 const app = new OpenAPIHono();
@@ -1015,6 +1016,14 @@ const listTransactionsRoute = createRoute({
       limit: z.string().transform(Number).optional(),
       starting_after: z.string().optional(),
       ending_before: z.string().optional(),
+      catalog_id: z.string().uuid().optional(),
+      customer_email: z.string().email().optional(),
+      date_from: z.string().transform(Number).optional(), // Unix timestamp
+      date_to: z.string().transform(Number).optional(), // Unix timestamp
+      amount_min: z.string().transform(Number).optional(), // In cents
+      amount_max: z.string().transform(Number).optional(), // In cents
+      sort_by: z.enum(['date', 'amount', 'email']).optional(),
+      sort_order: z.enum(['asc', 'desc']).optional(),
     }),
   },
   responses: {
@@ -1040,6 +1049,10 @@ const listTransactionsRoute = createRoute({
               receiptUrl: z.string().nullable(),
               created: z.number(),
               metadata: z.record(z.string()).optional(),
+              fees: z.object({
+                processingFee: z.number(),
+                netAmount: z.number(),
+              }).optional(),
             })),
             hasMore: z.boolean(),
           }),
@@ -1076,19 +1089,82 @@ app.openapi(listTransactionsRoute, async (c) => {
 
     const connectedAccount = rows[0];
     const queryParams = c.req.query();
+    const catalogIdFilter = queryParams.catalog_id;
+    const customerEmailFilter = queryParams.customer_email?.toLowerCase();
+    const dateFrom = queryParams.date_from ? parseInt(queryParams.date_from) : undefined;
+    const dateTo = queryParams.date_to ? parseInt(queryParams.date_to) : undefined;
+    const amountMin = queryParams.amount_min ? parseInt(queryParams.amount_min) : undefined;
+    const amountMax = queryParams.amount_max ? parseInt(queryParams.amount_max) : undefined;
+    const sortBy = queryParams.sort_by || 'date';
+    const sortOrder = queryParams.sort_order || 'desc';
+    const requestedLimit = queryParams.limit ? parseInt(queryParams.limit) : 25;
+
+    // If filtering, fetch more to compensate for filtered results
+    const hasFilter = catalogIdFilter || customerEmailFilter || amountMin !== undefined || amountMax !== undefined;
+    const fetchLimit = hasFilter ? Math.min(requestedLimit * 3, 100) : requestedLimit;
+
+    // Build created date range filter for Stripe API
+    const createdFilter: { gte?: number; lte?: number } = {};
+    if (dateFrom) createdFilter.gte = dateFrom;
+    if (dateTo) createdFilter.lte = dateTo;
 
     // Get charges from Stripe
     const charges = await stripeService.listConnectedAccountCharges(
       connectedAccount.stripe_account_id,
       {
-        limit: queryParams.limit ? parseInt(queryParams.limit) : 25,
+        limit: fetchLimit,
         starting_after: queryParams.starting_after,
         ending_before: queryParams.ending_before,
+        created: Object.keys(createdFilter).length > 0 ? createdFilter : undefined,
       }
     );
 
+    // Filter by catalog_id, customer_email, and amount range if provided
+    let filteredCharges = charges.data;
+    if (catalogIdFilter) {
+      filteredCharges = filteredCharges.filter(
+        (charge) => charge.metadata?.catalogId === catalogIdFilter
+      );
+    }
+    if (customerEmailFilter) {
+      filteredCharges = filteredCharges.filter(
+        (charge) => charge.receipt_email?.toLowerCase() === customerEmailFilter
+      );
+    }
+    if (amountMin !== undefined) {
+      filteredCharges = filteredCharges.filter((charge) => charge.amount >= amountMin);
+    }
+    if (amountMax !== undefined) {
+      filteredCharges = filteredCharges.filter((charge) => charge.amount <= amountMax);
+    }
+
+    // Sort the results
+    filteredCharges.sort((a, b) => {
+      let comparison = 0;
+      switch (sortBy) {
+        case 'date':
+          comparison = a.created - b.created;
+          break;
+        case 'amount':
+          comparison = a.amount - b.amount;
+          break;
+        case 'email':
+          const emailA = (a.receipt_email || '').toLowerCase();
+          const emailB = (b.receipt_email || '').toLowerCase();
+          comparison = emailA.localeCompare(emailB);
+          break;
+      }
+      return sortOrder === 'asc' ? comparison : -comparison;
+    });
+
+    // Limit to requested amount
+    const limitedCharges = filteredCharges.slice(0, requestedLimit);
+    const hasMoreFiltered = hasFilter
+      ? filteredCharges.length > requestedLimit || charges.has_more
+      : charges.has_more;
+
     // Format the response
-    const formattedTransactions = charges.data.map((charge) => {
+    const formattedTransactions = limitedCharges.map((charge) => {
       // Determine status
       let status: 'succeeded' | 'pending' | 'failed' | 'refunded' | 'partially_refunded' = 'pending';
       if (charge.status === 'succeeded') {
@@ -1122,10 +1198,26 @@ app.openapi(listTransactionsRoute, async (c) => {
         }
       }
 
+      // Calculate fees (all in cents)
+      // Platform fee from application_fee_amount or metadata
+      const platformFee = (charge as any).application_fee_amount ||
+        (charge.metadata?.platform_fee_cents ? parseInt(charge.metadata.platform_fee_cents) : 0);
+
+      // Stripe fee: 2.7% + 15¢ for Tap to Pay (card_present)
+      // Standard card: 2.9% + 30¢
+      const isCardPresent = charge.payment_method_details?.type === 'card_present';
+      const stripeFeePercent = isCardPresent ? 0.027 : 0.029;
+      const stripeFeeFixed = isCardPresent ? 15 : 30;
+      const stripeFee = Math.round(charge.amount * stripeFeePercent) + stripeFeeFixed;
+
+      // Combine fees for vendor display
+      const processingFee = stripeFee + platformFee;
+      const netAmount = charge.amount - processingFee - charge.amount_refunded;
+
       return {
         id: charge.id,
-        amount: charge.amount / 100,
-        amountRefunded: charge.amount_refunded / 100,
+        amount: charge.amount, // Keep in cents for consistency with app
+        amountRefunded: charge.amount_refunded, // Keep in cents
         currency: charge.currency,
         status,
         description: charge.description,
@@ -1135,6 +1227,10 @@ app.openapi(listTransactionsRoute, async (c) => {
         receiptUrl: charge.receipt_url,
         created: charge.created,
         metadata: charge.metadata,
+        fees: {
+          processingFee,
+          netAmount,
+        },
       };
     });
 
@@ -1142,11 +1238,12 @@ app.openapi(listTransactionsRoute, async (c) => {
       accountId: connectedAccount.stripe_account_id,
       organizationId: payload.organizationId,
       count: formattedTransactions.length,
+      catalogIdFilter: catalogIdFilter || null,
     });
 
     return c.json({
       data: formattedTransactions,
-      hasMore: charges.has_more,
+      hasMore: hasMoreFiltered,
     });
   } catch (error) {
     logger.error('Error listing transactions', { error });
@@ -1208,6 +1305,10 @@ const getTransactionRoute = createRoute({
               reason: z.string().nullable(),
               created: z.number(),
             })),
+            fees: z.object({
+              processingFee: z.number(),
+              netAmount: z.number(),
+            }),
           }),
         },
       },
@@ -1295,16 +1396,30 @@ app.openapi(getTransactionRoute, async (c) => {
     // Format refunds
     const refunds = (charge.refunds?.data || []).map((refund) => ({
       id: refund.id,
-      amount: refund.amount / 100,
+      amount: refund.amount, // Keep in cents
       status: refund.status || 'unknown',
       reason: refund.reason,
       created: refund.created,
     }));
 
+    // Calculate fees (all in cents)
+    const platformFee = (charge as any).application_fee_amount ||
+      (charge.metadata?.platform_fee_cents ? parseInt(charge.metadata.platform_fee_cents) : 0);
+
+    // Stripe fee: 2.7% + 15¢ for Tap to Pay (card_present), 2.9% + 30¢ for online
+    const isCardPresent = charge.payment_method_details?.type === 'card_present';
+    const stripeFeePercent = isCardPresent ? 0.027 : 0.029;
+    const stripeFeeFixed = isCardPresent ? 15 : 30;
+    const stripeFee = Math.round(charge.amount * stripeFeePercent) + stripeFeeFixed;
+
+    // Combine fees for vendor display
+    const processingFee = stripeFee + platformFee;
+    const netAmount = charge.amount - processingFee - charge.amount_refunded;
+
     return c.json({
       id: charge.id,
-      amount: charge.amount / 100,
-      amountRefunded: charge.amount_refunded / 100,
+      amount: charge.amount, // Keep in cents for consistency with app
+      amountRefunded: charge.amount_refunded, // Keep in cents
       currency: charge.currency,
       status,
       description: charge.description,
@@ -1316,6 +1431,10 @@ app.openapi(getTransactionRoute, async (c) => {
       created: charge.created,
       metadata: charge.metadata,
       refunds,
+      fees: {
+        processingFee,
+        netAmount,
+      },
     });
   } catch (error: any) {
     logger.error('Error getting transaction', { error, transactionId });
@@ -1422,16 +1541,55 @@ app.openapi(refundTransactionRoute, async (c) => {
       }
     );
 
+    // Retrieve the charge to check if it's fully refunded
+    const charge = await stripeService.retrieveConnectedAccountCharge(
+      connectedAccount.stripe_account_id,
+      transactionId
+    );
+
+    const isFullRefund = charge.refunded === true;
+    const newStatus = isFullRefund ? 'refunded' : 'partially_refunded';
+
+    // Update order status in database
+    const orderResult = await query<{ id: string; order_number: string }>(
+      `UPDATE orders
+       SET status = $1,
+           updated_at = NOW()
+       WHERE stripe_charge_id = $2
+       RETURNING id, order_number`,
+      [newStatus, transactionId]
+    );
+
+    if (orderResult.length > 0) {
+      const order = orderResult[0];
+
+      // Emit socket event for real-time updates
+      socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_REFUNDED, {
+        orderId: order.id,
+        orderNumber: order.order_number,
+        refundAmount: refund.amount / 100,
+        isFullRefund,
+        timestamp: new Date().toISOString(),
+      });
+
+      logger.info('Order status updated after refund', {
+        orderId: order.id,
+        orderNumber: order.order_number,
+        newStatus,
+        isFullRefund,
+      });
+    }
+
     logger.info('Created refund', {
       refundId: refund.id,
       chargeId: transactionId,
-      amount: refund.amount / 100,
+      amount: refund.amount,
       organizationId: payload.organizationId,
     });
 
     return c.json({
       id: refund.id,
-      amount: refund.amount / 100,
+      amount: refund.amount, // Keep in cents
       status: refund.status || 'succeeded',
       reason: refund.reason,
       created: refund.created,
@@ -1466,10 +1624,12 @@ const dashboardRoute = createRoute({
               sales: z.number(),
               orders: z.number(),
               averageOrderValue: z.number(),
+              customers: z.number(),
             }),
             yesterday: z.object({
               sales: z.number(),
               orders: z.number(),
+              customers: z.number(),
             }),
             balance: z.object({
               available: z.number(),
@@ -1565,11 +1725,24 @@ app.openapi(dashboardRoute, async (c) => {
     const todaySales = todaySucceeded.reduce((sum, c) => sum + (c.amount - (c.amount_refunded || 0)), 0) / 100;
     const todayOrders = todaySucceeded.length;
     const todayAvgOrder = todayOrders > 0 ? todaySales / todayOrders : 0;
+    // Count unique customers (by email)
+    const todayCustomerEmails = new Set(
+      todaySucceeded
+        .map(c => c.billing_details?.email || c.receipt_email)
+        .filter((email): email is string => !!email)
+    );
+    const todayCustomers = todayCustomerEmails.size;
 
     // Calculate yesterday's metrics (only succeeded charges)
     const yesterdaySucceeded = yesterdayCharges.data.filter(c => c.status === 'succeeded');
     const yesterdaySales = yesterdaySucceeded.reduce((sum, c) => sum + (c.amount - (c.amount_refunded || 0)), 0) / 100;
     const yesterdayOrders = yesterdaySucceeded.length;
+    const yesterdayCustomerEmails = new Set(
+      yesterdaySucceeded
+        .map(c => c.billing_details?.email || c.receipt_email)
+        .filter((email): email is string => !!email)
+    );
+    const yesterdayCustomers = yesterdayCustomerEmails.size;
 
     // Get balance amounts (default to USD) - handle empty arrays
     const availableBalance = balance.available?.length > 0
@@ -1595,10 +1768,12 @@ app.openapi(dashboardRoute, async (c) => {
         sales: todaySales,
         orders: todayOrders,
         averageOrderValue: Math.round(todayAvgOrder * 100) / 100,
+        customers: todayCustomers,
       },
       yesterday: {
         sales: yesterdaySales,
         orders: yesterdayOrders,
+        customers: yesterdayCustomers,
       },
       balance: {
         available: availableBalance ? availableBalance.amount / 100 : 0,
@@ -1659,6 +1834,35 @@ const analyticsRoute = createRoute({
             peakHours: z.array(z.object({
               hour: z.string(),
               count: z.number(),
+              percentage: z.number(),
+            })),
+            topProducts: z.array(z.object({
+              productId: z.string().nullable(),
+              name: z.string(),
+              description: z.string().nullable(),
+              imageUrl: z.string().nullable(),
+              quantity: z.number(),
+              revenue: z.number(),
+              percentage: z.number(),
+            })),
+            catalogBreakdown: z.array(z.object({
+              catalogId: z.string().nullable(),
+              catalogName: z.string(),
+              description: z.string().nullable(),
+              location: z.string().nullable(),
+              date: z.string().nullable(),
+              createdAt: z.string().nullable(),
+              productCount: z.number(),
+              orderCount: z.number(),
+              revenue: z.number(),
+              percentage: z.number(),
+            })),
+            categoryBreakdown: z.array(z.object({
+              categoryId: z.string().nullable(),
+              categoryName: z.string(),
+              quantity: z.number(),
+              revenue: z.number(),
+              percentage: z.number(),
             })),
           }),
         },
@@ -1681,20 +1885,7 @@ app.openapi(analyticsRoute, async (c) => {
     const { authService } = await import('../../services/auth');
     const payload = await authService.verifyToken(token);
 
-    // Get connected account
-    const rows = await query<StripeConnectedAccount>(
-      `SELECT * FROM stripe_connected_accounts WHERE organization_id = $1`,
-      [payload.organizationId]
-    );
-
-    if (rows.length === 0) {
-      return c.json({ error: 'No connected account found' }, 404);
-    }
-
-    const connectedAccount = rows[0];
     const range = c.req.query('range') || 'week';
-
-    // Calculate time boundaries based on range
     const now = new Date();
     let currentStart: Date;
     let previousStart: Date;
@@ -1712,165 +1903,349 @@ app.openapi(analyticsRoute, async (c) => {
         previousEnd = new Date(currentStart.getTime() - 1);
         break;
       case 'month':
-        currentStart = new Date(now.getFullYear(), now.getMonth(), 1);
-        previousStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+        // Last 12 months
+        currentStart = new Date(now.getFullYear(), now.getMonth() - 11, 1);
+        previousStart = new Date(now.getFullYear(), now.getMonth() - 23, 1);
         previousEnd = new Date(currentStart.getTime() - 1);
         break;
       case 'all':
       default:
-        // Last 6 months
-        currentStart = new Date(now.getFullYear(), now.getMonth() - 6, 1);
-        previousStart = new Date(now.getFullYear(), now.getMonth() - 12, 1);
+        // Last 2 years
+        currentStart = new Date(now.getFullYear() - 1, now.getMonth(), 1);
+        previousStart = new Date(now.getFullYear() - 3, now.getMonth(), 1);
         previousEnd = new Date(currentStart.getTime() - 1);
         break;
     }
 
-    const currentStartTimestamp = Math.floor(currentStart.getTime() / 1000);
-    const previousStartTimestamp = Math.floor(previousStart.getTime() / 1000);
-    const previousEndTimestamp = Math.floor(previousEnd.getTime() / 1000);
-
-    // Fetch current period charges (get up to 100 for analytics)
-    const currentCharges = await stripeService.listConnectedAccountCharges(
-      connectedAccount.stripe_account_id,
-      {
-        limit: 100,
-        created: { gte: currentStartTimestamp },
-      }
+    // Query current period metrics from database
+    const currentMetricsQuery = await query<{
+      revenue: string;
+      transactions: string;
+    }>(
+      `SELECT
+        COALESCE(SUM(total_amount), 0)::text as revenue,
+        COUNT(*)::text as transactions
+      FROM orders
+      WHERE organization_id = $1
+        AND status = 'completed'
+        AND created_at >= $2`,
+      [payload.organizationId, currentStart.toISOString()]
     );
 
-    // Fetch previous period charges for comparison
-    const previousCharges = await stripeService.listConnectedAccountCharges(
-      connectedAccount.stripe_account_id,
-      {
-        limit: 100,
-        created: { gte: previousStartTimestamp, lte: previousEndTimestamp },
-      }
-    );
-
-    // Calculate current period metrics (only succeeded charges)
-    const currentSucceeded = currentCharges.data.filter(c => c.status === 'succeeded');
-    const currentRevenue = currentSucceeded.reduce((sum, c) => sum + (c.amount - (c.amount_refunded || 0)), 0) / 100;
-    const currentTransactions = currentSucceeded.length;
+    const currentRevenue = parseFloat(currentMetricsQuery[0]?.revenue || '0');
+    const currentTransactions = parseInt(currentMetricsQuery[0]?.transactions || '0');
     const currentAvgTransaction = currentTransactions > 0 ? currentRevenue / currentTransactions : 0;
 
-    // Calculate previous period metrics
-    const previousSucceeded = previousCharges.data.filter(c => c.status === 'succeeded');
-    const previousRevenue = previousSucceeded.reduce((sum, c) => sum + (c.amount - (c.amount_refunded || 0)), 0) / 100;
-    const previousTransactions = previousSucceeded.length;
+    // Query previous period metrics
+    const previousMetricsQuery = await query<{
+      revenue: string;
+      transactions: string;
+    }>(
+      `SELECT
+        COALESCE(SUM(total_amount), 0)::text as revenue,
+        COUNT(*)::text as transactions
+      FROM orders
+      WHERE organization_id = $1
+        AND status = 'completed'
+        AND created_at >= $2
+        AND created_at <= $3`,
+      [payload.organizationId, previousStart.toISOString(), previousEnd.toISOString()]
+    );
 
-    // Calculate revenue data by time period
-    const revenueData: Array<{ label: string; revenue: number }> = [];
+    const previousRevenue = parseFloat(previousMetricsQuery[0]?.revenue || '0');
+    const previousTransactions = parseInt(previousMetricsQuery[0]?.transactions || '0');
+
+    // Calculate revenue data by time period using database aggregation
+    let revenueData: Array<{ label: string; revenue: number }> = [];
 
     if (range === 'today') {
       // Group by hour
-      const hourlyData: Record<number, number> = {};
-      for (let h = 0; h < 24; h++) {
-        hourlyData[h] = 0;
-      }
-      currentSucceeded.forEach(charge => {
-        const chargeDate = new Date(charge.created * 1000);
-        const hour = chargeDate.getHours();
-        hourlyData[hour] += (charge.amount - (charge.amount_refunded || 0)) / 100;
+      const hourlyQuery = await query<{ hour: string; revenue: string }>(
+        `SELECT
+          EXTRACT(HOUR FROM created_at)::text as hour,
+          COALESCE(SUM(total_amount), 0)::text as revenue
+        FROM orders
+        WHERE organization_id = $1
+          AND status = 'completed'
+          AND created_at >= $2
+        GROUP BY EXTRACT(HOUR FROM created_at)
+        ORDER BY EXTRACT(HOUR FROM created_at)`,
+        [payload.organizationId, currentStart.toISOString()]
+      );
+
+      const hourlyMap: Record<number, number> = {};
+      hourlyQuery.forEach(row => {
+        hourlyMap[parseInt(row.hour)] = parseFloat(row.revenue);
       });
-      // Only show hours from 9 AM to 9 PM for readability
+
+      // Show hours from 9 AM to 9 PM
       for (let h = 9; h <= 21; h++) {
         const hour12 = h > 12 ? h - 12 : h;
         const ampm = h >= 12 ? 'PM' : 'AM';
-        revenueData.push({ label: `${hour12}${ampm}`, revenue: Math.round(hourlyData[h]) });
+        revenueData.push({ label: `${hour12}${ampm}`, revenue: Math.round(hourlyMap[h] || 0) });
       }
     } else if (range === 'week') {
-      // Group by day of week
-      const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-      const dailyData: Record<number, number> = {};
-      for (let d = 0; d < 7; d++) {
-        dailyData[d] = 0;
-      }
-      currentSucceeded.forEach(charge => {
-        const chargeDate = new Date(charge.created * 1000);
-        const dayOfWeek = chargeDate.getDay();
-        dailyData[dayOfWeek] += (charge.amount - (charge.amount_refunded || 0)) / 100;
+      // Group by day - show last 7 days with actual dates
+      const dailyQuery = await query<{ day: string; revenue: string }>(
+        `SELECT
+          TO_CHAR(created_at, 'Dy') as day,
+          COALESCE(SUM(total_amount), 0)::text as revenue
+        FROM orders
+        WHERE organization_id = $1
+          AND status = 'completed'
+          AND created_at >= $2
+        GROUP BY TO_CHAR(created_at, 'Dy'), EXTRACT(DOW FROM created_at)
+        ORDER BY EXTRACT(DOW FROM created_at)`,
+        [payload.organizationId, currentStart.toISOString()]
+      );
+
+      const dailyMap: Record<string, number> = {};
+      dailyQuery.forEach(row => {
+        dailyMap[row.day] = parseFloat(row.revenue);
       });
+
       // Start from Monday
-      const orderedDays = [1, 2, 3, 4, 5, 6, 0]; // Mon to Sun
-      orderedDays.forEach(d => {
-        revenueData.push({ label: days[d], revenue: Math.round(dailyData[d]) });
+      const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+      days.forEach(d => {
+        revenueData.push({ label: d, revenue: Math.round(dailyMap[d] || 0) });
       });
     } else if (range === 'month') {
-      // Group by week
-      const weeklyData: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
-      currentSucceeded.forEach(charge => {
-        const chargeDate = new Date(charge.created * 1000);
-        const dayOfMonth = chargeDate.getDate();
-        const week = Math.ceil(dayOfMonth / 7);
-        weeklyData[week] = (weeklyData[week] || 0) + (charge.amount - (charge.amount_refunded || 0)) / 100;
+      // Group by month - show last 12 months with month names
+      const monthlyQuery = await query<{ month: string; year: string; revenue: string }>(
+        `SELECT
+          TO_CHAR(created_at, 'Mon') as month,
+          EXTRACT(YEAR FROM created_at)::text as year,
+          COALESCE(SUM(total_amount), 0)::text as revenue
+        FROM orders
+        WHERE organization_id = $1
+          AND status = 'completed'
+          AND created_at >= $2
+        GROUP BY TO_CHAR(created_at, 'Mon'), EXTRACT(YEAR FROM created_at), EXTRACT(MONTH FROM created_at)
+        ORDER BY EXTRACT(YEAR FROM created_at), EXTRACT(MONTH FROM created_at)`,
+        [payload.organizationId, currentStart.toISOString()]
+      );
+
+      // Create a map with year-month as key
+      const monthlyMap: Record<string, number> = {};
+      monthlyQuery.forEach(row => {
+        const key = `${row.month}-${row.year}`;
+        monthlyMap[key] = parseFloat(row.revenue);
       });
-      for (let w = 1; w <= 4; w++) {
-        revenueData.push({ label: `Week ${w}`, revenue: Math.round(weeklyData[w] || 0) });
+
+      // Generate last 12 months labels
+      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+      for (let i = 11; i >= 0; i--) {
+        const date = new Date(now.getFullYear(), now.getMonth() - i, 1);
+        const monthName = months[date.getMonth()];
+        const year = date.getFullYear();
+        const key = `${monthName}-${year}`;
+        revenueData.push({ label: monthName, revenue: Math.round(monthlyMap[key] || 0) });
       }
     } else {
-      // Group by month
-      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-      const monthlyData: Record<number, number> = {};
-      currentSucceeded.forEach(charge => {
-        const chargeDate = new Date(charge.created * 1000);
-        const month = chargeDate.getMonth();
-        monthlyData[month] = (monthlyData[month] || 0) + (charge.amount - (charge.amount_refunded || 0)) / 100;
+      // 'all' - Group by year
+      const yearlyQuery = await query<{ year: string; revenue: string }>(
+        `SELECT
+          EXTRACT(YEAR FROM created_at)::text as year,
+          COALESCE(SUM(total_amount), 0)::text as revenue
+        FROM orders
+        WHERE organization_id = $1
+          AND status = 'completed'
+          AND created_at >= $2
+        GROUP BY EXTRACT(YEAR FROM created_at)
+        ORDER BY EXTRACT(YEAR FROM created_at)`,
+        [payload.organizationId, currentStart.toISOString()]
+      );
+
+      const yearlyMap: Record<string, number> = {};
+      yearlyQuery.forEach(row => {
+        yearlyMap[row.year] = parseFloat(row.revenue);
       });
-      // Show last 6 months
-      for (let i = 5; i >= 0; i--) {
-        const monthIndex = (now.getMonth() - i + 12) % 12;
-        revenueData.push({ label: months[monthIndex], revenue: Math.round(monthlyData[monthIndex] || 0) });
+
+      // Show last 2 years
+      for (let i = 1; i >= 0; i--) {
+        const year = now.getFullYear() - i;
+        revenueData.push({ label: year.toString(), revenue: Math.round(yearlyMap[year.toString()] || 0) });
       }
     }
 
-    // Calculate payment method breakdown
-    const paymentMethodCounts: Record<string, number> = {};
-    currentSucceeded.forEach(charge => {
-      const method = charge.payment_method_details?.type || 'other';
+    // Query payment method breakdown from database
+    const paymentMethodQuery = await query<{ method: string | null; count: string }>(
+      `SELECT
+        payment_method::text as method,
+        COUNT(*)::text as count
+      FROM orders
+      WHERE organization_id = $1
+        AND status = 'completed'
+        AND created_at >= $2
+      GROUP BY payment_method
+      ORDER BY COUNT(*) DESC`,
+      [payload.organizationId, currentStart.toISOString()]
+    );
+
+    const totalPaymentMethods = paymentMethodQuery.reduce((sum, p) => sum + parseInt(p.count || '0'), 0);
+    const paymentMethods = paymentMethodQuery.map(p => {
       let displayMethod = 'Other';
-      if (method === 'card') {
-        const brand = charge.payment_method_details?.card?.brand || 'card';
-        displayMethod = brand.charAt(0).toUpperCase() + brand.slice(1);
-      } else if (method === 'card_present') {
-        displayMethod = 'Card (In-Person)';
-      } else {
-        displayMethod = method.charAt(0).toUpperCase() + method.slice(1).replace(/_/g, ' ');
-      }
-      paymentMethodCounts[displayMethod] = (paymentMethodCounts[displayMethod] || 0) + 1;
+      if (p.method === 'tap_to_pay') displayMethod = 'Tap to Pay';
+      else if (p.method === 'card') displayMethod = 'Card';
+      else if (p.method === 'cash') displayMethod = 'Cash';
+      else if (p.method) displayMethod = p.method.charAt(0).toUpperCase() + p.method.slice(1).replace(/_/g, ' ');
+
+      return {
+        method: displayMethod,
+        count: parseInt(p.count || '0'),
+        percentage: totalPaymentMethods > 0 ? Math.round((parseInt(p.count || '0') / totalPaymentMethods) * 100) : 0,
+      };
+    }).slice(0, 5);
+
+    // Query peak hours from database
+    const peakHoursQuery = await query<{ hour: string; count: string }>(
+      `SELECT
+        EXTRACT(HOUR FROM created_at)::text as hour,
+        COUNT(*)::text as count
+      FROM orders
+      WHERE organization_id = $1
+        AND status = 'completed'
+        AND created_at >= $2
+      GROUP BY EXTRACT(HOUR FROM created_at)
+      ORDER BY EXTRACT(HOUR FROM created_at)`,
+      [payload.organizationId, currentStart.toISOString()]
+    );
+
+    const hourCountMap: Record<number, number> = {};
+    peakHoursQuery.forEach(row => {
+      hourCountMap[parseInt(row.hour)] = parseInt(row.count);
     });
 
-    const totalPaymentMethods = Object.values(paymentMethodCounts).reduce((a, b) => a + b, 0);
-    const paymentMethods = Object.entries(paymentMethodCounts)
-      .map(([method, count]) => ({
-        method,
-        count,
-        percentage: totalPaymentMethods > 0 ? Math.round((count / totalPaymentMethods) * 100) : 0,
-      }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 5);
-
-    // Calculate peak hours (based on current period data)
-    const hourCounts: Record<number, number> = {};
-    for (let h = 0; h < 24; h++) {
-      hourCounts[h] = 0;
-    }
-    currentSucceeded.forEach(charge => {
-      const chargeDate = new Date(charge.created * 1000);
-      const hour = chargeDate.getHours();
-      hourCounts[hour]++;
-    });
-
-    const maxHourCount = Math.max(...Object.values(hourCounts), 1);
-    const peakHours: Array<{ hour: string; count: number }> = [];
-    // Show hours 9 AM to 9 PM
+    const totalHourTransactions = peakHoursQuery.reduce((sum, p) => sum + parseInt(p.count || '0'), 0);
+    const peakHours: Array<{ hour: string; count: number; percentage: number }> = [];
     for (let h = 9; h <= 21; h++) {
       const hour12 = h > 12 ? h - 12 : (h === 0 ? 12 : h);
       const ampm = h >= 12 ? 'PM' : 'AM';
+      const count = hourCountMap[h] || 0;
       peakHours.push({
         hour: `${hour12} ${ampm}`,
-        count: Math.round((hourCounts[h] / maxHourCount) * 100),
+        count,
+        percentage: totalHourTransactions > 0 ? Math.round((count / totalHourTransactions) * 100) : 0,
       });
     }
+
+    // Query top products from orders with product details
+    const topProductsQuery = await query<{
+      product_id: string | null;
+      name: string;
+      description: string | null;
+      image_url: string | null;
+      quantity: string;
+      revenue: string;
+    }>(
+      `SELECT
+        oi.product_id,
+        COALESCE(oi.name, p.name, 'Unknown Product') as name,
+        p.description,
+        p.image_url,
+        SUM(oi.quantity)::text as quantity,
+        SUM(oi.quantity * oi.unit_price)::text as revenue
+      FROM order_items oi
+      JOIN orders o ON oi.order_id = o.id
+      LEFT JOIN products p ON oi.product_id = p.id
+      WHERE o.organization_id = $1
+        AND o.status = 'completed'
+        AND o.created_at >= $2
+      GROUP BY oi.product_id, COALESCE(oi.name, p.name, 'Unknown Product'), p.description, p.image_url
+      ORDER BY SUM(oi.quantity) DESC
+      LIMIT 10`,
+      [payload.organizationId, currentStart.toISOString()]
+    );
+
+    const totalProductQuantity = topProductsQuery.reduce((sum, p) => sum + parseInt(p.quantity || '0'), 0);
+    const topProducts = topProductsQuery.map(p => ({
+      productId: p.product_id,
+      name: p.name,
+      description: p.description,
+      imageUrl: p.image_url,
+      quantity: parseInt(p.quantity || '0'),
+      revenue: parseFloat(p.revenue || '0'),
+      percentage: totalProductQuantity > 0 ? Math.round((parseInt(p.quantity || '0') / totalProductQuantity) * 100) : 0,
+    }));
+
+    // Query catalog breakdown from orders with catalog details
+    const catalogBreakdownQuery = await query<{
+      catalog_id: string | null;
+      catalog_name: string | null;
+      catalog_description: string | null;
+      catalog_location: string | null;
+      catalog_date: string | null;
+      catalog_created_at: string | null;
+      product_count: string;
+      order_count: string;
+      revenue: string;
+    }>(
+      `SELECT
+        o.catalog_id,
+        c.name as catalog_name,
+        c.description as catalog_description,
+        c.location as catalog_location,
+        c.date as catalog_date,
+        c.created_at::text as catalog_created_at,
+        (SELECT COUNT(*)::text FROM catalog_products WHERE catalog_id = c.id) as product_count,
+        COUNT(o.id)::text as order_count,
+        SUM(o.total_amount)::text as revenue
+      FROM orders o
+      LEFT JOIN catalogs c ON o.catalog_id = c.id
+      WHERE o.organization_id = $1
+        AND o.status = 'completed'
+        AND o.created_at >= $2
+      GROUP BY o.catalog_id, c.name, c.description, c.location, c.date, c.created_at, c.id
+      ORDER BY COUNT(o.id) DESC`,
+      [payload.organizationId, currentStart.toISOString()]
+    );
+
+    const totalCatalogOrders = catalogBreakdownQuery.reduce((sum, c) => sum + parseInt(c.order_count || '0'), 0);
+    const catalogBreakdown = catalogBreakdownQuery.map(c => ({
+      catalogId: c.catalog_id,
+      catalogName: c.catalog_name || 'Quick Charge',
+      description: c.catalog_description,
+      location: c.catalog_location,
+      date: c.catalog_date,
+      createdAt: c.catalog_created_at,
+      productCount: parseInt(c.product_count || '0'),
+      orderCount: parseInt(c.order_count || '0'),
+      revenue: parseFloat(c.revenue || '0'),
+      percentage: totalCatalogOrders > 0 ? Math.round((parseInt(c.order_count || '0') / totalCatalogOrders) * 100) : 0,
+    }));
+
+    // Query category breakdown from order_items
+    const categoryBreakdownQuery = await query<{
+      category_id: string | null;
+      category_name: string | null;
+      quantity: string;
+      revenue: string;
+    }>(
+      `SELECT
+        oi.category_id,
+        cat.name as category_name,
+        SUM(oi.quantity)::text as quantity,
+        SUM(oi.quantity * oi.unit_price)::text as revenue
+      FROM order_items oi
+      JOIN orders o ON oi.order_id = o.id
+      LEFT JOIN categories cat ON oi.category_id = cat.id
+      WHERE o.organization_id = $1
+        AND o.status = 'completed'
+        AND o.created_at >= $2
+      GROUP BY oi.category_id, cat.name
+      ORDER BY SUM(oi.quantity) DESC
+      LIMIT 10`,
+      [payload.organizationId, currentStart.toISOString()]
+    );
+
+    const totalCategoryQuantity = categoryBreakdownQuery.reduce((sum, c) => sum + parseInt(c.quantity || '0'), 0);
+    const categoryBreakdown = categoryBreakdownQuery.map(c => ({
+      categoryId: c.category_id,
+      categoryName: c.category_name || 'Uncategorized',
+      quantity: parseInt(c.quantity || '0'),
+      revenue: parseFloat(c.revenue || '0'),
+      percentage: totalCategoryQuantity > 0 ? Math.round((parseInt(c.quantity || '0') / totalCategoryQuantity) * 100) : 0,
+    }));
 
     return c.json({
       metrics: {
@@ -1883,6 +2258,9 @@ app.openapi(analyticsRoute, async (c) => {
       revenueData,
       paymentMethods,
       peakHours,
+      topProducts,
+      catalogBreakdown,
+      categoryBreakdown,
     });
   } catch (error: any) {
     logger.error('Error fetching analytics', {

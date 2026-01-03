@@ -21,6 +21,7 @@ const catalogSchema = z.object({
   promptForEmail: z.boolean(),
   tipPercentages: z.array(z.number()),
   allowCustomTip: z.boolean(),
+  taxRate: z.number(),
   layoutType: layoutTypeSchema,
   productCount: z.number(),
   createdAt: z.string(),
@@ -37,6 +38,7 @@ const createCatalogSchema = z.object({
   promptForEmail: z.boolean().optional().default(true),
   tipPercentages: z.array(z.number()).optional().default([15, 18, 20, 25]),
   allowCustomTip: z.boolean().optional().default(true),
+  taxRate: z.number().min(0).max(100).optional().default(0),
   layoutType: layoutTypeSchema.optional().default('grid'),
 });
 
@@ -50,6 +52,7 @@ const updateCatalogSchema = z.object({
   promptForEmail: z.boolean().optional(),
   tipPercentages: z.array(z.number()).optional(),
   allowCustomTip: z.boolean().optional(),
+  taxRate: z.number().min(0).max(100).optional(),
   layoutType: layoutTypeSchema.optional(),
 });
 
@@ -107,6 +110,7 @@ app.openapi(listCatalogsRoute, async (c) => {
       promptForEmail: (row as any).prompt_for_email ?? true,
       tipPercentages: (row as any).tip_percentages ?? [15, 18, 20, 25],
       allowCustomTip: (row as any).allow_custom_tip ?? true,
+      taxRate: parseFloat((row as any).tax_rate) || 0,
       layoutType: (row as any).layout_type || 'grid',
       productCount: row.product_count || 0,
       createdAt: row.created_at.toISOString(),
@@ -177,6 +181,7 @@ app.openapi(getCatalogRoute, async (c) => {
       promptForEmail: (row as any).prompt_for_email ?? true,
       tipPercentages: (row as any).tip_percentages ?? [15, 18, 20, 25],
       allowCustomTip: (row as any).allow_custom_tip ?? true,
+      taxRate: parseFloat((row as any).tax_rate) || 0,
       layoutType: (row as any).layout_type || 'grid',
       productCount: row.product_count || 0,
       createdAt: row.created_at.toISOString(),
@@ -226,8 +231,8 @@ app.openapi(createCatalogRoute, async (c) => {
     const body = await c.req.json();
 
     const rows = await query<Catalog>(
-      `INSERT INTO catalogs (organization_id, name, description, location, date, is_active, show_tip_screen, prompt_for_email, tip_percentages, allow_custom_tip, layout_type)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      `INSERT INTO catalogs (organization_id, name, description, location, date, is_active, show_tip_screen, prompt_for_email, tip_percentages, allow_custom_tip, tax_rate, layout_type)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING *`,
       [
         payload.organizationId,
@@ -240,6 +245,7 @@ app.openapi(createCatalogRoute, async (c) => {
         body.promptForEmail ?? true,
         JSON.stringify(body.tipPercentages ?? [15, 18, 20, 25]),
         body.allowCustomTip ?? true,
+        body.taxRate ?? 0,
         body.layoutType || 'grid',
       ]
     );
@@ -264,6 +270,7 @@ app.openapi(createCatalogRoute, async (c) => {
       promptForEmail: (row as any).prompt_for_email ?? true,
       tipPercentages: (row as any).tip_percentages ?? [15, 18, 20, 25],
       allowCustomTip: (row as any).allow_custom_tip ?? true,
+      taxRate: parseFloat((row as any).tax_rate) || 0,
       layoutType: (row as any).layout_type || 'grid',
       productCount: 0,
       createdAt: row.created_at.toISOString(),
@@ -368,6 +375,11 @@ app.openapi(updateCatalogRoute, async (c) => {
       values.push(body.allowCustomTip);
       paramCount++;
     }
+    if (body.taxRate !== undefined) {
+      updates.push(`tax_rate = $${paramCount}`);
+      values.push(body.taxRate);
+      paramCount++;
+    }
     if (body.layoutType !== undefined) {
       updates.push(`layout_type = $${paramCount}`);
       values.push(body.layoutType);
@@ -413,6 +425,7 @@ app.openapi(updateCatalogRoute, async (c) => {
       promptForEmail: (row as any).prompt_for_email ?? true,
       tipPercentages: (row as any).tip_percentages ?? [15, 18, 20, 25],
       allowCustomTip: (row as any).allow_custom_tip ?? true,
+      taxRate: parseFloat((row as any).tax_rate) || 0,
       layoutType: (row as any).layout_type || 'grid',
       productCount: row.product_count || 0,
       createdAt: row.created_at.toISOString(),

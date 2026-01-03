@@ -7,6 +7,26 @@ import { logger } from '../../utils/logger';
 
 const app = new OpenAPIHono();
 
+// Subscription tier type
+type SubscriptionTier = 'starter' | 'pro' | 'enterprise';
+
+// Platform fee configuration (in addition to Stripe's 2.7% + $0.15 for Tap to Pay)
+const PLATFORM_FEES = {
+  // Free plan: 2.9% + $0.18 total, Stripe takes 2.7% + $0.15, platform gets 0.2% + $0.03
+  starter: { percentRate: 0.002, fixedCents: 3 },
+  // Pro plan: 2.8% + $0.16 total, Stripe takes 2.7% + $0.15, platform gets 0.1% + $0.01
+  pro: { percentRate: 0.001, fixedCents: 1 },
+  // Enterprise: custom pricing, default to no platform fee
+  enterprise: { percentRate: 0, fixedCents: 0 },
+};
+
+// Calculate platform fee in cents
+function calculatePlatformFee(amountCents: number, tier: SubscriptionTier): number {
+  const feeConfig = PLATFORM_FEES[tier] || PLATFORM_FEES.starter;
+  const fee = Math.round(amountCents * feeConfig.percentRate) + feeConfig.fixedCents;
+  return Math.max(0, fee); // Ensure non-negative
+}
+
 // Helper to verify auth and get connected account
 async function getConnectedAccount(authHeader: string | undefined) {
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -32,7 +52,38 @@ async function getConnectedAccount(authHeader: string | undefined) {
     throw new Error('Payments are not enabled for this account');
   }
 
-  return { connectedAccount, payload };
+  // Get subscription tier for the organization
+  // First try by organization_id, then fall back to user_id (for owner's subscription)
+  let subscriptionRows = await query<{ tier: SubscriptionTier }>(
+    `SELECT tier FROM subscriptions
+     WHERE organization_id = $1 AND status IN ('active', 'trialing')
+     ORDER BY created_at DESC LIMIT 1`,
+    [payload.organizationId]
+  );
+
+  // If not found by org, check if user has a subscription (they might be the owner)
+  if (subscriptionRows.length === 0) {
+    subscriptionRows = await query<{ tier: SubscriptionTier }>(
+      `SELECT tier FROM subscriptions
+       WHERE user_id = $1 AND status IN ('active', 'trialing')
+       ORDER BY created_at DESC LIMIT 1`,
+      [payload.userId]
+    );
+  }
+
+  const subscriptionFound = subscriptionRows.length > 0;
+  const subscriptionTier: SubscriptionTier = subscriptionFound
+    ? subscriptionRows[0].tier
+    : 'starter'; // Default to starter (free) if no subscription
+
+  logger.info('Subscription lookup for platform fee', {
+    organizationId: payload.organizationId,
+    userId: payload.userId,
+    subscriptionFound,
+    subscriptionTier,
+  });
+
+  return { connectedAccount, payload, subscriptionTier };
 }
 
 // ============================================
@@ -162,7 +213,7 @@ const createPaymentIntentRoute = createRoute({
 
 app.openapi(createPaymentIntentRoute, async (c) => {
   try {
-    const { connectedAccount, payload } = await getConnectedAccount(c.req.header('Authorization'));
+    const { connectedAccount, payload, subscriptionTier } = await getConnectedAccount(c.req.header('Authorization'));
     const body = await c.req.json();
 
     // Validate amount
@@ -173,7 +224,10 @@ app.openapi(createPaymentIntentRoute, async (c) => {
     // Convert to cents
     const amountInCents = Math.round(body.amount * 100);
 
-    // Create payment intent for the connected account
+    // Calculate platform fee based on subscription tier
+    const platformFee = calculatePlatformFee(amountInCents, subscriptionTier);
+
+    // Create payment intent for the connected account with platform fee
     const paymentIntent = await stripe.paymentIntents.create(
       {
         amount: amountInCents,
@@ -182,11 +236,14 @@ app.openapi(createPaymentIntentRoute, async (c) => {
         capture_method: 'automatic',
         description: body.description || 'Tap to Pay payment',
         receipt_email: body.receiptEmail,
+        application_fee_amount: platformFee > 0 ? platformFee : undefined,
         metadata: {
           ...body.metadata,
           organization_id: payload.organizationId,
           user_id: payload.userId,
           source: 'mobile_app',
+          subscription_tier: subscriptionTier,
+          platform_fee_cents: platformFee.toString(),
         },
       },
       {
@@ -197,6 +254,8 @@ app.openapi(createPaymentIntentRoute, async (c) => {
     logger.info('Terminal payment intent created', {
       paymentIntentId: paymentIntent.id,
       amount: body.amount,
+      platformFee,
+      subscriptionTier,
       accountId: connectedAccount.stripe_account_id,
       organizationId: payload.organizationId,
     });
@@ -537,13 +596,42 @@ app.openapi(sendReceiptRoute, async (c) => {
     );
 
     // Also save/update customer in our database
+    // NOTE: We do NOT increment total_orders/total_spent here because that was already
+    // done when the order was created in orders.ts. This only ensures the customer
+    // record exists and updates their email linkage if needed.
     try {
+      const catalogId = paymentIntent.metadata?.catalogId || null;
+      const orderId = paymentIntent.metadata?.orderId || null;
+
+      // Only create customer record if it doesn't exist, don't update stats
       await query(
-        `INSERT INTO customers (organization_id, email)
-         VALUES ($1, $2)
-         ON CONFLICT (organization_id, email) DO NOTHING`,
-        [payload.organizationId, email.toLowerCase()]
+        `INSERT INTO customers (organization_id, catalog_id, email, total_orders, total_spent, last_order_at)
+         VALUES ($1, $2, $3, 0, 0, NOW())
+         ON CONFLICT (organization_id, COALESCE(catalog_id, '00000000-0000-0000-0000-000000000000'::uuid), email)
+         DO UPDATE SET
+           last_order_at = NOW(),
+           updated_at = NOW()`,
+        [
+          payload.organizationId,
+          catalogId,
+          email.toLowerCase(),
+        ]
       );
+
+      // If we have an orderId, update the order's customer_email and link customer
+      if (orderId) {
+        await query(
+          `UPDATE orders SET customer_email = $1, updated_at = NOW() WHERE id = $2`,
+          [email.toLowerCase(), orderId]
+        );
+      }
+
+      logger.info('Customer saved/updated for receipt', {
+        email: email.toLowerCase(),
+        organizationId: payload.organizationId,
+        catalogId,
+        orderId,
+      });
     } catch (dbError) {
       // Log but don't fail the request
       logger.error('Failed to save customer email', { error: dbError, email });
@@ -574,6 +662,226 @@ app.openapi(sendReceiptRoute, async (c) => {
     }
 
     return c.json({ error: 'Failed to send receipt' }, 500);
+  }
+});
+
+// ============================================
+// POST /stripe/terminal/payment-intent/:id/simulate - Simulate payment for testing
+// ============================================
+const simulatePaymentRoute = createRoute({
+  method: 'post',
+  path: '/stripe/terminal/payment-intent/{paymentIntentId}/simulate',
+  summary: 'Simulate a terminal payment for testing (test mode only)',
+  description: 'Confirms a payment intent with a test card for browser/dev testing. Only works in Stripe test mode.',
+  tags: ['Stripe Terminal'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    params: z.object({
+      paymentIntentId: z.string(),
+    }),
+  },
+  responses: {
+    200: {
+      description: 'Payment simulated successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            id: z.string(),
+            status: z.string(),
+            amount: z.number(),
+            receiptUrl: z.string().nullable(),
+          }),
+        },
+      },
+    },
+    400: { description: 'Simulation failed or not in test mode' },
+    401: { description: 'Unauthorized' },
+    404: { description: 'Payment intent not found' },
+  },
+});
+
+app.openapi(simulatePaymentRoute, async (c) => {
+  try {
+    const { paymentIntentId } = c.req.param();
+    const { connectedAccount, subscriptionTier } = await getConnectedAccount(c.req.header('Authorization'));
+
+    // First, check if we're in test mode
+    const paymentIntent = await stripe.paymentIntents.retrieve(
+      paymentIntentId,
+      {},
+      { stripeAccount: connectedAccount.stripe_account_id }
+    );
+
+    if (!paymentIntent.id.startsWith('pi_') || paymentIntent.livemode) {
+      return c.json({ error: 'Simulation only works in Stripe test mode' }, 400);
+    }
+
+    if (paymentIntent.status === 'succeeded') {
+      return c.json({
+        id: paymentIntent.id,
+        status: paymentIntent.status,
+        amount: paymentIntent.amount,
+        receiptUrl: null,
+      });
+    }
+
+    // For card_present payment intents, we need to use test helpers
+    // First, create a simulated reader if needed and present a test card
+    try {
+      // Use Stripe Test Helpers to simulate the terminal payment
+      // This requires using the testHelpers API
+      const testHelpers = (stripe as any).testHelpers;
+
+      if (testHelpers?.terminal?.readers) {
+        // Get or create a simulated reader
+        const readers = await stripe.terminal.readers.list(
+          { limit: 1, status: 'online' },
+          { stripeAccount: connectedAccount.stripe_account_id }
+        );
+
+        let readerId: string;
+
+        if (readers.data.length > 0) {
+          readerId = readers.data[0].id;
+        } else {
+          // Create a simulated reader
+          const location = await stripe.terminal.locations.create(
+            {
+              display_name: 'Test Location',
+              address: {
+                line1: '123 Test St',
+                city: 'San Francisco',
+                state: 'CA',
+                postal_code: '94111',
+                country: 'US',
+              },
+            },
+            { stripeAccount: connectedAccount.stripe_account_id }
+          );
+
+          const reader = await stripe.terminal.readers.create(
+            {
+              registration_code: 'simulated-wpe',
+              label: 'Simulated Reader',
+              location: location.id,
+            },
+            { stripeAccount: connectedAccount.stripe_account_id }
+          );
+          readerId = reader.id;
+        }
+
+        // Present a test payment method
+        await testHelpers.terminal.readers.presentPaymentMethod(
+          readerId,
+          {},
+          { stripeAccount: connectedAccount.stripe_account_id }
+        );
+      }
+    } catch (testHelperError: any) {
+      // Test helpers might not be available, fall back to direct confirmation
+      logger.warn('Test helpers not available, using fallback', { error: testHelperError.message });
+    }
+
+    // Try to confirm the payment intent directly for simulation
+    // For card_present, we'll update it to use a regular card for testing
+    try {
+      // Cancel the card_present intent and create a new one with card type
+      await stripe.paymentIntents.cancel(
+        paymentIntentId,
+        {},
+        { stripeAccount: connectedAccount.stripe_account_id }
+      );
+
+      // Calculate platform fee based on subscription tier
+      const platformFee = calculatePlatformFee(paymentIntent.amount, subscriptionTier);
+
+      // Create a new payment intent with card payment method
+      const newPaymentIntent = await stripe.paymentIntents.create(
+        {
+          amount: paymentIntent.amount,
+          currency: paymentIntent.currency,
+          payment_method_types: ['card'], // Explicitly use card only
+          payment_method: 'pm_card_visa', // Stripe's test Visa card
+          confirm: true,
+          description: paymentIntent.description || 'Simulated payment',
+          receipt_email: paymentIntent.receipt_email || undefined, // Only pass if non-empty
+          application_fee_amount: platformFee > 0 ? platformFee : undefined,
+          metadata: {
+            ...paymentIntent.metadata,
+            simulated: 'true',
+            original_payment_intent: paymentIntentId,
+            subscription_tier: subscriptionTier,
+            platform_fee_cents: platformFee.toString(),
+          },
+        },
+        { stripeAccount: connectedAccount.stripe_account_id }
+      );
+
+      // Get the receipt URL
+      let receiptUrl = null;
+      if (newPaymentIntent.latest_charge) {
+        const charge = await stripe.charges.retrieve(
+          newPaymentIntent.latest_charge as string,
+          {},
+          { stripeAccount: connectedAccount.stripe_account_id }
+        );
+        receiptUrl = charge.receipt_url;
+      }
+
+      // Update the order to reference the new payment intent ID and mark as completed
+      // The original order was linked to paymentIntentId, now we need to update it
+      const orderId = paymentIntent.metadata?.orderId;
+      if (orderId) {
+        await query(
+          `UPDATE orders
+           SET stripe_payment_intent_id = $1,
+               stripe_charge_id = $2,
+               status = 'completed',
+               updated_at = NOW()
+           WHERE id = $3`,
+          [newPaymentIntent.id, newPaymentIntent.latest_charge || null, orderId]
+        );
+        logger.info('Order updated with simulated payment', {
+          orderId,
+          newPaymentIntentId: newPaymentIntent.id,
+          chargeId: newPaymentIntent.latest_charge,
+        });
+      }
+
+      logger.info('Payment simulated successfully', {
+        originalPaymentIntentId: paymentIntentId,
+        newPaymentIntentId: newPaymentIntent.id,
+        amount: newPaymentIntent.amount,
+        platformFee,
+        subscriptionTier,
+        accountId: connectedAccount.stripe_account_id,
+        orderId: orderId || null,
+      });
+
+      return c.json({
+        id: newPaymentIntent.id,
+        status: newPaymentIntent.status,
+        amount: newPaymentIntent.amount,
+        receiptUrl,
+      });
+    } catch (confirmError: any) {
+      logger.error('Failed to simulate payment', { error: confirmError.message });
+      return c.json({ error: `Simulation failed: ${confirmError.message}` }, 400);
+    }
+  } catch (error: any) {
+    logger.error('Error simulating payment', { error: error.message });
+
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    if (error.type === 'StripeInvalidRequestError') {
+      if (error.message?.includes('No such payment_intent')) {
+        return c.json({ error: 'Payment intent not found' }, 404);
+      }
+      return c.json({ error: error.message }, 400);
+    }
+
+    return c.json({ error: 'Failed to simulate payment' }, 500);
   }
 });
 
