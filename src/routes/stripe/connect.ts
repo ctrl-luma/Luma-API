@@ -1309,6 +1309,16 @@ const getTransactionRoute = createRoute({
               processingFee: z.number(),
               netAmount: z.number(),
             }),
+            orderItems: z.array(z.object({
+              id: z.string(),
+              productId: z.string().nullable(),
+              name: z.string(),
+              quantity: z.number(),
+              unitPrice: z.number(),
+            })).optional(),
+            isQuickCharge: z.boolean().optional(),
+            tipAmount: z.number().optional(),
+            taxAmount: z.number().optional(),
           }),
         },
       },
@@ -1416,6 +1426,53 @@ app.openapi(getTransactionRoute, async (c) => {
     const processingFee = stripeFee + platformFee;
     const netAmount = charge.amount - processingFee - charge.amount_refunded;
 
+    // Look up order and order items if we have a payment intent
+    let orderItems: Array<{ id: string; productId: string | null; name: string; quantity: number; unitPrice: number }> | undefined;
+    let isQuickCharge: boolean | undefined;
+    let tipAmount: number | undefined;
+    let taxAmount: number | undefined;
+
+    if (charge.payment_intent) {
+      const paymentIntentId = typeof charge.payment_intent === 'string'
+        ? charge.payment_intent
+        : charge.payment_intent.id;
+
+      const orderRows = await query<{ id: string; metadata: any; tip_amount: string; tax_amount: string }>(
+        'SELECT id, metadata, tip_amount, tax_amount FROM orders WHERE stripe_payment_intent_id = $1 AND organization_id = $2',
+        [paymentIntentId, payload.organizationId]
+      );
+
+      if (orderRows.length > 0) {
+        const order = orderRows[0];
+        const orderMetadata = typeof order.metadata === 'string' ? JSON.parse(order.metadata) : order.metadata;
+        isQuickCharge = orderMetadata?.isQuickCharge || false;
+        tipAmount = Math.round(parseFloat(order.tip_amount || '0') * 100); // Convert to cents
+        taxAmount = Math.round(parseFloat(order.tax_amount || '0') * 100); // Convert to cents
+
+        // Get order items
+        const itemRows = await query<{
+          id: string;
+          product_id: string | null;
+          name: string;
+          quantity: number;
+          unit_price: string;
+        }>(
+          'SELECT id, product_id, name, quantity, unit_price FROM order_items WHERE order_id = $1',
+          [order.id]
+        );
+
+        if (itemRows.length > 0) {
+          orderItems = itemRows.map((item) => ({
+            id: item.id,
+            productId: item.product_id,
+            name: item.name,
+            quantity: item.quantity,
+            unitPrice: Math.round(parseFloat(item.unit_price) * 100), // Convert to cents
+          }));
+        }
+      }
+    }
+
     return c.json({
       id: charge.id,
       amount: charge.amount, // Keep in cents for consistency with app
@@ -1435,6 +1492,10 @@ app.openapi(getTransactionRoute, async (c) => {
         processingFee,
         netAmount,
       },
+      orderItems,
+      isQuickCharge,
+      tipAmount,
+      taxAmount,
     });
   } catch (error: any) {
     logger.error('Error getting transaction', { error, transactionId });
@@ -1864,6 +1925,11 @@ const analyticsRoute = createRoute({
               revenue: z.number(),
               percentage: z.number(),
             })),
+            quickCharge: z.object({
+              orders: z.number(),
+              revenue: z.number(),
+              percentage: z.number(),
+            }),
           }),
         },
       },
@@ -1982,32 +2048,34 @@ app.openapi(analyticsRoute, async (c) => {
       for (let h = 9; h <= 21; h++) {
         const hour12 = h > 12 ? h - 12 : h;
         const ampm = h >= 12 ? 'PM' : 'AM';
-        revenueData.push({ label: `${hour12}${ampm}`, revenue: Math.round(hourlyMap[h] || 0) });
+        revenueData.push({ label: `${hour12}${ampm}`, revenue: Math.round((hourlyMap[h] || 0) * 100) / 100 });
       }
     } else if (range === 'week') {
-      // Group by day - show last 7 days with actual dates
-      const dailyQuery = await query<{ day: string; revenue: string }>(
+      // Group by day - use ISODOW (1=Monday, 7=Sunday) for locale-independent results
+      const dailyQuery = await query<{ day_num: string; revenue: string }>(
         `SELECT
-          TO_CHAR(created_at, 'Dy') as day,
+          EXTRACT(ISODOW FROM created_at)::text as day_num,
           COALESCE(SUM(total_amount), 0)::text as revenue
         FROM orders
         WHERE organization_id = $1
           AND status = 'completed'
           AND created_at >= $2
-        GROUP BY TO_CHAR(created_at, 'Dy'), EXTRACT(DOW FROM created_at)
-        ORDER BY EXTRACT(DOW FROM created_at)`,
+        GROUP BY EXTRACT(ISODOW FROM created_at)
+        ORDER BY EXTRACT(ISODOW FROM created_at)`,
         [payload.organizationId, currentStart.toISOString()]
       );
 
-      const dailyMap: Record<string, number> = {};
+      // Map ISODOW numbers to day names (1=Mon, 2=Tue, ..., 7=Sun)
+      const dailyMap: Record<number, number> = {};
       dailyQuery.forEach(row => {
-        dailyMap[row.day] = parseFloat(row.revenue);
+        dailyMap[parseInt(row.day_num)] = parseFloat(row.revenue);
       });
 
-      // Start from Monday
+      // ISODOW: 1=Monday through 7=Sunday
       const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-      days.forEach(d => {
-        revenueData.push({ label: d, revenue: Math.round(dailyMap[d] || 0) });
+      days.forEach((d, index) => {
+        const isodow = index + 1; // 1-7
+        revenueData.push({ label: d, revenue: Math.round((dailyMap[isodow] || 0) * 100) / 100 });
       });
     } else if (range === 'month') {
       // Group by month - show last 12 months with month names
@@ -2039,7 +2107,7 @@ app.openapi(analyticsRoute, async (c) => {
         const monthName = months[date.getMonth()];
         const year = date.getFullYear();
         const key = `${monthName}-${year}`;
-        revenueData.push({ label: monthName, revenue: Math.round(monthlyMap[key] || 0) });
+        revenueData.push({ label: monthName, revenue: Math.round((monthlyMap[key] || 0) * 100) / 100 });
       }
     } else {
       // 'all' - Group by year
@@ -2064,7 +2132,7 @@ app.openapi(analyticsRoute, async (c) => {
       // Show last 2 years
       for (let i = 1; i >= 0; i--) {
         const year = now.getFullYear() - i;
-        revenueData.push({ label: year.toString(), revenue: Math.round(yearlyMap[year.toString()] || 0) });
+        revenueData.push({ label: year.toString(), revenue: Math.round((yearlyMap[year.toString()] || 0) * 100) / 100 });
       }
     }
 
@@ -2247,6 +2315,28 @@ app.openapi(analyticsRoute, async (c) => {
       percentage: totalCategoryQuantity > 0 ? Math.round((parseInt(c.quantity || '0') / totalCategoryQuantity) * 100) : 0,
     }));
 
+    // Query Quick Charge stats (orders with isQuickCharge flag in metadata)
+    const quickChargeQuery = await query<{
+      order_count: string;
+      revenue: string;
+    }>(
+      `SELECT
+        COUNT(*)::text as order_count,
+        COALESCE(SUM(total_amount), 0)::text as revenue
+      FROM orders
+      WHERE organization_id = $1
+        AND status = 'completed'
+        AND created_at >= $2
+        AND (metadata->>'isQuickCharge')::boolean = true`,
+      [payload.organizationId, currentStart.toISOString()]
+    );
+
+    const quickChargeOrders = parseInt(quickChargeQuery[0]?.order_count || '0');
+    const quickChargeRevenue = parseFloat(quickChargeQuery[0]?.revenue || '0');
+    const quickChargePercentage = currentTransactions > 0
+      ? Math.round((quickChargeOrders / currentTransactions) * 100)
+      : 0;
+
     return c.json({
       metrics: {
         revenue: Math.round(currentRevenue * 100) / 100,
@@ -2261,6 +2351,11 @@ app.openapi(analyticsRoute, async (c) => {
       topProducts,
       catalogBreakdown,
       categoryBreakdown,
+      quickCharge: {
+        orders: quickChargeOrders,
+        revenue: Math.round(quickChargeRevenue * 100) / 100,
+        percentage: quickChargePercentage,
+      },
     });
   } catch (error: any) {
     logger.error('Error fetching analytics', {

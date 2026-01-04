@@ -29,9 +29,9 @@ const catalogSchema = z.object({
 });
 
 const createCatalogSchema = z.object({
-  name: z.string().min(1),
-  description: z.string().nullable().optional(),
-  location: z.string().nullable().optional(),
+  name: z.string().min(1).max(100),
+  description: z.string().max(500).nullable().optional(),
+  location: z.string().max(200).nullable().optional(),
   date: z.string().nullable().optional(),
   isActive: z.boolean().optional().default(true),
   showTipScreen: z.boolean().optional().default(true),
@@ -43,9 +43,9 @@ const createCatalogSchema = z.object({
 });
 
 const updateCatalogSchema = z.object({
-  name: z.string().min(1).optional(),
-  description: z.string().nullable().optional(),
-  location: z.string().nullable().optional(),
+  name: z.string().min(1).max(100).optional(),
+  description: z.string().max(500).nullable().optional(),
+  location: z.string().max(200).nullable().optional(),
   date: z.string().nullable().optional(),
   isActive: z.boolean().optional(),
   showTipScreen: z.boolean().optional(),

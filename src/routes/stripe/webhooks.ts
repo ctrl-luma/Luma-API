@@ -6,6 +6,7 @@ import { logger } from '../../utils/logger';
 import { query, transaction } from '../../db';
 import { normalizeEmail } from '../../utils/email';
 import { PRICING_BY_TIER, DEFAULT_FEATURES_BY_TIER } from '../../db/models/subscription';
+import { socketService, SocketEvents } from '../../services/socket';
 
 const app = new OpenAPIHono();
 
@@ -140,14 +141,26 @@ app.openapi(webhookRoute, async (c) => {
 
 async function handlePaymentIntentSucceeded(paymentIntent: any) {
   await transaction(async (client) => {
-    await client.query(
-      `UPDATE orders 
-       SET status = 'completed', 
+    const result = await client.query(
+      `UPDATE orders
+       SET status = 'completed',
            stripe_charge_id = $1,
            updated_at = NOW()
-       WHERE stripe_payment_intent_id = $2`,
+       WHERE stripe_payment_intent_id = $2
+       RETURNING id, organization_id, total_amount`,
       [paymentIntent.latest_charge, paymentIntent.id]
     );
+
+    if (result.rows.length > 0) {
+      const order = result.rows[0];
+
+      // Emit socket event for real-time updates
+      socketService.emitToOrganization(order.organization_id, SocketEvents.ORDER_COMPLETED, {
+        orderId: order.id,
+        amount: order.total_amount,
+        timestamp: new Date(),
+      });
+    }
 
     logger.info('Payment intent succeeded', {
       paymentIntentId: paymentIntent.id,
@@ -158,13 +171,25 @@ async function handlePaymentIntentSucceeded(paymentIntent: any) {
 
 async function handlePaymentIntentFailed(paymentIntent: any) {
   await transaction(async (client) => {
-    await client.query(
-      `UPDATE orders 
+    const result = await client.query(
+      `UPDATE orders
        SET status = 'failed',
            updated_at = NOW()
-       WHERE stripe_payment_intent_id = $1`,
+       WHERE stripe_payment_intent_id = $1
+       RETURNING id, organization_id`,
       [paymentIntent.id]
     );
+
+    if (result.rows.length > 0) {
+      const order = result.rows[0];
+
+      // Emit socket event for real-time updates
+      socketService.emitToOrganization(order.organization_id, SocketEvents.ORDER_FAILED, {
+        orderId: order.id,
+        error: paymentIntent.last_payment_error?.message || 'Payment failed',
+        timestamp: new Date(),
+      });
+    }
 
     logger.info('Payment intent failed', {
       paymentIntentId: paymentIntent.id,
@@ -175,19 +200,28 @@ async function handlePaymentIntentFailed(paymentIntent: any) {
 
 async function handleChargeRefunded(charge: any) {
   const refundAmount = charge.amount_refunded / 100;
-  
+
   await transaction(async (client) => {
     const result = await client.query(
-      `UPDATE orders 
+      `UPDATE orders
        SET status = 'refunded',
            updated_at = NOW()
        WHERE stripe_charge_id = $1
-       RETURNING id, total_amount`,
+       RETURNING id, organization_id, total_amount`,
       [charge.id]
     );
 
     if (result.rows.length > 0) {
       const order = result.rows[0];
+
+      // Emit socket event for real-time updates
+      socketService.emitToOrganization(order.organization_id, SocketEvents.ORDER_REFUNDED, {
+        orderId: order.id,
+        refundAmount,
+        partialRefund: refundAmount < order.total_amount,
+        timestamp: new Date(),
+      });
+
       logger.info('Charge refunded', {
         chargeId: charge.id,
         orderId: order.id,
@@ -199,13 +233,25 @@ async function handleChargeRefunded(charge: any) {
 }
 
 async function handleAccountUpdated(account: any) {
-  await query(
-    `UPDATE organizations 
+  const result = await query<{ id: string }>(
+    `UPDATE organizations
      SET stripe_onboarding_completed = $1,
          updated_at = NOW()
-     WHERE stripe_account_id = $2`,
+     WHERE stripe_account_id = $2
+     RETURNING id`,
     [account.charges_enabled && account.payouts_enabled, account.id]
   );
+
+  if (result.length > 0) {
+    const organizationId = result[0].id;
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(organizationId, SocketEvents.CONNECT_STATUS_UPDATED, {
+      chargesEnabled: account.charges_enabled,
+      payoutsEnabled: account.payouts_enabled,
+      timestamp: new Date(),
+    });
+  }
 
   logger.info('Connected account updated', {
     accountId: account.id,

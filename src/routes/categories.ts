@@ -23,15 +23,15 @@ const categorySchema = z.object({
 });
 
 const createCategorySchema = z.object({
-  name: z.string().min(1),
-  description: z.string().nullable().optional(),
+  name: z.string().min(1).max(100),
+  description: z.string().max(500).nullable().optional(),
   icon: z.string().nullable().optional(),
   isActive: z.boolean().optional().default(true),
 });
 
 const updateCategorySchema = z.object({
-  name: z.string().min(1).optional(),
-  description: z.string().nullable().optional(),
+  name: z.string().min(1).max(100).optional(),
+  description: z.string().max(500).nullable().optional(),
   icon: z.string().nullable().optional(),
   sortOrder: z.number().optional(),
   isActive: z.boolean().optional(),

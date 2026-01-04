@@ -31,70 +31,6 @@ export interface User {
   updated_at: Date;
 }
 
-export interface Event {
-  id: string;
-  organization_id: string;
-  name: string;
-  venue_name: string | null;
-  location_address: string | null;
-  location_lat: number | null;
-  location_lng: number | null;
-  start_time: Date;
-  end_time: Date | null;
-  status: 'draft' | 'active' | 'completed' | 'cancelled';
-  settings: Record<string, any>;
-  tip_settings: {
-    enabled: boolean;
-    default_percentages: number[];
-  };
-  revenue_split: Array<{
-    name: string;
-    type: string;
-    percentage: number;
-    stripe_account_id?: string;
-  }>;
-  created_by: string | null;
-  created_at: Date;
-  updated_at: Date;
-}
-
-export interface MenuCategory {
-  id: string;
-  organization_id: string;
-  name: string;
-  display_order: number;
-  is_active: boolean;
-  created_at: Date;
-  updated_at: Date;
-}
-
-export interface MenuItem {
-  id: string;
-  organization_id: string;
-  category_id: string | null;
-  name: string;
-  description: string | null;
-  price: number;
-  tax_rate: number;
-  sku: string | null;
-  quick_add: boolean;
-  display_order: number;
-  is_active: boolean;
-  modifiers: Array<{
-    id: string;
-    name: string;
-    options: Array<{
-      id: string;
-      name: string;
-      price: number;
-    }>;
-    required: boolean;
-    max_selections: number;
-  }>;
-  created_at: Date;
-  updated_at: Date;
-}
-
 export interface Order {
   id: string;
   organization_id: string;
@@ -147,15 +83,6 @@ export interface Payout {
   processed_at: Date | null;
   created_at: Date;
   updated_at: Date;
-}
-
-export interface Session {
-  id: string;
-  user_id: string;
-  refresh_token: string;
-  device_info: Record<string, any>;
-  expires_at: Date;
-  created_at: Date;
 }
 
 export interface AuditLog {

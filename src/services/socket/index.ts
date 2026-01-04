@@ -171,22 +171,21 @@ export class SocketService {
 export const socketService = new SocketService();
 
 export const SocketEvents = {
+  // Order events
   ORDER_CREATED: 'order:created',
   ORDER_UPDATED: 'order:updated',
   ORDER_COMPLETED: 'order:completed',
   ORDER_FAILED: 'order:failed',
   ORDER_REFUNDED: 'order:refunded',
+  // Payment events
   PAYMENT_RECEIVED: 'payment:received',
-  TIP_UPDATED: 'tip:updated',
-  EVENT_STARTED: 'event:started',
-  EVENT_ENDED: 'event:ended',
   REVENUE_UPDATE: 'revenue:update',
-  STAFF_JOINED: 'staff:joined',
-  STAFF_LEFT: 'staff:left',
+  TIP_UPDATED: 'tip:updated',
   // Stripe Connect events
   CONNECT_STATUS_UPDATED: 'connect:status_updated',
-  // User/Profile events
+  // User events
   USER_UPDATED: 'user:updated',
+  // Organization events
   ORGANIZATION_UPDATED: 'organization:updated',
   // Catalog events
   CATALOG_UPDATED: 'catalog:updated',

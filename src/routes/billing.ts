@@ -100,11 +100,21 @@ app.openapi(billingHistoryRoute, async (c) => {
     }
 
     if (!user.stripe_customer_id) {
-      logger.info('User has no stripe_customer_id', { 
+      logger.info('User has no stripe_customer_id, returning empty billing history', {
         userId: user.id,
-        email: user.email 
+        email: user.email
       });
-      return c.json({ error: 'No billing history found' }, 404);
+      return c.json({
+        data: [],
+        pagination: {
+          page: 1,
+          per_page: 10,
+          total_pages: 0,
+          total_count: 0,
+          has_next: false,
+          has_previous: false,
+        },
+      });
     }
 
     logger.info('Looking up billing history', {
@@ -287,8 +297,26 @@ app.openapi(paymentInfoRoute, async (c) => {
     payload = await authService.verifyToken(token);
     const user = await authService.getUserById(payload.userId);
     
-    if (!user || !user.stripe_customer_id) {
+    if (!user) {
       return c.json({ error: 'User not found' }, 404);
+    }
+
+    // If no Stripe customer, return empty/default data instead of error
+    if (!user.stripe_customer_id) {
+      logger.info('User has no stripe_customer_id, returning default payment info', {
+        userId: user.id,
+        email: user.email
+      });
+      return c.json({
+        payment_method: null,
+        manage_payment_url: null,
+        next_billing_date: null,
+        subscription_status: 'none',
+        current_plan: null,
+        manage_subscription_url: null,
+        cancel_at: null,
+        canceled_at: null,
+      });
     }
 
     logger.info('Starting payment info retrieval', {

@@ -96,15 +96,6 @@ export function cacheKey(...parts: (string | number)[]): string {
 }
 
 export const CacheKeys = {
-  organization: (id: string) => cacheKey('org', id),
-  organizationByStripeId: (stripeId: string) => cacheKey('org', 'stripe', stripeId),
   user: (id: string) => cacheKey('user', id),
   userByEmail: (email: string) => cacheKey('user', 'email', email),
-  event: (id: string) => cacheKey('event', id),
-  activeEvents: (orgId: string) => cacheKey('events', 'active', orgId),
-  menuItems: (orgId: string) => cacheKey('menu', 'items', orgId),
-  menuCategories: (orgId: string) => cacheKey('menu', 'categories', orgId),
-  quickAddItems: (orgId: string) => cacheKey('menu', 'quick', orgId),
-  orderStats: (eventId: string) => cacheKey('stats', 'orders', eventId),
-  revenueStats: (eventId: string) => cacheKey('stats', 'revenue', eventId),
 } as const;
