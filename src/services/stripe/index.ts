@@ -111,7 +111,6 @@ export class StripeService {
         settings: {
           payouts: {
             schedule: {
-              delay_days: 'minimum',
               interval: 'manual',
             },
           },
