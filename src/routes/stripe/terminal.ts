@@ -30,6 +30,7 @@ function calculatePlatformFee(amountCents: number, tier: SubscriptionTier): numb
 // Helper to verify auth and get connected account
 async function getConnectedAccount(authHeader: string | undefined) {
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    logger.warn('Terminal auth failed: missing or invalid auth header');
     throw new Error('Unauthorized');
   }
 
@@ -37,18 +38,37 @@ async function getConnectedAccount(authHeader: string | undefined) {
   const { authService } = await import('../../services/auth');
   const payload = await authService.verifyToken(token);
 
+  logger.info('Terminal: Looking up connected account', {
+    organizationId: payload.organizationId,
+    userId: payload.userId,
+  });
+
   const rows = await query<StripeConnectedAccount>(
     'SELECT * FROM stripe_connected_accounts WHERE organization_id = $1',
     [payload.organizationId]
   );
 
+  logger.info('Terminal: Connected account lookup result', {
+    organizationId: payload.organizationId,
+    found: rows.length > 0,
+    chargesEnabled: rows.length > 0 ? rows[0].charges_enabled : null,
+    stripeAccountId: rows.length > 0 ? rows[0].stripe_account_id : null,
+  });
+
   if (rows.length === 0) {
+    logger.warn('Terminal: No connected account found', {
+      organizationId: payload.organizationId,
+    });
     throw new Error('No connected account found');
   }
 
   const connectedAccount = rows[0];
 
   if (!connectedAccount.charges_enabled) {
+    logger.warn('Terminal: Charges not enabled', {
+      organizationId: payload.organizationId,
+      stripeAccountId: connectedAccount.stripe_account_id,
+    });
     throw new Error('Payments are not enabled for this account');
   }
 
@@ -85,6 +105,116 @@ async function getConnectedAccount(authHeader: string | undefined) {
 
   return { connectedAccount, payload, subscriptionTier };
 }
+
+// ============================================
+// GET /stripe/terminal/location - Get or create a Terminal location for Tap to Pay
+// ============================================
+const getLocationRoute = createRoute({
+  method: 'get',
+  path: '/stripe/terminal/location',
+  summary: 'Get or create a Terminal location for Tap to Pay',
+  description: 'Returns an existing Terminal location or creates one if none exists. Required for local mobile reader (Tap to Pay).',
+  tags: ['Stripe Terminal'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: {
+      description: 'Terminal location retrieved/created successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            locationId: z.string(),
+            displayName: z.string(),
+          }),
+        },
+      },
+    },
+    401: { description: 'Unauthorized' },
+    403: { description: 'Payments not enabled for this account' },
+    404: { description: 'No connected account found' },
+  },
+});
+
+app.openapi(getLocationRoute, async (c) => {
+  logger.info('Terminal location request received');
+
+  try {
+    const { connectedAccount, payload } = await getConnectedAccount(c.req.header('Authorization'));
+
+    logger.info('Terminal: Fetching locations from Stripe', {
+      stripeAccountId: connectedAccount.stripe_account_id,
+    });
+
+    // Try to find an existing location for this account
+    const existingLocations = await stripe.terminal.locations.list(
+      { limit: 1 },
+      { stripeAccount: connectedAccount.stripe_account_id }
+    );
+
+    logger.info('Terminal: Stripe locations response', {
+      count: existingLocations.data.length,
+      stripeAccountId: connectedAccount.stripe_account_id,
+    });
+
+    if (existingLocations.data.length > 0) {
+      const location = existingLocations.data[0];
+      logger.info('Using existing Terminal location', {
+        locationId: location.id,
+        accountId: connectedAccount.stripe_account_id,
+      });
+      return c.json({
+        locationId: location.id,
+        displayName: location.display_name,
+      });
+    }
+
+    // No location exists, create one
+    // Get organization name for the display name
+    const orgRows = await query<{ name: string }>(
+      'SELECT name FROM organizations WHERE id = $1',
+      [payload.organizationId]
+    );
+    const orgName = orgRows.length > 0 ? orgRows[0].name : 'Mobile POS';
+
+    const newLocation = await stripe.terminal.locations.create(
+      {
+        display_name: `${orgName} - Tap to Pay`,
+        address: {
+          line1: '123 Main St', // Placeholder - required by Stripe
+          city: 'San Francisco',
+          state: 'CA',
+          postal_code: '94111',
+          country: 'US',
+        },
+      },
+      { stripeAccount: connectedAccount.stripe_account_id }
+    );
+
+    logger.info('Created new Terminal location', {
+      locationId: newLocation.id,
+      accountId: connectedAccount.stripe_account_id,
+      organizationId: payload.organizationId,
+    });
+
+    return c.json({
+      locationId: newLocation.id,
+      displayName: newLocation.display_name,
+    });
+  } catch (error: any) {
+    logger.error('Error getting/creating Terminal location', { error: error.message });
+
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    if (error.message === 'No connected account found') {
+      return c.json({ error: 'No connected account found' }, 404);
+    }
+    if (error.message === 'Payments are not enabled for this account') {
+      return c.json({ error: 'Payments are not enabled for this account' }, 403);
+    }
+
+    return c.json({ error: 'Failed to get/create Terminal location' }, 500);
+  }
+});
 
 // ============================================
 // POST /stripe/terminal/connection-token - Get a connection token for Stripe Terminal SDK

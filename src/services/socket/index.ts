@@ -185,6 +185,8 @@ export const SocketEvents = {
   CONNECT_STATUS_UPDATED: 'connect:status_updated',
   // User events
   USER_UPDATED: 'user:updated',
+  // Session events
+  SESSION_KICKED: 'session:kicked', // Emitted when user logs in on another device
   // Organization events
   ORGANIZATION_UPDATED: 'organization:updated',
   // Catalog events

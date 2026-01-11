@@ -14,6 +14,9 @@ COPY . .
 # Build the application
 RUN npm run build
 
+# Copy email templates to dist (TypeScript doesn't copy non-ts files)
+RUN cp -r src/services/email/templates dist/services/email/
+
 # Production stage
 FROM node:18-alpine
 WORKDIR /app
@@ -37,8 +40,11 @@ COPY --from=builder /app/dist ./dist
 # Copy database files
 COPY db ./db
 
+# Create image storage directory (will be overridden by PVC mount in production)
+RUN mkdir -p /data/images/.tmp
+
 # Change ownership to nodejs user
-RUN chown -R nodejs:nodejs /app
+RUN chown -R nodejs:nodejs /app /data/images
 
 # Switch to non-root user
 USER nodejs

@@ -618,4 +618,117 @@ app.openapi(stripeConfigRoute, async (c) => {
   });
 });
 
+// Create checkout session for upgrading to Pro
+const createUpgradeSessionRoute = createRoute({
+  method: 'post',
+  path: '/billing/create-upgrade-session',
+  summary: 'Create checkout session for Pro upgrade',
+  description: 'Creates a Stripe Checkout session for upgrading to Pro plan',
+  tags: ['Billing'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: {
+      description: 'Checkout session created',
+      content: {
+        'application/json': {
+          schema: z.object({
+            url: z.string(),
+          }),
+        },
+      },
+    },
+    401: { description: 'Unauthorized' },
+    400: { description: 'Already subscribed or missing configuration' },
+    500: { description: 'Internal server error' },
+  },
+});
+
+app.openapi(createUpgradeSessionRoute, async (c) => {
+  const authHeader = c.req.header('Authorization');
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    const payload = await authService.verifyToken(token);
+    const user = await authService.getUserById(payload.userId);
+
+    if (!user) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    if (!config.stripe.proPriceId) {
+      logger.error('Pro price ID not configured');
+      return c.json({ error: 'Pro plan not configured' }, 400);
+    }
+
+    // Ensure user has a Stripe customer ID
+    let customerId = user.stripe_customer_id;
+    if (!customerId) {
+      // Create a Stripe customer
+      const customer = await stripe.customers.create({
+        email: user.email,
+        name: `${user.first_name || ''} ${user.last_name || ''}`.trim() || undefined,
+        metadata: {
+          userId: user.id,
+          organizationId: user.organization_id,
+        },
+      });
+      customerId = customer.id;
+
+      // Update user with Stripe customer ID
+      const { query } = await import('../db');
+      await query(
+        'UPDATE users SET stripe_customer_id = $1 WHERE id = $2',
+        [customerId, user.id]
+      );
+
+      logger.info('Created Stripe customer for user', {
+        userId: user.id,
+        customerId,
+      });
+    }
+
+    // Check if user already has an active subscription
+    const subscriptions = await stripe.subscriptions.list({
+      customer: customerId,
+      status: 'active',
+      limit: 1,
+    });
+
+    if (subscriptions.data.length > 0) {
+      return c.json({ error: 'Already have an active subscription' }, 400);
+    }
+
+    const returnUrl = config.email.dashboardUrl || 'https://portal.lumapos.co';
+
+    // Create checkout session
+    const session = await stripeService.createCheckoutSession({
+      customer: customerId,
+      price: config.stripe.proPriceId,
+      successUrl: `${returnUrl}/billing?upgrade=success`,
+      cancelUrl: `${returnUrl}/billing?upgrade=cancelled`,
+      metadata: {
+        userId: user.id,
+        organizationId: user.organization_id,
+        email: user.email,
+      },
+      mode: 'subscription',
+    });
+
+    logger.info('Upgrade checkout session created', {
+      userId: user.id,
+      sessionId: session.id,
+    });
+
+    return c.json({ url: session.url });
+  } catch (error: any) {
+    logger.error('Failed to create upgrade session', { error });
+    return c.json({ error: 'Failed to create checkout session' }, 500);
+  }
+});
+
 export { app as billingRoutes };

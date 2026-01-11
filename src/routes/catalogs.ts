@@ -1,9 +1,10 @@
 import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
 import { z } from 'zod';
-import { query } from '../db';
-import { Catalog } from '../db/models';
+import { query, transaction } from '../db';
+import { Catalog, Category, CatalogProduct, Product } from '../db/models';
 import { logger } from '../utils/logger';
 import { socketService, SocketEvents } from '../services/socket';
+import { imageService } from '../services/images';
 
 const app = new OpenAPIHono();
 
@@ -90,14 +91,32 @@ app.openapi(listCatalogsRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
 
-    const rows = await query<Catalog & { product_count: number }>(
-      `SELECT c.*,
-        (SELECT COUNT(*) FROM catalog_products WHERE catalog_id = c.id)::int as product_count
-       FROM catalogs c
-       WHERE c.organization_id = $1
-       ORDER BY c.created_at DESC`,
-      [payload.organizationId]
-    );
+    // For 'user' role (staff), filter by assigned catalogs
+    // For 'owner' and 'admin' roles, show all catalogs
+    let rows: (Catalog & { product_count: number })[];
+
+    if (payload.role === 'user') {
+      // Staff with 'user' role - only show assigned catalogs
+      rows = await query<Catalog & { product_count: number }>(
+        `SELECT c.*,
+          (SELECT COUNT(*) FROM catalog_products WHERE catalog_id = c.id)::int as product_count
+         FROM catalogs c
+         INNER JOIN user_catalogs uc ON c.id = uc.catalog_id
+         WHERE c.organization_id = $1 AND uc.user_id = $2
+         ORDER BY c.created_at DESC`,
+        [payload.organizationId, payload.userId]
+      );
+    } else {
+      // Owner/Admin - show all catalogs
+      rows = await query<Catalog & { product_count: number }>(
+        `SELECT c.*,
+          (SELECT COUNT(*) FROM catalog_products WHERE catalog_id = c.id)::int as product_count
+         FROM catalogs c
+         WHERE c.organization_id = $1
+         ORDER BY c.created_at DESC`,
+        [payload.organizationId]
+      );
+    }
 
     return c.json(rows.map(row => ({
       id: row.id,
@@ -488,6 +507,231 @@ app.openapi(deleteCatalogRoute, async (c) => {
     }
     logger.error('Error deleting catalog', { error, catalogId: id });
     return c.json({ error: 'Failed to delete catalog' }, 500);
+  }
+});
+
+// Duplicate catalog
+const duplicateCatalogRoute = createRoute({
+  method: 'post',
+  path: '/catalogs/{id}/duplicate',
+  summary: 'Duplicate a catalog with all its categories and products',
+  tags: ['Catalogs'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    params: z.object({
+      id: z.string().uuid(),
+    }),
+    body: {
+      content: {
+        'application/json': {
+          schema: z.object({
+            name: z.string().min(1).max(100).optional(),
+          }).optional(),
+        },
+      },
+      required: false,
+    },
+  },
+  responses: {
+    201: {
+      description: 'Catalog duplicated',
+      content: {
+        'application/json': {
+          schema: catalogSchema,
+        },
+      },
+    },
+    401: { description: 'Unauthorized' },
+    404: { description: 'Original catalog not found' },
+  },
+});
+
+app.openapi(duplicateCatalogRoute, async (c) => {
+  const { id: originalId } = c.req.param();
+
+  try {
+    const payload = await verifyAuth(c.req.header('Authorization'));
+    const body = await c.req.json().catch(() => ({}));
+
+    return await transaction(async (client) => {
+      // Fetch the original catalog
+      const originalCatalog = await client.query(
+        'SELECT * FROM catalogs WHERE id = $1 AND organization_id = $2',
+        [originalId, payload.organizationId]
+      ) as { rows: Catalog[] };
+
+      if (originalCatalog.rows.length === 0) {
+        return c.json({ error: 'Catalog not found' }, 404);
+      }
+
+      const original = originalCatalog.rows[0];
+      const newName = body.name || `${original.name} (Copy)`;
+
+      // Create the new catalog
+      const newCatalogResult = await client.query(
+        `INSERT INTO catalogs (
+          organization_id, name, description, location, date, is_active,
+          show_tip_screen, prompt_for_email, tip_percentages, allow_custom_tip,
+          tax_rate, layout_type
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        RETURNING *`,
+        [
+          payload.organizationId,
+          newName,
+          original.description,
+          original.location,
+          original.date,
+          original.is_active,
+          original.show_tip_screen,
+          (original as any).prompt_for_email,
+          JSON.stringify((original as any).tip_percentages || [15, 18, 20, 25]),
+          (original as any).allow_custom_tip,
+          (original as any).tax_rate || 0,
+          (original as any).layout_type || 'grid',
+        ]
+      ) as { rows: Catalog[] };
+
+      const newCatalog = newCatalogResult.rows[0];
+
+      // Fetch and duplicate categories, keeping track of old -> new ID mapping
+      const originalCategories = await client.query(
+        'SELECT * FROM categories WHERE catalog_id = $1 ORDER BY sort_order ASC',
+        [originalId]
+      ) as { rows: Category[] };
+
+      const categoryIdMap = new Map<string, string>(); // old ID -> new ID
+
+      for (const category of originalCategories.rows) {
+        const newCategoryResult = await client.query(
+          `INSERT INTO categories (
+            catalog_id, organization_id, name, description, icon, sort_order, is_active
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+          RETURNING *`,
+          [
+            newCatalog.id,
+            payload.organizationId,
+            category.name,
+            category.description,
+            category.icon,
+            category.sort_order,
+            category.is_active,
+          ]
+        ) as { rows: Category[] };
+        categoryIdMap.set(category.id, newCategoryResult.rows[0].id);
+      }
+
+      // Fetch catalog products with their product details
+      const originalCatalogProducts = await client.query(
+        `SELECT cp.*, p.name as product_name, p.description as product_description, p.image_id as product_image_id
+         FROM catalog_products cp
+         JOIN products p ON cp.product_id = p.id
+         WHERE cp.catalog_id = $1
+         ORDER BY cp.sort_order ASC`,
+        [originalId]
+      ) as { rows: (CatalogProduct & { product_name: string; product_description: string | null; product_image_id: string | null })[] };
+
+      // Duplicate each product and its catalog_product entry
+      for (const catalogProduct of originalCatalogProducts.rows) {
+        // Duplicate the image if it exists
+        let newImageId: string | null = null;
+        if (catalogProduct.product_image_id) {
+          const duplicatedImage = await imageService.duplicate(catalogProduct.product_image_id);
+          if (duplicatedImage) {
+            newImageId = duplicatedImage.id;
+          }
+        }
+
+        // Create a new product in the product library
+        const newProductResult = await client.query(
+          `INSERT INTO products (organization_id, name, description, image_id, image_url)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING *`,
+          [
+            payload.organizationId,
+            catalogProduct.product_name,
+            catalogProduct.product_description,
+            newImageId,
+            newImageId ? imageService.getUrl(newImageId) : null,
+          ]
+        ) as { rows: Product[] };
+
+        const newProduct = newProductResult.rows[0];
+
+        // Map the category ID to the new catalog's category
+        const newCategoryId = catalogProduct.category_id
+          ? categoryIdMap.get(catalogProduct.category_id) || null
+          : null;
+
+        // Create the catalog_product entry
+        await client.query(
+          `INSERT INTO catalog_products (
+            catalog_id, product_id, category_id, price, sort_order, is_active
+          ) VALUES ($1, $2, $3, $4, $5, $6)`,
+          [
+            newCatalog.id,
+            newProduct.id,
+            newCategoryId,
+            catalogProduct.price,
+            catalogProduct.sort_order,
+            catalogProduct.is_active,
+          ]
+        );
+      }
+
+      // Duplicate revenue splits if any
+      await client.query(
+        `INSERT INTO revenue_splits (
+          catalog_id, organization_id, recipient_name, recipient_type, percentage, notes, is_active
+        )
+        SELECT $1, organization_id, recipient_name, recipient_type, percentage, notes, is_active
+        FROM revenue_splits
+        WHERE catalog_id = $2`,
+        [newCatalog.id, originalId]
+      );
+
+      logger.info('Catalog duplicated', {
+        originalCatalogId: originalId,
+        newCatalogId: newCatalog.id,
+        categoriesDuplicated: originalCategories.rows.length,
+        productsDuplicated: originalCatalogProducts.rows.length,
+      });
+
+      // Emit socket event for real-time updates
+      socketService.emitToOrganization(payload.organizationId, SocketEvents.CATALOG_CREATED, {
+        catalogId: newCatalog.id,
+        name: newCatalog.name,
+      });
+
+      // Get product count for response
+      const productCountResult = await client.query(
+        'SELECT COUNT(*) as count FROM catalog_products WHERE catalog_id = $1',
+        [newCatalog.id]
+      );
+
+      return c.json({
+        id: newCatalog.id,
+        name: newCatalog.name,
+        description: newCatalog.description,
+        location: newCatalog.location,
+        date: newCatalog.date,
+        isActive: newCatalog.is_active,
+        showTipScreen: newCatalog.show_tip_screen,
+        promptForEmail: (newCatalog as any).prompt_for_email ?? true,
+        tipPercentages: (newCatalog as any).tip_percentages ?? [15, 18, 20, 25],
+        allowCustomTip: (newCatalog as any).allow_custom_tip ?? true,
+        taxRate: parseFloat((newCatalog as any).tax_rate) || 0,
+        layoutType: (newCatalog as any).layout_type || 'grid',
+        productCount: parseInt(productCountResult.rows[0].count) || 0,
+        createdAt: newCatalog.created_at.toISOString(),
+        updatedAt: newCatalog.updated_at.toISOString(),
+      }, 201);
+    });
+  } catch (error: any) {
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    logger.error('Error duplicating catalog', { error, catalogId: originalId });
+    return c.json({ error: 'Failed to duplicate catalog' }, 500);
   }
 });
 

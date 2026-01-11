@@ -249,11 +249,51 @@ export async function sendPayoutEmail(to: string, payoutData: any): Promise<void
 <strong>Bank Account:</strong> ****${payoutData.last4}<br><br>
 The funds should arrive in your bank account by ${payoutData.expectedArrival}. Processing times may vary depending on your bank.<br><br>
 You can view all your payouts and transaction history in your dashboard.`;
-  
+
   await sendTemplatedEmail(to, {
     subject: `Payout Processed - $${payoutData.amount.toFixed(2)}`,
     preheader_text: 'Your payout has been processed',
     email_title: 'Payout Confirmation',
+    email_content: emailContent,
+  });
+}
+
+export async function sendStaffInviteEmail(to: string, inviteData: {
+  firstName: string;
+  inviterName: string;
+  organizationName: string;
+  inviteToken: string;
+}): Promise<void> {
+  const acceptUrl = `${config.email.siteUrl}/accept-invite?token=${inviteData.inviteToken}`;
+
+  const emailContent = `Hi ${inviteData.firstName},<br><br>
+${inviteData.inviterName} has invited you to join <strong>${inviteData.organizationName}</strong> on Luma POS.<br><br>
+As a team member, you'll be able to use the Luma mobile app to process payments, manage orders, and help run the business.<br><br>
+Click the button below to set up your account. This invitation expires in 7 days.`;
+
+  await sendTemplatedEmail(to, {
+    subject: `You've been invited to join ${inviteData.organizationName} on Luma`,
+    preheader_text: `${inviteData.inviterName} has invited you to join their team`,
+    email_title: 'You\'re Invited!',
+    email_content: emailContent,
+    cta_url: acceptUrl,
+    cta_text: 'Accept Invitation',
+    security_notice: true,
+  });
+}
+
+export async function sendStaffDisabledEmail(to: string, staffData: {
+  firstName: string;
+  organizationName: string;
+}): Promise<void> {
+  const emailContent = `Hi ${staffData.firstName},<br><br>
+Your access to <strong>${staffData.organizationName}</strong> on Luma has been temporarily disabled because the organization's subscription is no longer active.<br><br>
+Please contact your organization administrator for more information.`;
+
+  await sendTemplatedEmail(to, {
+    subject: 'Your Luma account has been temporarily disabled',
+    preheader_text: 'Your account access has been temporarily disabled',
+    email_title: 'Account Access Disabled',
     email_content: emailContent,
   });
 }

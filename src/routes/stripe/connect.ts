@@ -2,7 +2,7 @@ import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
 import { z } from 'zod';
 import { query, transaction } from '../../db';
 import { StripeConnectedAccount, ConnectOnboardingState } from '../../db/models';
-import { stripeService } from '../../services/stripe';
+import { stripe, stripeService } from '../../services/stripe';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
 import { socketService, SocketEvents } from '../../services/socket';
@@ -47,6 +47,7 @@ async function syncAccountFromStripe(account: Stripe.Account, organizationId: st
   let externalAccountLast4: string | null = null;
   let externalAccountBankName: string | null = null;
   let externalAccountType: string | null = null;
+  let externalAccountStatus: string | null = null;
 
   if (account.external_accounts?.data && account.external_accounts.data.length > 0) {
     const externalAccount = account.external_accounts.data[0];
@@ -54,11 +55,44 @@ async function syncAccountFromStripe(account: Stripe.Account, organizationId: st
       externalAccountLast4 = externalAccount.last4 || null;
       externalAccountBankName = externalAccount.bank_name || null;
       externalAccountType = 'bank_account';
+      externalAccountStatus = (externalAccount as any).status || null;
     } else if (externalAccount.object === 'card') {
       externalAccountLast4 = externalAccount.last4 || null;
       externalAccountBankName = externalAccount.brand || null;
       externalAccountType = 'card';
     }
+  }
+
+  // Check for recent failed payouts to determine payout status
+  // Only mark as undeliverable if the MOST RECENT payout failed AND was to the current bank account
+  let payoutStatus: string | null = 'active';
+  let payoutFailureCode: string | null = null;
+  let payoutFailureMessage: string | null = null;
+
+  try {
+    const recentPayouts = await stripe.payouts.list(
+      { limit: 1 },
+      { stripeAccount: account.id }
+    );
+
+    // Only check the most recent payout - if it failed, there's likely still an issue
+    const mostRecentPayout = recentPayouts.data[0];
+    if (mostRecentPayout && mostRecentPayout.status === 'failed') {
+      // Check if the failed payout was to the current external account
+      // If user changed bank accounts, don't show warning for old bank's failure
+      const failedDestination = mostRecentPayout.destination as string | null;
+      const currentExternalAccountId = account.external_accounts?.data[0]?.id;
+
+      // Only show warning if the failed payout was to the current bank account
+      // or if we can't determine the destination (be safe and show warning)
+      if (!failedDestination || !currentExternalAccountId || failedDestination === currentExternalAccountId) {
+        payoutStatus = 'undeliverable';
+        payoutFailureCode = mostRecentPayout.failure_code || null;
+        payoutFailureMessage = mostRecentPayout.failure_message || null;
+      }
+    }
+  } catch (error) {
+    logger.warn('Failed to check payout status', { accountId: account.id, error });
   }
 
   const queryParams = [
@@ -80,6 +114,10 @@ async function syncAccountFromStripe(account: Stripe.Account, organizationId: st
     externalAccountLast4,
     externalAccountBankName,
     externalAccountType,
+    externalAccountStatus,
+    payoutStatus,
+    payoutFailureCode,
+    payoutFailureMessage,
     isComplete,
   ];
 
@@ -109,9 +147,13 @@ async function syncAccountFromStripe(account: Stripe.Account, organizationId: st
         external_account_last4,
         external_account_bank_name,
         external_account_type,
+        external_account_status,
+        payout_status,
+        payout_failure_code,
+        payout_failure_message,
         onboarding_completed_at,
         last_stripe_sync_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, CASE WHEN $19 THEN NOW() ELSE NULL END, NOW())
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, CASE WHEN $23 THEN NOW() ELSE NULL END, NOW())
       ON CONFLICT (organization_id) DO UPDATE SET
         charges_enabled = $4,
         payouts_enabled = $5,
@@ -128,7 +170,11 @@ async function syncAccountFromStripe(account: Stripe.Account, organizationId: st
         external_account_last4 = $16,
         external_account_bank_name = $17,
         external_account_type = $18,
-        onboarding_completed_at = CASE WHEN $19 AND stripe_connected_accounts.onboarding_completed_at IS NULL THEN NOW() ELSE stripe_connected_accounts.onboarding_completed_at END,
+        external_account_status = $19,
+        payout_status = $20,
+        payout_failure_code = $21,
+        payout_failure_message = $22,
+        onboarding_completed_at = CASE WHEN $23 AND stripe_connected_accounts.onboarding_completed_at IS NULL THEN NOW() ELSE stripe_connected_accounts.onboarding_completed_at END,
         last_stripe_sync_at = NOW(),
         updated_at = NOW()`,
       queryParams
@@ -175,6 +221,10 @@ const getConnectStatusRoute = createRoute({
             businessName: z.string().nullable(),
             externalAccountLast4: z.string().nullable(),
             externalAccountBankName: z.string().nullable(),
+            externalAccountStatus: z.string().nullable(),
+            payoutStatus: z.string().nullable(),
+            payoutFailureCode: z.string().nullable(),
+            payoutFailureMessage: z.string().nullable(),
           }),
         },
       },
@@ -217,6 +267,10 @@ app.openapi(getConnectStatusRoute, async (c) => {
         businessName: null,
         externalAccountLast4: null,
         externalAccountBankName: null,
+        externalAccountStatus: null,
+        payoutStatus: null,
+        payoutFailureCode: null,
+        payoutFailureMessage: null,
       });
     }
 
@@ -262,6 +316,10 @@ app.openapi(getConnectStatusRoute, async (c) => {
             businessName: updated.business_name,
             externalAccountLast4: updated.external_account_last4,
             externalAccountBankName: updated.external_account_bank_name,
+            externalAccountStatus: updated.external_account_status,
+            payoutStatus: updated.payout_status,
+            payoutFailureCode: updated.payout_failure_code,
+            payoutFailureMessage: updated.payout_failure_message,
           });
         }
       } catch (error) {
@@ -282,6 +340,10 @@ app.openapi(getConnectStatusRoute, async (c) => {
       businessName: connectedAccount.business_name,
       externalAccountLast4: connectedAccount.external_account_last4,
       externalAccountBankName: connectedAccount.external_account_bank_name,
+      externalAccountStatus: connectedAccount.external_account_status,
+      payoutStatus: connectedAccount.payout_status,
+      payoutFailureCode: connectedAccount.payout_failure_code,
+      payoutFailureMessage: connectedAccount.payout_failure_message,
     });
   } catch (error) {
     logger.error('Error getting connect status', { error });
@@ -674,9 +736,13 @@ app.openapi(getBalanceRoute, async (c) => {
         currency: item.currency,
       }));
 
+    // Log raw balance from Stripe for debugging
     logger.info('Retrieved connected account balance', {
       accountId: connectedAccount.stripe_account_id,
       organizationId: payload.organizationId,
+      rawAvailable: balance.available,
+      rawPending: balance.pending,
+      rawInstantAvailable: balance.instant_available,
     });
 
     return c.json({
@@ -1868,6 +1934,7 @@ const analyticsRoute = createRoute({
   request: {
     query: z.object({
       range: z.enum(['today', 'week', 'month', 'all']).default('week'),
+      offset: z.string().transform(Number).optional(), // Negative number to go back in time (e.g., -1 = previous period)
     }),
   },
   responses: {
@@ -1952,50 +2019,74 @@ app.openapi(analyticsRoute, async (c) => {
     const payload = await authService.verifyToken(token);
 
     const range = c.req.query('range') || 'week';
+    const offset = parseInt(c.req.query('offset') || '0') || 0; // Offset for navigating to previous periods
     const now = new Date();
     let currentStart: Date;
+    let currentEnd: Date;
     let previousStart: Date;
     let previousEnd: Date;
 
     switch (range) {
       case 'today':
-        currentStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        // Apply offset (negative = go back in days)
+        currentStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() + offset);
+        currentEnd = new Date(currentStart.getTime() + 24 * 60 * 60 * 1000 - 1);
         previousStart = new Date(currentStart.getTime() - 24 * 60 * 60 * 1000);
         previousEnd = new Date(currentStart.getTime() - 1);
         break;
       case 'week':
-        currentStart = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+        // Start of current week (Monday)
+        const dayOfWeek = now.getDay(); // 0=Sunday, 1=Monday, ..., 6=Saturday
+        const daysFromMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1; // Convert to days since Monday
+        // Apply offset (negative = go back weeks)
+        currentStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysFromMonday + (offset * 7));
+        currentEnd = new Date(currentStart.getTime() + 7 * 24 * 60 * 60 * 1000 - 1);
+        // Previous week is the 7 days before current week start
         previousStart = new Date(currentStart.getTime() - 7 * 24 * 60 * 60 * 1000);
         previousEnd = new Date(currentStart.getTime() - 1);
         break;
       case 'month':
-        // Last 12 months
-        currentStart = new Date(now.getFullYear(), now.getMonth() - 11, 1);
-        previousStart = new Date(now.getFullYear(), now.getMonth() - 23, 1);
+        // Single month with offset
+        currentStart = new Date(now.getFullYear(), now.getMonth() + offset, 1);
+        currentEnd = new Date(now.getFullYear(), now.getMonth() + offset + 1, 0, 23, 59, 59);
+        previousStart = new Date(now.getFullYear(), now.getMonth() + offset - 1, 1);
         previousEnd = new Date(currentStart.getTime() - 1);
         break;
       case 'all':
       default:
-        // Last 2 years
+        // All time - no offset support
         currentStart = new Date(now.getFullYear() - 1, now.getMonth(), 1);
+        currentEnd = now;
         previousStart = new Date(now.getFullYear() - 3, now.getMonth(), 1);
         previousEnd = new Date(currentStart.getTime() - 1);
         break;
     }
 
     // Query current period metrics from database
+    // Use bounded query when viewing past periods (offset != 0)
     const currentMetricsQuery = await query<{
       revenue: string;
       transactions: string;
     }>(
-      `SELECT
-        COALESCE(SUM(total_amount), 0)::text as revenue,
-        COUNT(*)::text as transactions
-      FROM orders
-      WHERE organization_id = $1
-        AND status = 'completed'
-        AND created_at >= $2`,
-      [payload.organizationId, currentStart.toISOString()]
+      offset !== 0
+        ? `SELECT
+            COALESCE(SUM(total_amount), 0)::text as revenue,
+            COUNT(*)::text as transactions
+          FROM orders
+          WHERE organization_id = $1
+            AND status = 'completed'
+            AND created_at >= $2
+            AND created_at <= $3`
+        : `SELECT
+            COALESCE(SUM(total_amount), 0)::text as revenue,
+            COUNT(*)::text as transactions
+          FROM orders
+          WHERE organization_id = $1
+            AND status = 'completed'
+            AND created_at >= $2`,
+      offset !== 0
+        ? [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
+        : [payload.organizationId, currentStart.toISOString()]
     );
 
     const currentRevenue = parseFloat(currentMetricsQuery[0]?.revenue || '0');
@@ -2044,70 +2135,88 @@ app.openapi(analyticsRoute, async (c) => {
         hourlyMap[parseInt(row.hour)] = parseFloat(row.revenue);
       });
 
-      // Show hours from 9 AM to 9 PM
-      for (let h = 9; h <= 21; h++) {
-        const hour12 = h > 12 ? h - 12 : h;
+      // Determine hour range - default 9 AM to 9 PM, but expand if transactions exist outside
+      const hoursWithData = Object.keys(hourlyMap).map(Number);
+      let minHour = 9;
+      let maxHour = 21;
+
+      if (hoursWithData.length > 0) {
+        const dataMin = Math.min(...hoursWithData);
+        const dataMax = Math.max(...hoursWithData);
+        minHour = Math.min(minHour, dataMin);
+        maxHour = Math.max(maxHour, dataMax);
+      }
+
+      // Generate hours for the determined range
+      for (let h = minHour; h <= maxHour; h++) {
+        const hour12 = h === 0 ? 12 : (h > 12 ? h - 12 : h);
         const ampm = h >= 12 ? 'PM' : 'AM';
         revenueData.push({ label: `${hour12}${ampm}`, revenue: Math.round((hourlyMap[h] || 0) * 100) / 100 });
       }
     } else if (range === 'week') {
-      // Group by day - use ISODOW (1=Monday, 7=Sunday) for locale-independent results
-      const dailyQuery = await query<{ day_num: string; revenue: string }>(
+      // Group by date for current week
+      const dailyQuery = await query<{ day_date: string; revenue: string }>(
         `SELECT
-          EXTRACT(ISODOW FROM created_at)::text as day_num,
+          DATE(created_at)::text as day_date,
           COALESCE(SUM(total_amount), 0)::text as revenue
         FROM orders
         WHERE organization_id = $1
           AND status = 'completed'
           AND created_at >= $2
-        GROUP BY EXTRACT(ISODOW FROM created_at)
-        ORDER BY EXTRACT(ISODOW FROM created_at)`,
+        GROUP BY DATE(created_at)
+        ORDER BY DATE(created_at)`,
         [payload.organizationId, currentStart.toISOString()]
       );
 
-      // Map ISODOW numbers to day names (1=Mon, 2=Tue, ..., 7=Sun)
-      const dailyMap: Record<number, number> = {};
+      // Map dates to revenue
+      const dailyMap: Record<string, number> = {};
       dailyQuery.forEach(row => {
-        dailyMap[parseInt(row.day_num)] = parseFloat(row.revenue);
+        dailyMap[row.day_date] = parseFloat(row.revenue);
       });
 
-      // ISODOW: 1=Monday through 7=Sunday
-      const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-      days.forEach((d, index) => {
-        const isodow = index + 1; // 1-7
-        revenueData.push({ label: d, revenue: Math.round((dailyMap[isodow] || 0) * 100) / 100 });
-      });
+      // Generate each day of the current week (Mon-Sun)
+      const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+      for (let i = 0; i < 7; i++) {
+        const date = new Date(currentStart.getTime() + i * 24 * 60 * 60 * 1000);
+        const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD format
+        revenueData.push({
+          label: dayNames[i],
+          revenue: Math.round((dailyMap[dateStr] || 0) * 100) / 100
+        });
+      }
     } else if (range === 'month') {
-      // Group by month - show last 12 months with month names
-      const monthlyQuery = await query<{ month: string; year: string; revenue: string }>(
+      // Group by day for the selected month
+      const dailyQuery = await query<{ day_date: string; revenue: string }>(
         `SELECT
-          TO_CHAR(created_at, 'Mon') as month,
-          EXTRACT(YEAR FROM created_at)::text as year,
+          DATE(created_at)::text as day_date,
           COALESCE(SUM(total_amount), 0)::text as revenue
         FROM orders
         WHERE organization_id = $1
           AND status = 'completed'
           AND created_at >= $2
-        GROUP BY TO_CHAR(created_at, 'Mon'), EXTRACT(YEAR FROM created_at), EXTRACT(MONTH FROM created_at)
-        ORDER BY EXTRACT(YEAR FROM created_at), EXTRACT(MONTH FROM created_at)`,
-        [payload.organizationId, currentStart.toISOString()]
+          AND created_at <= $3
+        GROUP BY DATE(created_at)
+        ORDER BY DATE(created_at)`,
+        [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
       );
 
-      // Create a map with year-month as key
-      const monthlyMap: Record<string, number> = {};
-      monthlyQuery.forEach(row => {
-        const key = `${row.month}-${row.year}`;
-        monthlyMap[key] = parseFloat(row.revenue);
+      // Map dates to revenue
+      const dailyMap: Record<string, number> = {};
+      dailyQuery.forEach(row => {
+        dailyMap[row.day_date] = parseFloat(row.revenue);
       });
 
-      // Generate last 12 months labels
-      const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-      for (let i = 11; i >= 0; i--) {
-        const date = new Date(now.getFullYear(), now.getMonth() - i, 1);
-        const monthName = months[date.getMonth()];
-        const year = date.getFullYear();
-        const key = `${monthName}-${year}`;
-        revenueData.push({ label: monthName, revenue: Math.round((monthlyMap[key] || 0) * 100) / 100 });
+      // Get number of days in the month
+      const daysInMonth = new Date(currentStart.getFullYear(), currentStart.getMonth() + 1, 0).getDate();
+
+      // Generate each day of the month
+      for (let i = 0; i < daysInMonth; i++) {
+        const date = new Date(currentStart.getFullYear(), currentStart.getMonth(), i + 1);
+        const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD format
+        revenueData.push({
+          label: (i + 1).toString(), // Day number
+          revenue: Math.round((dailyMap[dateStr] || 0) * 100) / 100
+        });
       }
     } else {
       // 'all' - Group by year
@@ -2136,6 +2245,14 @@ app.openapi(analyticsRoute, async (c) => {
       }
     }
 
+    // Helper for date-bounded queries
+    const dateCondition = offset !== 0
+      ? 'AND created_at >= $2 AND created_at <= $3'
+      : 'AND created_at >= $2';
+    const dateParams = offset !== 0
+      ? [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
+      : [payload.organizationId, currentStart.toISOString()];
+
     // Query payment method breakdown from database
     const paymentMethodQuery = await query<{ method: string | null; count: string }>(
       `SELECT
@@ -2144,10 +2261,10 @@ app.openapi(analyticsRoute, async (c) => {
       FROM orders
       WHERE organization_id = $1
         AND status = 'completed'
-        AND created_at >= $2
+        ${dateCondition}
       GROUP BY payment_method
       ORDER BY COUNT(*) DESC`,
-      [payload.organizationId, currentStart.toISOString()]
+      dateParams
     );
 
     const totalPaymentMethods = paymentMethodQuery.reduce((sum, p) => sum + parseInt(p.count || '0'), 0);
@@ -2173,10 +2290,10 @@ app.openapi(analyticsRoute, async (c) => {
       FROM orders
       WHERE organization_id = $1
         AND status = 'completed'
-        AND created_at >= $2
+        ${dateCondition}
       GROUP BY EXTRACT(HOUR FROM created_at)
       ORDER BY EXTRACT(HOUR FROM created_at)`,
-      [payload.organizationId, currentStart.toISOString()]
+      dateParams
     );
 
     const hourCountMap: Record<number, number> = {};
@@ -2198,6 +2315,10 @@ app.openapi(analyticsRoute, async (c) => {
     }
 
     // Query top products from orders with product details
+    const orderDateCondition = offset !== 0
+      ? 'AND o.created_at >= $2 AND o.created_at <= $3'
+      : 'AND o.created_at >= $2';
+
     const topProductsQuery = await query<{
       product_id: string | null;
       name: string;
@@ -2218,11 +2339,11 @@ app.openapi(analyticsRoute, async (c) => {
       LEFT JOIN products p ON oi.product_id = p.id
       WHERE o.organization_id = $1
         AND o.status = 'completed'
-        AND o.created_at >= $2
+        ${orderDateCondition}
       GROUP BY oi.product_id, COALESCE(oi.name, p.name, 'Unknown Product'), p.description, p.image_url
       ORDER BY SUM(oi.quantity) DESC
       LIMIT 10`,
-      [payload.organizationId, currentStart.toISOString()]
+      dateParams
     );
 
     const totalProductQuantity = topProductsQuery.reduce((sum, p) => sum + parseInt(p.quantity || '0'), 0);
@@ -2236,7 +2357,7 @@ app.openapi(analyticsRoute, async (c) => {
       percentage: totalProductQuantity > 0 ? Math.round((parseInt(p.quantity || '0') / totalProductQuantity) * 100) : 0,
     }));
 
-    // Query catalog breakdown from orders with catalog details
+    // Query catalog breakdown from orders with catalog details (excluding quick charges)
     const catalogBreakdownQuery = await query<{
       catalog_id: string | null;
       catalog_name: string | null;
@@ -2262,16 +2383,18 @@ app.openapi(analyticsRoute, async (c) => {
       LEFT JOIN catalogs c ON o.catalog_id = c.id
       WHERE o.organization_id = $1
         AND o.status = 'completed'
-        AND o.created_at >= $2
+        AND o.catalog_id IS NOT NULL
+        AND (o.metadata->>'isQuickCharge')::boolean IS NOT TRUE
+        ${orderDateCondition}
       GROUP BY o.catalog_id, c.name, c.description, c.location, c.date, c.created_at, c.id
       ORDER BY COUNT(o.id) DESC`,
-      [payload.organizationId, currentStart.toISOString()]
+      dateParams
     );
 
     const totalCatalogOrders = catalogBreakdownQuery.reduce((sum, c) => sum + parseInt(c.order_count || '0'), 0);
     const catalogBreakdown = catalogBreakdownQuery.map(c => ({
       catalogId: c.catalog_id,
-      catalogName: c.catalog_name || 'Quick Charge',
+      catalogName: c.catalog_name || 'Unknown Catalog',
       description: c.catalog_description,
       location: c.catalog_location,
       date: c.catalog_date,
@@ -2299,11 +2422,11 @@ app.openapi(analyticsRoute, async (c) => {
       LEFT JOIN categories cat ON oi.category_id = cat.id
       WHERE o.organization_id = $1
         AND o.status = 'completed'
-        AND o.created_at >= $2
+        ${orderDateCondition}
       GROUP BY oi.category_id, cat.name
       ORDER BY SUM(oi.quantity) DESC
       LIMIT 10`,
-      [payload.organizationId, currentStart.toISOString()]
+      dateParams
     );
 
     const totalCategoryQuantity = categoryBreakdownQuery.reduce((sum, c) => sum + parseInt(c.quantity || '0'), 0);
@@ -2326,9 +2449,9 @@ app.openapi(analyticsRoute, async (c) => {
       FROM orders
       WHERE organization_id = $1
         AND status = 'completed'
-        AND created_at >= $2
+        ${dateCondition}
         AND (metadata->>'isQuickCharge')::boolean = true`,
-      [payload.organizationId, currentStart.toISOString()]
+      dateParams
     );
 
     const quickChargeOrders = parseInt(quickChargeQuery[0]?.order_count || '0');

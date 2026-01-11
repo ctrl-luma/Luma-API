@@ -184,7 +184,7 @@ app.openapi(createProductRoute, async (c) => {
 
     const contentType = c.req.header('Content-Type') || '';
     let body: any;
-    let imageFile: File | null = null;
+    let imageFile: Blob | null = null;
 
     // Parse based on content type
     if (contentType.includes('multipart/form-data')) {
@@ -194,8 +194,9 @@ app.openapi(createProductRoute, async (c) => {
         description: formData.get('description') as string || null,
       };
       const file = formData.get('image');
-      if (file instanceof File) {
-        imageFile = file;
+      // Use duck typing - File is not available in Node.js
+      if (file && typeof file === 'object' && 'arrayBuffer' in file && 'type' in file) {
+        imageFile = file as Blob;
       }
       logger.info('Parsed FormData', { body, hasImage: !!imageFile });
     } else {
@@ -406,13 +407,17 @@ app.openapi(updateProductImageRoute, async (c) => {
     const formData = await c.req.formData();
     const file = formData.get('image');
 
-    if (!(file instanceof File)) {
+    // Use duck typing - File is not available in Node.js
+    const isFileLike = file && typeof file === 'object' && 'arrayBuffer' in file && 'type' in file;
+    if (!isFileLike) {
       return c.json({ error: 'No image file provided' }, 400);
     }
 
+    const uploadedFile = file as Blob;
+
     // Upload new image
-    const buffer = await file.arrayBuffer();
-    const result = await imageService.upload(buffer, file.type, { imageType: 'product' });
+    const buffer = await uploadedFile.arrayBuffer();
+    const result = await imageService.upload(buffer, uploadedFile.type, { imageType: 'product' });
 
     // Update product with new image
     const rows = await query<Product>(
@@ -443,7 +448,7 @@ app.openapi(updateProductImageRoute, async (c) => {
     if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
       return c.json({ error: 'Unauthorized' }, 401);
     }
-    logger.error('Error updating product image', { error, productId });
+    logger.error('Error updating product image', { error: error.message || error, stack: error.stack, productId });
     return c.json({ error: 'Failed to update product image' }, 500);
   }
 });
@@ -496,6 +501,117 @@ app.openapi(deleteProductRoute, async (c) => {
     }
     logger.error('Error deleting product', { error, productId });
     return c.json({ error: 'Failed to delete product' }, 500);
+  }
+});
+
+// Duplicate product
+const duplicateProductRoute = createRoute({
+  method: 'post',
+  path: '/products/{productId}/duplicate',
+  summary: 'Duplicate a product with its image',
+  tags: ['Products'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    params: z.object({
+      productId: z.string().uuid(),
+    }),
+    body: {
+      content: {
+        'application/json': {
+          schema: z.object({
+            name: z.string().min(1).max(100).optional(),
+          }).optional(),
+        },
+      },
+      required: false,
+    },
+  },
+  responses: {
+    201: {
+      description: 'Product duplicated',
+      content: {
+        'application/json': {
+          schema: productSchema,
+        },
+      },
+    },
+    401: { description: 'Unauthorized' },
+    404: { description: 'Original product not found' },
+  },
+});
+
+app.openapi(duplicateProductRoute, async (c) => {
+  const { productId: originalId } = c.req.param();
+
+  try {
+    const payload = await verifyAuth(c.req.header('Authorization'));
+    const body = await c.req.json().catch(() => ({}));
+
+    // Fetch the original product
+    const originalRows = await query<Product>(
+      'SELECT * FROM products WHERE id = $1 AND organization_id = $2',
+      [originalId, payload.organizationId]
+    );
+
+    if (originalRows.length === 0) {
+      return c.json({ error: 'Product not found' }, 404);
+    }
+
+    const original = originalRows[0];
+    const newName = body.name || `${original.name} (Copy)`;
+
+    // Duplicate the image if it exists
+    let newImageId: string | null = null;
+    let newImageUrl: string | null = null;
+    if (original.image_id) {
+      const duplicatedImage = await imageService.duplicate(original.image_id);
+      if (duplicatedImage) {
+        newImageId = duplicatedImage.id;
+        newImageUrl = duplicatedImage.url;
+      }
+    }
+
+    // Create the new product
+    const rows = await query<Product>(
+      `INSERT INTO products (organization_id, name, description, image_id, image_url)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [
+        payload.organizationId,
+        newName,
+        original.description,
+        newImageId,
+        newImageUrl,
+      ]
+    );
+
+    const row = rows[0];
+    logger.info('Product duplicated', {
+      originalProductId: originalId,
+      newProductId: row.id,
+    });
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.PRODUCT_CREATED, {
+      productId: row.id,
+      name: row.name,
+    });
+
+    return c.json({
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      imageId: row.image_id,
+      imageUrl: row.image_url,
+      createdAt: row.created_at.toISOString(),
+      updatedAt: row.updated_at.toISOString(),
+    }, 201);
+  } catch (error: any) {
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    logger.error('Error duplicating product', { error, productId: originalId });
+    return c.json({ error: 'Failed to duplicate product' }, 500);
   }
 });
 

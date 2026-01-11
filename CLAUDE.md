@@ -282,6 +282,27 @@ Template functions:
 - Input validation with Zod
 - SQL injection prevention with parameterized queries
 
+### Single Session Enforcement
+The app enforces single session per user - signing in on a new device kicks out the old session.
+
+**How it works:**
+1. **On login**: `session_version` is incremented in the database and returned to the client
+2. **Socket notification**: `SESSION_KICKED` event is emitted to existing connections before login completes
+3. **API validation**: Client sends `X-Session-Version` header; if lower than DB version, returns 401 with `code: 'SESSION_KICKED'`
+4. **Redis cache**: Session version is cached in Redis for fast auth middleware checks
+
+**Files involved:**
+- `db/migrations/025_add_session_version_to_users.sql` - Adds `session_version` column
+- `src/services/auth/index.ts` - `incrementSessionVersion()`, `getSessionVersion()`, emits Socket event on login
+- `src/middleware/auth.ts` - Checks `X-Session-Version` header against current session version
+- `src/services/socket/index.ts` - `SESSION_KICKED` event definition
+
+**Client implementation:**
+- Store `sessionVersion` from login response
+- Send `X-Session-Version` header with all requests
+- Handle `SESSION_KICKED` error code (401) by logging out and showing alert
+- Listen for `session:kicked` socket event for immediate notification
+
 ## Troubleshooting
 
 ### Common Issues

@@ -98,4 +98,5 @@ export function cacheKey(...parts: (string | number)[]): string {
 export const CacheKeys = {
   user: (id: string) => cacheKey('user', id),
   userByEmail: (email: string) => cacheKey('user', 'email', email),
+  sessionVersion: (userId: string) => cacheKey('session', 'version', userId),
 } as const;

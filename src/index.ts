@@ -29,6 +29,9 @@ import categoryRoutes from './routes/categories';
 import imageRoutes from './routes/images';
 import customerRoutes from './routes/customers';
 import orderRoutes from './routes/orders';
+import tipsRoutes from './routes/tips';
+import staffRoutes from './routes/staff';
+import splitsRoutes from './routes/splits';
 
 const app = new OpenAPIHono();
 
@@ -49,7 +52,7 @@ winstonLogger.info('CORS Origins configured:', corsOrigins);
 app.use('*', cors({
   origin: corsOrigins,
   credentials: true,
-  allowHeaders: ['Content-Type', 'Authorization'],
+  allowHeaders: ['Content-Type', 'Authorization', 'X-Session-Version'],
   allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }));
 app.use('*', prettyJSON());
@@ -104,6 +107,9 @@ app.route('/', productRoutes);
 app.route('/', categoryRoutes);
 app.route('/', imageRoutes);
 app.route('/', customerRoutes);
+app.route('/', tipsRoutes);
+app.route('/', staffRoutes);
+app.route('/', splitsRoutes);
 
 app.onError(errorHandler);
 

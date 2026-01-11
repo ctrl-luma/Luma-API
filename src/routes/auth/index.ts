@@ -2,6 +2,7 @@ import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
 import { z } from 'zod';
 import { authService } from '../../services/auth';
 import { cognitoService } from '../../services/auth/cognito';
+import { staffService } from '../../services/staff';
 import { logger } from '../../utils/logger';
 import { query } from '../../db';
 import { config } from '../../config';
@@ -39,6 +40,7 @@ const LoginResponseSchema = z.object({
     refreshToken: z.string(),
     expiresIn: z.number(),
   }),
+  sessionVersion: z.number(), // For single session enforcement
 });
 
 const loginRoute = createRoute({
@@ -75,12 +77,37 @@ app.openapi(loginRoute, async (c) => {
   const validated = LoginRequestSchema.parse(body);
 
   try {
-    const tokens = await authService.login(validated.email, validated.password);
+    // First get the user to check if they're staff and verify subscription
     const user = await authService.getUserByEmail(validated.email);
 
     if (!user) {
       return c.json({ error: 'Invalid credentials' }, 401);
     }
+
+    // Check if this is a staff member (has invited_by set)
+    if (user.invited_by) {
+      // Check if organization has active subscription
+      const subscriptionResult = await query<{ status: string }>(
+        `SELECT status FROM subscriptions
+         WHERE organization_id = $1 AND status IN ('active', 'trialing')
+         LIMIT 1`,
+        [user.organization_id]
+      );
+
+      if (subscriptionResult.length === 0) {
+        logger.warn('Staff login blocked - no active subscription', {
+          userId: user.id,
+          email: user.email,
+          organizationId: user.organization_id,
+        });
+        return c.json({
+          error: 'Your account has been temporarily disabled because your organization\'s subscription is no longer active. Please contact your organization administrator.',
+          code: 'SUBSCRIPTION_INACTIVE'
+        }, 403);
+      }
+    }
+
+    const tokens = await authService.login(validated.email, validated.password);
 
     // Fetch organization data
     const orgRows = await query<{ id: string; name: string; settings: any }>(
@@ -89,7 +116,7 @@ app.openapi(loginRoute, async (c) => {
     );
     const org = orgRows[0];
 
-    logger.info('User logged in', { userId: user.id, email: user.email });
+    logger.info('User logged in', { userId: user.id, email: user.email, sessionVersion: tokens.sessionVersion, isStaff: !!user.invited_by });
 
     return c.json({
       user: {
@@ -109,7 +136,12 @@ app.openapi(loginRoute, async (c) => {
         id: org.id,
         name: org.name,
       } : null,
-      tokens,
+      tokens: {
+        accessToken: tokens.accessToken,
+        refreshToken: tokens.refreshToken,
+        expiresIn: tokens.expiresIn,
+      },
+      sessionVersion: tokens.sessionVersion, // For single session enforcement
     });
   } catch (error: any) {
     logger.error('Login error', { error, email: validated.email });
@@ -183,6 +215,76 @@ app.openapi(checkEmailRoute, async (c) => {
     logger.error('Email check error', error);
     return c.json({ error: 'Email check failed' }, 500);
   }
+});
+
+const PasswordCheckRequestSchema = z.object({
+  password: z.string(),
+});
+
+const PasswordCheckResponseSchema = z.object({
+  valid: z.boolean(),
+  errors: z.array(z.string()),
+});
+
+const checkPasswordRoute = createRoute({
+  method: 'post',
+  path: '/auth/check-password',
+  summary: 'Check if password meets policy requirements',
+  tags: ['Authentication'],
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: PasswordCheckRequestSchema,
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Password validation result',
+      content: {
+        'application/json': {
+          schema: PasswordCheckResponseSchema,
+        },
+      },
+    },
+  },
+});
+
+app.openapi(checkPasswordRoute, async (c) => {
+  const body = await c.req.json();
+  const validated = PasswordCheckRequestSchema.parse(body);
+  const { password } = validated;
+
+  const errors: string[] = [];
+
+  // Check minimum length
+  if (password.length < 8) {
+    errors.push('Password must be at least 8 characters');
+  }
+
+  // Check for number
+  if (!/[0-9]/.test(password)) {
+    errors.push('Password must contain at least 1 number');
+  }
+
+  // Check for special character
+  if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password)) {
+    errors.push('Password must contain at least 1 special character');
+  }
+
+  // Check for lowercase letter
+  if (!/[a-z]/.test(password)) {
+    errors.push('Password must contain at least 1 lowercase letter');
+  }
+
+  // Check for uppercase letter
+  if (!/[A-Z]/.test(password)) {
+    errors.push('Password must contain at least 1 uppercase letter');
+  }
+
+  return c.json({ valid: errors.length === 0, errors }, 200);
 });
 
 const refreshRoute = createRoute({
@@ -342,6 +444,7 @@ const getCurrentUserRoute = createRoute({
             marketingEmails: z.boolean(),
             weeklyReports: z.boolean(),
             avatarUrl: z.string().nullable(),
+            createdAt: z.string(),
           }),
         },
       },
@@ -354,7 +457,7 @@ const getCurrentUserRoute = createRoute({
 
 app.openapi(getCurrentUserRoute, async (c) => {
   const authHeader = c.req.header('Authorization');
-  
+
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     return c.json({ error: 'Unauthorized' }, 401);
   }
@@ -363,9 +466,9 @@ app.openapi(getCurrentUserRoute, async (c) => {
 
   try {
     const payload = await authService.verifyToken(token);
-    
+
     const dbUser = await authService.getUserById(payload.userId);
-    
+
     if (!dbUser) {
       return c.json({ error: 'User not found' }, 404);
     }
@@ -384,9 +487,18 @@ app.openapi(getCurrentUserRoute, async (c) => {
       marketingEmails: dbUser.marketing_emails,
       weeklyReports: dbUser.weekly_reports,
       avatarUrl: imageService.getUrl(dbUser.avatar_image_id),
+      // Handle both Date object (from DB) and string (from cache)
+      createdAt: typeof dbUser.created_at === 'string'
+        ? dbUser.created_at
+        : dbUser.created_at.toISOString(),
     });
-  } catch (error) {
-    logger.error('Get current user error', { error });
+  } catch (error: any) {
+    logger.error('Get current user error', {
+      errorMessage: error?.message,
+      errorName: error?.name,
+      errorCode: error?.code,
+      tokenPreview: token?.substring(0, 50) + '...',
+    });
     return c.json({ error: 'Unauthorized' }, 401);
   }
 });
@@ -787,17 +899,142 @@ app.openapi(validateResetTokenRoute, async (c) => {
 
   try {
     const user = await authService.validatePasswordResetToken(validated.token);
-    
-    return c.json({ 
+
+    return c.json({
       valid: !!user,
       email: user?.email
     });
   } catch (error) {
     logger.error('Validate reset token error', { error, token: validated.token });
-    
-    return c.json({ 
-      valid: false 
+
+    return c.json({
+      valid: false
     });
+  }
+});
+
+// Staff invite validation endpoint
+const ValidateInviteTokenSchema = z.object({
+  token: z.string(),
+});
+
+const validateInviteRoute = createRoute({
+  method: 'get',
+  path: '/auth/validate-invite',
+  summary: 'Validate staff invite token',
+  tags: ['Authentication'],
+  request: {
+    query: ValidateInviteTokenSchema,
+  },
+  responses: {
+    200: {
+      description: 'Invite validation result',
+      content: {
+        'application/json': {
+          schema: z.object({
+            valid: z.boolean(),
+            email: z.string().optional(),
+            firstName: z.string().optional(),
+            lastName: z.string().optional(),
+            organizationName: z.string().optional(),
+            inviterName: z.string().optional(),
+          }),
+        },
+      },
+    },
+  },
+});
+
+app.openapi(validateInviteRoute, async (c) => {
+  const { token } = c.req.query();
+
+  try {
+    const result = await staffService.validateInviteToken(token);
+
+    if (!result.valid || !result.user) {
+      return c.json({ valid: false });
+    }
+
+    return c.json({
+      valid: true,
+      email: result.user.email,
+      firstName: result.user.first_name || undefined,
+      lastName: result.user.last_name || undefined,
+      organizationName: result.organizationName,
+      inviterName: result.inviterName,
+    });
+  } catch (error) {
+    logger.error('Validate invite token error', { error, token });
+    return c.json({ valid: false });
+  }
+});
+
+// Accept staff invite endpoint
+const AcceptInviteRequestSchema = z.object({
+  token: z.string(),
+  password: z.string().min(8).regex(
+    /^(?=.*[0-9])(?=.*[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?])(?=.*[a-z])(?=.*[A-Z]).+$/,
+    'Password must contain at least 1 number, 1 special character, 1 uppercase letter, and 1 lowercase letter'
+  ),
+});
+
+const acceptInviteRoute = createRoute({
+  method: 'post',
+  path: '/auth/accept-invite',
+  summary: 'Accept staff invite and set password',
+  tags: ['Authentication'],
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: AcceptInviteRequestSchema,
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Invite accepted, user can now login',
+      content: {
+        'application/json': {
+          schema: z.object({
+            message: z.string(),
+            email: z.string(),
+          }),
+        },
+      },
+    },
+    400: {
+      description: 'Invalid or expired token',
+    },
+  },
+});
+
+app.openapi(acceptInviteRoute, async (c) => {
+  const body = await c.req.json();
+  const validated = AcceptInviteRequestSchema.parse(body);
+
+  try {
+    const user = await staffService.acceptInvite(validated.token, validated.password);
+
+    logger.info('Staff invite accepted', { userId: user.id, email: user.email });
+
+    return c.json({
+      message: 'Your account has been set up successfully. You can now log in with the Luma app.',
+      email: user.email,
+    });
+  } catch (error: any) {
+    logger.error('Accept invite error', { error, token: validated.token });
+
+    if (error.issues) {
+      return c.json({ error: 'Invalid password format', details: error.issues }, 400);
+    }
+
+    if (error.message === 'Invalid or expired invite token') {
+      return c.json({ error: error.message }, 400);
+    }
+
+    return c.json({ error: 'Failed to accept invite' }, 500);
   }
 });
 
@@ -982,6 +1219,13 @@ const uploadAvatarRoute = createRoute({
 });
 
 app.openapi(uploadAvatarRoute, async (c) => {
+  logger.info('Avatar upload request received', {
+    method: c.req.method,
+    path: c.req.path,
+    contentType: c.req.header('Content-Type'),
+    contentLength: c.req.header('Content-Length'),
+  });
+
   // Check if image service is configured
   if (!imageService.isConfigured()) {
     logger.warn('Avatar upload attempted but image service not configured');
@@ -991,24 +1235,35 @@ app.openapi(uploadAvatarRoute, async (c) => {
   const authHeader = c.req.header('Authorization');
 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    logger.warn('Avatar upload: missing or invalid auth header');
     return c.json({ error: 'Unauthorized' }, 401);
   }
 
   const token = authHeader.substring(7);
 
   try {
+    logger.info('Avatar upload: verifying token...');
     const payload = await authService.verifyToken(token);
+    logger.info('Avatar upload: token verified', { userId: payload.userId });
 
     // Get the uploaded file from multipart form data
+    logger.info('Avatar upload: parsing form data...');
     const formData = await c.req.formData();
     const file = formData.get('file');
+    // Check if file is a File-like object (has arrayBuffer method and type property)
+    // Note: We use duck typing instead of instanceof File because File is not available in Node.js
+    const isFileLike = file && typeof file === 'object' && 'arrayBuffer' in file && 'type' in file;
+    logger.info('Avatar upload: form data parsed', { hasFile: !!file, isFileLike, fileType: typeof file });
 
-    if (!file || !(file instanceof File)) {
+    if (!isFileLike) {
       return c.json({ error: 'No file provided' }, 400);
     }
 
+    // Type assertion - we've verified it has the required properties
+    const uploadedFile = file as Blob;
+
     // Validate content type
-    const contentType = file.type;
+    const contentType = uploadedFile.type;
     if (!imageService.allowedTypes.includes(contentType)) {
       return c.json({
         error: `Invalid file type: ${contentType}. Allowed types: ${imageService.allowedTypes.join(', ')}`
@@ -1016,7 +1271,7 @@ app.openapi(uploadAvatarRoute, async (c) => {
     }
 
     // Get file buffer
-    const buffer = await file.arrayBuffer();
+    const buffer = await uploadedFile.arrayBuffer();
 
     // Validate file size
     if (buffer.byteLength > imageService.maxSizeBytes) {
@@ -1034,12 +1289,19 @@ app.openapi(uploadAvatarRoute, async (c) => {
 
     // If user has existing avatar, replace it (same ID for overwrite)
     const existingAvatarId = currentUser.avatar_image_id;
+    logger.info('Avatar upload: starting image upload', {
+      userId: payload.userId,
+      existingAvatarId,
+      contentType,
+      bufferSize: buffer.byteLength,
+    });
 
     // Upload the image (will replace if existingAvatarId is provided)
     const uploadResult = await imageService.upload(buffer, contentType, {
       existingId: existingAvatarId || undefined,
       imageType: 'avatar',
     });
+    logger.info('Avatar upload: image uploaded successfully', { uploadResult });
 
     // Update user's avatar_image_id in database
     await query(
@@ -1063,7 +1325,12 @@ app.openapi(uploadAvatarRoute, async (c) => {
       avatarImageId: uploadResult.id,
     });
   } catch (error: any) {
-    logger.error('Upload avatar error', { error });
+    logger.error('Upload avatar error', {
+      error,
+      errorMessage: error?.message,
+      errorStack: error?.stack,
+      errorCode: error?.code,
+    });
 
     if (error.code === 'INVALID_TYPE') {
       return c.json({ error: error.message }, 400);

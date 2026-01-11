@@ -7,6 +7,7 @@ import { User } from '../../db/models';
 import { cacheService, CacheKeys } from '../redis/cache';
 import { cognitoService } from './cognito';
 import { normalizeEmail } from '../../utils/email';
+import { socketService, SocketEvents } from '../socket';
 
 export interface AuthTokens {
   accessToken: string;
@@ -88,7 +89,7 @@ export class AuthService {
     return user;
   }
 
-  async login(email: string, password: string): Promise<AuthTokens> {
+  async login(email: string, password: string): Promise<AuthTokens & { sessionVersion: number }> {
     const user = await this.getUserByEmail(email);
     if (!user || !user.is_active) {
       throw new Error('Invalid credentials');
@@ -97,17 +98,44 @@ export class AuthService {
     if (config.aws.cognito.userPoolId) {
       try {
         const cognitoAuth = await cognitoService.authenticateUser(email, password);
-        
+
         if (cognitoAuth.challengeName === 'NEW_PASSWORD_REQUIRED') {
           throw new Error('Password change required');
         }
 
+        // Single session enforcement:
+        // 1. Notify existing sessions they're being kicked (via Socket.IO)
+        socketService.emitToUser(user.id, SocketEvents.SESSION_KICKED, {
+          reason: 'logged_in_elsewhere',
+          message: 'You have been signed out because your account was signed in on another device.',
+          timestamp: new Date().toISOString(),
+        });
+
+        // 2. Increment session version to invalidate old tokens on API calls
+        const newSessionVersion = await this.incrementSessionVersion(user.id);
+
+        // 3. Store new session version in Redis for fast auth middleware checks
+        await cacheService.set(
+          CacheKeys.sessionVersion(user.id),
+          newSessionVersion,
+          { ttl: 86400 * 7 } // 7 days
+        );
+
+        // 4. Update last login and invalidate user cache
         await this.updateLastLogin(user.id);
+        await cacheService.del(CacheKeys.user(user.id));
+        await cacheService.del(CacheKeys.userByEmail(user.email));
+
+        logger.info('User logged in, session version incremented', {
+          userId: user.id,
+          sessionVersion: newSessionVersion,
+        });
 
         return {
           accessToken: cognitoAuth.idToken!,
           refreshToken: cognitoAuth.refreshToken!,
           expiresIn: cognitoAuth.expiresIn!,
+          sessionVersion: newSessionVersion,
         };
       } catch (error: any) {
         if (error.name === 'NotAuthorizedException') {
@@ -122,6 +150,46 @@ export class AuthService {
     }
 
     throw new Error('Local authentication not supported. Please use Cognito.');
+  }
+
+  private async incrementSessionVersion(userId: string): Promise<number> {
+    const result = await query<{ session_version: number }>(
+      `UPDATE users
+       SET session_version = session_version + 1, updated_at = NOW()
+       WHERE id = $1
+       RETURNING session_version`,
+      [userId]
+    );
+    return result[0].session_version;
+  }
+
+  async getSessionVersion(userId: string): Promise<number> {
+    // Try Redis cache first
+    const cached = await cacheService.get<number>(CacheKeys.sessionVersion(userId));
+    if (cached !== null) {
+      return cached;
+    }
+
+    // Fall back to database
+    const result = await query<{ session_version: number }>(
+      `SELECT session_version FROM users WHERE id = $1`,
+      [userId]
+    );
+
+    if (result.length === 0) {
+      return 0;
+    }
+
+    const version = result[0].session_version;
+
+    // Cache for future lookups
+    await cacheService.set(
+      CacheKeys.sessionVersion(userId),
+      version,
+      { ttl: 86400 * 7 }
+    );
+
+    return version;
   }
 
   async generateTokens(_user: User): Promise<AuthTokens> {

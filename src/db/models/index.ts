@@ -27,9 +27,17 @@ export interface User {
   marketing_emails: boolean;
   weekly_reports: boolean;
   avatar_image_id: string | null;
+  session_version: number; // For single session enforcement
+  // Staff invite fields
+  invited_by: string | null;
+  invite_token: string | null;
+  invite_expires_at: Date | null;
+  invite_accepted_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }
+
+export type StaffStatus = 'pending' | 'active' | 'disabled';
 
 export interface Order {
   id: string;
@@ -199,6 +207,12 @@ export interface StripeConnectedAccount {
   external_account_last4: string | null;
   external_account_bank_name: string | null;
   external_account_type: string | null;
+  external_account_status: string | null; // 'new', 'validated', 'verified', 'verification_failed', 'errored'
+
+  // Payout status tracking
+  payout_status: string | null; // 'active', 'undeliverable', 'restricted'
+  payout_failure_code: string | null; // e.g. 'insufficient_funds', 'account_closed'
+  payout_failure_message: string | null; // Human-readable message
 
   // TOS acceptance tracking
   tos_acceptance_date: Date | null;
@@ -213,6 +227,71 @@ export interface StripeConnectedAccount {
 
   // Cache invalidation flag - set when user goes to Stripe, cleared on next status fetch
   pending_stripe_sync: boolean;
+}
+
+export type TipPoolStatus = 'draft' | 'calculated' | 'finalized';
+
+export interface TipPool {
+  id: string;
+  organization_id: string;
+  name: string;
+  start_date: Date;
+  end_date: Date;
+  total_tips: number; // In cents
+  status: TipPoolStatus;
+  notes: string | null;
+  created_by: string;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface TipPoolMember {
+  id: string;
+  tip_pool_id: string;
+  user_id: string;
+  hours_worked: number; // Decimal hours
+  tips_earned: number; // Individual tips in cents
+  pool_share: number; // Calculated share in cents
+  final_amount: number; // Final payout in cents
+  created_at: Date;
+  updated_at: Date;
+}
+
+export type RevenueSplitRecipientType = 'venue' | 'promoter' | 'partner' | 'other';
+
+export interface RevenueSplit {
+  id: string;
+  catalog_id: string;
+  organization_id: string;
+  recipient_name: string;
+  recipient_type: RevenueSplitRecipientType;
+  percentage: number; // 0.00 to 100.00
+  notes: string | null;
+  is_active: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface RevenueSplitReport {
+  catalogId: string;
+  catalogName: string;
+  period: {
+    startDate: string;
+    endDate: string;
+  };
+  summary: {
+    grossSales: number; // In cents
+    totalSplitAmount: number; // In cents
+    yourShare: number; // In cents
+    orderCount: number;
+  };
+  splits: Array<{
+    id: string;
+    recipientName: string;
+    recipientType: RevenueSplitRecipientType;
+    percentage: number;
+    amount: number; // Calculated amount in cents
+  }>;
 }
 
 export * from './subscription';

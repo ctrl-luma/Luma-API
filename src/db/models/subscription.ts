@@ -53,7 +53,7 @@ export const DEFAULT_FEATURES_BY_TIER: Record<string, SubscriptionFeatures> = {
   pro: {
     max_devices: -1, // unlimited
     max_events_per_month: -1,
-    max_staff_accounts: 20,
+    max_staff_accounts: -1, // unlimited
     analytics_enabled: true,
     api_access: false,
     priority_support: false,

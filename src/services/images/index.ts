@@ -289,11 +289,51 @@ export function isImageServerConfigured(): boolean {
   return !!config.images.fileServerUrl;
 }
 
+/**
+ * Duplicates an existing image with a new ID
+ * Used when duplicating products/catalogs
+ */
+export async function duplicateImage(existingImageId: string): Promise<UploadResult | null> {
+  const existingPath = path.join(IMAGE_STORAGE_PATH, existingImageId);
+
+  try {
+    // Read the existing image
+    const buffer = await fs.readFile(existingPath);
+
+    // Generate a new ID
+    const newImageId = generateImageId();
+    const newPath = path.join(IMAGE_STORAGE_PATH, newImageId);
+
+    // Copy the file
+    await fs.writeFile(newPath, buffer);
+
+    logger.info('Image duplicated successfully', {
+      originalId: existingImageId,
+      newId: newImageId,
+    });
+
+    return {
+      id: newImageId,
+      url: buildPublicUrl(newImageId),
+      contentType: 'image/webp', // Assume WebP since we process all images to WebP
+      sizeBytes: buffer.byteLength,
+    };
+  } catch (error: any) {
+    if (error.code === 'ENOENT') {
+      logger.warn('Image not found for duplication', { existingImageId });
+      return null;
+    }
+    logger.error('Failed to duplicate image', { error, existingImageId });
+    return null;
+  }
+}
+
 export const imageService = {
   upload: uploadImage,
   delete: deleteImage,
   exists: imageExists,
   getUrl: getImageUrl,
+  duplicate: duplicateImage,
   isConfigured: isImageServerConfigured,
   maxSizeBytes: config.images.maxSizeBytes,
   allowedTypes: Array.from(ALLOWED_MIME_TYPES),

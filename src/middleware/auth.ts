@@ -15,10 +15,10 @@ declare module 'hono' {
   }
 }
 
-export const auth = (): MiddlewareHandler => {
+export const auth = (options?: { skipSessionCheck?: boolean }): MiddlewareHandler => {
   return async (c, next) => {
     const authHeader = c.req.header('Authorization');
-    
+
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return c.json({ error: 'Unauthorized' }, 401);
     }
@@ -27,7 +27,32 @@ export const auth = (): MiddlewareHandler => {
 
     try {
       const payload = await authService.verifyToken(token);
-      
+
+      // Check session version unless explicitly skipped
+      // This enforces single session - if user logged in elsewhere, their session_version increased
+      if (!options?.skipSessionCheck) {
+        const clientSessionVersion = c.req.header('X-Session-Version');
+
+        if (clientSessionVersion) {
+          const currentSessionVersion = await authService.getSessionVersion(payload.userId);
+          const clientVersion = parseInt(clientSessionVersion, 10);
+
+          if (!isNaN(clientVersion) && clientVersion < currentSessionVersion) {
+            logger.info('Session invalidated - newer session exists', {
+              userId: payload.userId,
+              clientVersion,
+              currentVersion: currentSessionVersion,
+            });
+
+            return c.json({
+              error: 'Session invalidated',
+              code: 'SESSION_KICKED',
+              message: 'Your session has been signed out because you signed in on another device.',
+            }, 401);
+          }
+        }
+      }
+
       c.set('user', {
         userId: payload.userId,
         email: payload.email,

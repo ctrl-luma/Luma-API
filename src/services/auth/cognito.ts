@@ -340,8 +340,34 @@ export class CognitoService {
     try {
       const payload = await this.idTokenVerifier.verify(token);
       return payload;
-    } catch (error) {
-      logger.error('Failed to verify ID token', error);
+    } catch (error: any) {
+      // Log detailed error info since JWT errors don't serialize well
+      logger.error('Failed to verify ID token', {
+        errorMessage: error?.message,
+        errorName: error?.name,
+        errorCode: error?.code,
+        tokenPreview: token?.substring(0, 50) + '...',
+        // Check if token is expired by decoding (without verification)
+        tokenExpInfo: (() => {
+          try {
+            const parts = token.split('.');
+            if (parts.length === 3) {
+              const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString());
+              const now = Math.floor(Date.now() / 1000);
+              return {
+                exp: payload.exp,
+                iat: payload.iat,
+                now,
+                isExpired: payload.exp < now,
+                expiresIn: payload.exp - now,
+              };
+            }
+            return 'invalid token format';
+          } catch {
+            return 'failed to decode';
+          }
+        })(),
+      });
       throw error;
     }
   }

@@ -133,12 +133,15 @@ app.openapi(uploadImageRoute, async (c) => {
     const formData = await c.req.formData();
     const file = formData.get('file');
 
-    if (!file || !(file instanceof File)) {
+    // Use duck typing - File is not available in Node.js
+    const isFileLike = file && typeof file === 'object' && 'arrayBuffer' in file && 'type' in file;
+    if (!isFileLike) {
       return c.json({ error: 'No file provided' }, 400);
     }
 
-    const buffer = await file.arrayBuffer();
-    const result = await imageService.upload(buffer, file.type, { imageType: 'product' });
+    const uploadedFile = file as Blob;
+    const buffer = await uploadedFile.arrayBuffer();
+    const result = await imageService.upload(buffer, uploadedFile.type, { imageType: 'product' });
 
     logger.info('Image uploaded', { imageId: result.id, size: result.sizeBytes });
 

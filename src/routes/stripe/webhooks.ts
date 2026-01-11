@@ -1,5 +1,4 @@
-import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
-import { z } from 'zod';
+import { Hono } from 'hono';
 import { config } from '../../config';
 import { stripeService, stripe } from '../../services/stripe';
 import { logger } from '../../utils/logger';
@@ -7,43 +6,14 @@ import { query, transaction } from '../../db';
 import { normalizeEmail } from '../../utils/email';
 import { PRICING_BY_TIER, DEFAULT_FEATURES_BY_TIER } from '../../db/models/subscription';
 import { socketService, SocketEvents } from '../../services/socket';
+import { staffService } from '../../services/staff';
 
-const app = new OpenAPIHono();
+const app = new Hono();
 
-const webhookRoute = createRoute({
-  method: 'post',
-  path: '/stripe/webhook',
-  summary: 'Handle Stripe webhooks',
-  tags: ['Webhooks'],
-  request: {
-    body: {
-      content: {
-        'application/json': {
-          schema: z.any(),
-        },
-      },
-    },
-  },
-  responses: {
-    200: {
-      description: 'Webhook processed successfully',
-      content: {
-        'application/json': {
-          schema: z.object({
-            received: z.boolean(),
-          }),
-        },
-      },
-    },
-    400: {
-      description: 'Invalid webhook signature',
-    },
-  },
-});
-
-app.openapi(webhookRoute, async (c) => {
+// Use plain Hono route (not OpenAPI) to get raw body for signature verification
+app.post('/stripe/webhook', async (c) => {
   const signature = c.req.header('stripe-signature');
-  const rawBody = await c.req.raw.text();
+  const rawBody = await c.req.text();
 
   if (!signature) {
     return c.json({ error: 'Missing stripe-signature header' }, 400);
@@ -154,8 +124,13 @@ async function handlePaymentIntentSucceeded(paymentIntent: any) {
     if (result.rows.length > 0) {
       const order = result.rows[0];
 
-      // Emit socket event for real-time updates
+      // Emit socket events for real-time updates
       socketService.emitToOrganization(order.organization_id, SocketEvents.ORDER_COMPLETED, {
+        orderId: order.id,
+        amount: order.total_amount,
+        timestamp: new Date(),
+      });
+      socketService.emitToOrganization(order.organization_id, SocketEvents.PAYMENT_RECEIVED, {
         orderId: order.id,
         amount: order.total_amount,
         timestamp: new Date(),
@@ -454,10 +429,13 @@ async function handleSubscriptionDeleted(subscription: any) {
 }
 
 async function updateSubscriptionStatus(subscription: any, status: string) {
+  let organizationId: string | null = null;
+  let previousStatus: string | null = null;
+
   await transaction(async (client) => {
     // Find subscription by Stripe ID
     const subResult = await client.query(
-      `SELECT s.*, u.id as user_id, u.organization_id 
+      `SELECT s.*, u.id as user_id, u.organization_id
        FROM subscriptions s
        JOIN users u ON s.user_id = u.id
        WHERE s.stripe_subscription_id = $1`,
@@ -470,10 +448,12 @@ async function updateSubscriptionStatus(subscription: any, status: string) {
     }
 
     const sub = subResult.rows[0];
-    
+    organizationId = sub.organization_id;
+    previousStatus = sub.status;
+
     // Update subscription status
     await client.query(
-      `UPDATE subscriptions 
+      `UPDATE subscriptions
        SET status = $1,
            current_period_start = $2,
            current_period_end = $3,
@@ -501,6 +481,44 @@ async function updateSubscriptionStatus(subscription: any, status: string) {
       ]
     );
   });
+
+  // Handle staff account enable/disable based on subscription status change
+  if (organizationId) {
+    const inactiveStatuses = ['canceled', 'past_due', 'unpaid', 'incomplete_expired'];
+    const activeStatuses = ['active', 'trialing'];
+
+    const wasActive = previousStatus && activeStatuses.includes(previousStatus);
+    const isNowActive = activeStatuses.includes(status);
+    const isNowInactive = inactiveStatuses.includes(status);
+
+    // Subscription became inactive - disable all staff
+    if (wasActive && isNowInactive) {
+      try {
+        const disabledCount = await staffService.disableAllStaff(organizationId);
+        logger.info('Staff accounts disabled due to subscription lapse', {
+          organizationId,
+          disabledCount,
+          newStatus: status,
+        });
+      } catch (error) {
+        logger.error('Failed to disable staff accounts', { error, organizationId });
+      }
+    }
+
+    // Subscription became active - re-enable all staff
+    if (!wasActive && isNowActive && previousStatus && inactiveStatuses.includes(previousStatus)) {
+      try {
+        const enabledCount = await staffService.enableAllStaff(organizationId);
+        logger.info('Staff accounts re-enabled due to subscription reactivation', {
+          organizationId,
+          enabledCount,
+          newStatus: status,
+        });
+      } catch (error) {
+        logger.error('Failed to enable staff accounts', { error, organizationId });
+      }
+    }
+  }
 
   logger.info('Subscription status updated', {
     subscriptionId: subscription.id,

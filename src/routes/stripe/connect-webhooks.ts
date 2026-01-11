@@ -1,5 +1,4 @@
-import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
-import { z } from 'zod';
+import { Hono } from 'hono';
 import { config } from '../../config';
 import { stripeService } from '../../services/stripe';
 import { logger } from '../../utils/logger';
@@ -7,42 +6,12 @@ import { transaction, query } from '../../db';
 import { syncAccountFromStripe, deriveOnboardingState } from './connect';
 import { socketService, SocketEvents } from '../../services/socket';
 
-const app = new OpenAPIHono();
+const app = new Hono();
 
-const connectWebhookRoute = createRoute({
-  method: 'post',
-  path: '/stripe/webhook-connect',
-  summary: 'Handle Stripe Connect webhooks',
-  tags: ['Webhooks'],
-  request: {
-    body: {
-      content: {
-        'application/json': {
-          schema: z.any(),
-        },
-      },
-    },
-  },
-  responses: {
-    200: {
-      description: 'Webhook processed successfully',
-      content: {
-        'application/json': {
-          schema: z.object({
-            received: z.boolean(),
-          }),
-        },
-      },
-    },
-    400: {
-      description: 'Invalid webhook signature',
-    },
-  },
-});
-
-app.openapi(connectWebhookRoute, async (c) => {
+// Use plain Hono route (not OpenAPI) to get raw body for signature verification
+app.post('/stripe/webhook-connect', async (c) => {
   const signature = c.req.header('stripe-signature');
-  const rawBody = await c.req.raw.text();
+  const rawBody = await c.req.text();
 
   if (!signature) {
     return c.json({ error: 'Missing stripe-signature header' }, 400);
@@ -367,10 +336,15 @@ async function handlePaymentIntentSucceeded(paymentIntent: any, connectedAccount
         connectedAccountId,
       });
 
-      // Emit socket event for real-time updates
+      // Emit socket events for real-time updates
       socketService.emitToOrganization(order.organization_id, SocketEvents.ORDER_COMPLETED, {
         orderId: order.id,
         orderNumber: order.order_number,
+        amount: order.total_amount,
+        timestamp: new Date().toISOString(),
+      });
+      socketService.emitToOrganization(order.organization_id, SocketEvents.PAYMENT_RECEIVED, {
+        orderId: order.id,
         amount: order.total_amount,
         timestamp: new Date().toISOString(),
       });

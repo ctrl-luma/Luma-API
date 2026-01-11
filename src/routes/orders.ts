@@ -2,6 +2,7 @@ import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
 import { z } from 'zod';
 import { query, transaction } from '../db';
 import { logger } from '../utils/logger';
+import { socketService, SocketEvents } from '../services/socket';
 
 const app = new OpenAPIHono();
 
@@ -211,6 +212,14 @@ app.openapi(createOrderRoute, async (c) => {
       customerEmail,
       isQuickCharge: body.isQuickCharge,
       itemCount: body.items?.length || 0,
+    });
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_CREATED, {
+      orderId: result.order.id,
+      orderNumber,
+      status: result.order.status,
+      totalAmount: parseFloat(result.order.total_amount) * 100,
     });
 
     return c.json({
