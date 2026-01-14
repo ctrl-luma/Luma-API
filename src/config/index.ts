@@ -46,6 +46,14 @@ const envSchema = z.object({
   IMAGE_FILE_SERVER_URL: z.string().url().optional(),
   IMAGE_MAX_SIZE_BYTES: z.string().transform(Number).default('5242880'), // 5MB default
   IMAGE_STORAGE_PATH: z.string().default('/data/images'),
+
+  // Google Play Billing
+  GOOGLE_PLAY_PACKAGE_NAME: z.string().optional(),
+  GOOGLE_PLAY_CREDENTIALS: z.string().optional(), // JSON string of service account credentials
+
+  // App Download Links
+  ANDROID_LINK: z.string().url().optional(),
+  IOS_LINK: z.string().url().optional(),
 });
 
 const env = envSchema.parse(process.env);
@@ -111,6 +119,14 @@ export const config = {
     fileServerUrl: env.IMAGE_FILE_SERVER_URL,
     maxSizeBytes: env.IMAGE_MAX_SIZE_BYTES,
     storagePath: env.IMAGE_STORAGE_PATH,
+  },
+  googlePlay: {
+    packageName: env.GOOGLE_PLAY_PACKAGE_NAME,
+    credentials: env.GOOGLE_PLAY_CREDENTIALS,
+  },
+  appLinks: {
+    android: env.ANDROID_LINK,
+    ios: env.IOS_LINK,
   },
 } as const;
 

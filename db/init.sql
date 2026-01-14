@@ -10,6 +10,7 @@ CREATE TYPE payout_status AS ENUM ('pending', 'processing', 'paid', 'failed');
 CREATE TYPE payment_method AS ENUM ('card', 'cash', 'tap_to_pay');
 CREATE TYPE subscription_status AS ENUM ('trialing', 'active', 'canceled', 'past_due', 'incomplete', 'incomplete_expired', 'pending_payment', 'pending_approval');
 CREATE TYPE subscription_tier AS ENUM ('starter', 'pro', 'enterprise');
+CREATE TYPE subscription_platform AS ENUM ('stripe', 'apple', 'google');
 
 -- Organizations table
 CREATE TABLE organizations (
@@ -217,8 +218,16 @@ CREATE TABLE subscriptions (
     organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
     stripe_subscription_id VARCHAR(255) UNIQUE,
     stripe_customer_id VARCHAR(255),
+    -- Apple App Store fields
+    apple_original_transaction_id VARCHAR(255) UNIQUE,
+    apple_product_id VARCHAR(255),
+    -- Google Play fields
+    google_purchase_token TEXT,
+    google_order_id VARCHAR(255),
+    google_product_id VARCHAR(255),
     tier subscription_tier NOT NULL DEFAULT 'starter',
     status subscription_status NOT NULL DEFAULT 'active',
+    platform subscription_platform NOT NULL DEFAULT 'stripe',
     current_period_start TIMESTAMP WITH TIME ZONE,
     current_period_end TIMESTAMP WITH TIME ZONE,
     trial_start TIMESTAMP WITH TIME ZONE,
@@ -239,6 +248,7 @@ CREATE INDEX idx_subscriptions_organization ON subscriptions(organization_id);
 CREATE INDEX idx_subscriptions_stripe_subscription ON subscriptions(stripe_subscription_id);
 CREATE INDEX idx_subscriptions_status ON subscriptions(status);
 CREATE INDEX idx_subscriptions_tier ON subscriptions(tier);
+CREATE INDEX idx_subscriptions_platform ON subscriptions(platform);
 
 -- Custom plan requests table
 CREATE TABLE custom_plan_requests (

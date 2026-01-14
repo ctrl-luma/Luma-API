@@ -1,11 +1,23 @@
+export type SubscriptionPlatform = 'stripe' | 'apple' | 'google';
+
 export interface Subscription {
   id: string;
   user_id: string;
   organization_id: string;
+  // Stripe fields
   stripe_subscription_id: string | null;
   stripe_customer_id: string | null;
+  // Apple App Store fields
+  apple_original_transaction_id: string | null;
+  apple_product_id: string | null;
+  // Google Play fields
+  google_purchase_token: string | null;
+  google_order_id: string | null;
+  google_product_id: string | null;
+  // Common fields
   tier: 'starter' | 'pro' | 'enterprise';
   status: 'trialing' | 'active' | 'canceled' | 'past_due' | 'incomplete' | 'incomplete_expired';
+  platform: SubscriptionPlatform;
   current_period_start: Date | null;
   current_period_end: Date | null;
   trial_start: Date | null;

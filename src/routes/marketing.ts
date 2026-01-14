@@ -2,6 +2,7 @@ import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
 import { z } from 'zod';
 import { query } from '../db';
 import { logger } from '../utils/logger';
+import { config } from '../config';
 
 const app = new OpenAPIHono();
 
@@ -153,6 +154,34 @@ app.openapi(unsubscribeRoute, async (c) => {
     logger.error('Failed to unsubscribe email', { error });
     return c.json({ error: 'Failed to unsubscribe. Please try again later.' }, 500);
   }
+});
+
+// App download links endpoint
+const appLinksRoute = createRoute({
+  method: 'get',
+  path: '/app-links',
+  summary: 'Get app download links',
+  tags: ['Marketing'],
+  responses: {
+    200: {
+      description: 'App download links',
+      content: {
+        'application/json': {
+          schema: z.object({
+            android: z.string().nullable(),
+            ios: z.string().nullable(),
+          }),
+        },
+      },
+    },
+  },
+});
+
+app.openapi(appLinksRoute, async (c) => {
+  return c.json({
+    android: config.appLinks.android || null,
+    ios: config.appLinks.ios || null,
+  });
 });
 
 export default app;

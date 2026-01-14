@@ -89,7 +89,7 @@ export class AuthService {
     return user;
   }
 
-  async login(email: string, password: string): Promise<AuthTokens & { sessionVersion: number }> {
+  async login(email: string, password: string, source: 'app' | 'web' = 'web'): Promise<AuthTokens & { sessionVersion: number }> {
     const user = await this.getUserByEmail(email);
     if (!user || !user.is_active) {
       throw new Error('Invalid credentials');
@@ -103,33 +103,46 @@ export class AuthService {
           throw new Error('Password change required');
         }
 
-        // Single session enforcement:
-        // 1. Notify existing sessions they're being kicked (via Socket.IO)
-        socketService.emitToUser(user.id, SocketEvents.SESSION_KICKED, {
-          reason: 'logged_in_elsewhere',
-          message: 'You have been signed out because your account was signed in on another device.',
-          timestamp: new Date().toISOString(),
-        });
+        let newSessionVersion: number;
 
-        // 2. Increment session version to invalidate old tokens on API calls
-        const newSessionVersion = await this.incrementSessionVersion(user.id);
+        // Single session enforcement - ONLY for app logins
+        // Vendor portal (web) can have multiple sessions without kicking others
+        if (source === 'app') {
+          // 1. Notify existing APP sessions they're being kicked (via Socket.IO)
+          socketService.emitToUser(user.id, SocketEvents.SESSION_KICKED, {
+            reason: 'logged_in_elsewhere',
+            message: 'You have been signed out because your account was signed in on another device.',
+            timestamp: new Date().toISOString(),
+            source: 'app', // Include source so clients can filter
+          });
 
-        // 3. Store new session version in Redis for fast auth middleware checks
-        await cacheService.set(
-          CacheKeys.sessionVersion(user.id),
-          newSessionVersion,
-          { ttl: 86400 * 7 } // 7 days
-        );
+          // 2. Increment session version to invalidate old app tokens on API calls
+          newSessionVersion = await this.incrementSessionVersion(user.id);
 
-        // 4. Update last login and invalidate user cache
+          // 3. Store new session version in Redis for fast auth middleware checks
+          await cacheService.set(
+            CacheKeys.sessionVersion(user.id),
+            newSessionVersion,
+            { ttl: 86400 * 7 } // 7 days
+          );
+
+          logger.info('App login - session version incremented, old sessions kicked', {
+            userId: user.id,
+            sessionVersion: newSessionVersion,
+          });
+        } else {
+          // Web login - don't increment session version, allow multiple sessions
+          newSessionVersion = await this.getSessionVersion(user.id);
+          logger.info('Web login - no session kicking', {
+            userId: user.id,
+            sessionVersion: newSessionVersion,
+          });
+        }
+
+        // Update last login and invalidate user cache
         await this.updateLastLogin(user.id);
         await cacheService.del(CacheKeys.user(user.id));
         await cacheService.del(CacheKeys.userByEmail(user.email));
-
-        logger.info('User logged in, session version incremented', {
-          userId: user.id,
-          sessionVersion: newSessionVersion,
-        });
 
         return {
           accessToken: cognitoAuth.idToken!,

@@ -10,6 +10,7 @@ import signupRoutes from './signup';
 import { sendPasswordResetEmail } from '../../services/email/template-sender';
 import { cacheService, CacheKeys } from '../../services/redis/cache';
 import { imageService } from '../../services/images';
+import { stripe } from '../../services/stripe';
 
 const app = new OpenAPIHono();
 
@@ -19,6 +20,7 @@ app.route('/', signupRoutes);
 const LoginRequestSchema = z.object({
   email: z.string().email(),
   password: z.string(),
+  source: z.enum(['app', 'web']).optional().default('web'),
 });
 
 const LoginResponseSchema = z.object({
@@ -86,9 +88,9 @@ app.openapi(loginRoute, async (c) => {
 
     // Check if this is a staff member (has invited_by set)
     if (user.invited_by) {
-      // Check if organization has active subscription
-      const subscriptionResult = await query<{ status: string }>(
-        `SELECT status FROM subscriptions
+      // Check if organization has active subscription AND tier that allows staff
+      const subscriptionResult = await query<{ status: string; tier: string }>(
+        `SELECT status, tier FROM subscriptions
          WHERE organization_id = $1 AND status IN ('active', 'trialing')
          LIMIT 1`,
         [user.organization_id]
@@ -105,9 +107,24 @@ app.openapi(loginRoute, async (c) => {
           code: 'SUBSCRIPTION_INACTIVE'
         }, 403);
       }
+
+      // Check if tier allows staff access (starter/free tier does not allow staff)
+      const subscription = subscriptionResult[0];
+      if (subscription.tier === 'starter' || subscription.tier === 'free') {
+        logger.warn('Staff login blocked - free tier does not allow staff', {
+          userId: user.id,
+          email: user.email,
+          organizationId: user.organization_id,
+          tier: subscription.tier,
+        });
+        return c.json({
+          error: 'Your account has been temporarily disabled because your organization is on the free plan. Staff accounts require a Pro subscription. Please contact your organization administrator.',
+          code: 'TIER_STAFF_NOT_ALLOWED'
+        }, 403);
+      }
     }
 
-    const tokens = await authService.login(validated.email, validated.password);
+    const tokens = await authService.login(validated.email, validated.password, validated.source);
 
     // Fetch organization data
     const orgRows = await query<{ id: string; name: string; settings: any }>(
@@ -116,7 +133,88 @@ app.openapi(loginRoute, async (c) => {
     );
     const org = orgRows[0];
 
-    logger.info('User logged in', { userId: user.id, email: user.email, sessionVersion: tokens.sessionVersion, isStaff: !!user.invited_by });
+    // Fetch subscription tier for the organization
+    // Include all statuses to get the most recent subscription, then check if it's still valid
+    const loginSubscriptionResult = await query<{ tier: string; status: string; current_period_end: Date | null }>(
+      `SELECT tier, status, current_period_end FROM subscriptions
+       WHERE organization_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [user.organization_id]
+    );
+
+    let subscription = { tier: 'starter', status: 'none' };
+    if (loginSubscriptionResult.length > 0) {
+      const sub = loginSubscriptionResult[0];
+      const isActive = sub.status === 'active' || sub.status === 'trialing';
+      // Also check if canceled but still within billing period
+      const isCanceledButValid = sub.status === 'canceled' &&
+        sub.current_period_end &&
+        new Date(sub.current_period_end) > new Date();
+
+      if (isActive || isCanceledButValid) {
+        subscription = { tier: sub.tier, status: sub.status };
+      }
+    }
+
+    // If no local subscription found, check Stripe directly as fallback
+    if (subscription.tier === 'starter' && subscription.status === 'none' && user.stripe_customer_id) {
+      try {
+        const stripeSubscriptions = await stripe.subscriptions.list({
+          customer: user.stripe_customer_id,
+          status: 'all',
+          limit: 1,
+        });
+
+        if (stripeSubscriptions.data.length > 0) {
+          const stripeSub = stripeSubscriptions.data[0];
+          const isActive = stripeSub.status === 'active' || stripeSub.status === 'trialing';
+          const isCanceledButValid = stripeSub.status === 'canceled' &&
+            stripeSub.current_period_end &&
+            stripeSub.current_period_end > Math.floor(Date.now() / 1000);
+
+          if (isActive || isCanceledButValid) {
+            const priceId = stripeSub.items.data[0]?.price?.id;
+            const tier = priceId === config.stripe.proPriceId ? 'pro' :
+                        priceId === config.stripe.enterprisePriceId ? 'enterprise' : 'pro';
+            subscription = { tier, status: stripeSub.status };
+
+            logger.info('Subscription found in Stripe but not in local DB, syncing...', {
+              userId: user.id,
+              stripeSubscriptionId: stripeSub.id,
+              tier,
+              status: stripeSub.status,
+            });
+
+            // Sync to local DB (fire and forget)
+            query(
+              `INSERT INTO subscriptions (user_id, organization_id, stripe_subscription_id, stripe_customer_id, tier, status, current_period_start, current_period_end, platform)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'stripe')
+               ON CONFLICT (stripe_subscription_id) DO UPDATE SET
+                 tier = EXCLUDED.tier,
+                 status = EXCLUDED.status,
+                 current_period_start = EXCLUDED.current_period_start,
+                 current_period_end = EXCLUDED.current_period_end,
+                 updated_at = NOW()`,
+              [
+                user.id,
+                user.organization_id,
+                stripeSub.id,
+                user.stripe_customer_id,
+                tier,
+                stripeSub.status,
+                stripeSub.current_period_start ? new Date(stripeSub.current_period_start * 1000) : null,
+                stripeSub.current_period_end ? new Date(stripeSub.current_period_end * 1000) : null,
+              ]
+            ).catch(err => logger.error('Failed to sync subscription to local DB', { error: err }));
+          }
+        }
+      } catch (stripeError) {
+        logger.warn('Failed to check Stripe for subscription on login', { error: stripeError });
+      }
+    }
+
+    logger.info('User logged in', { userId: user.id, email: user.email, sessionVersion: tokens.sessionVersion, isStaff: !!user.invited_by, tier: subscription.tier });
 
     return c.json({
       user: {
@@ -142,6 +240,7 @@ app.openapi(loginRoute, async (c) => {
         expiresIn: tokens.expiresIn,
       },
       sessionVersion: tokens.sessionVersion, // For single session enforcement
+      subscription, // Include subscription info so frontend has it immediately
     });
   } catch (error: any) {
     logger.error('Login error', { error, email: validated.email });
@@ -473,7 +572,90 @@ app.openapi(getCurrentUserRoute, async (c) => {
       return c.json({ error: 'User not found' }, 404);
     }
 
-    logger.debug('Current user fetched', { userId: payload.userId });
+    // Fetch subscription tier for the organization
+    // Include all statuses to get the most recent subscription, then check if it's still valid
+    const subscriptionResult = await query<{ tier: string; status: string; current_period_end: Date | null }>(
+      `SELECT tier, status, current_period_end FROM subscriptions
+       WHERE organization_id = $1
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [dbUser.organization_id]
+    );
+
+    let subscription = { tier: 'starter', status: 'none' };
+    if (subscriptionResult.length > 0) {
+      const sub = subscriptionResult[0];
+      const isActive = sub.status === 'active' || sub.status === 'trialing';
+      // Also check if canceled but still within billing period
+      const isCanceledButValid = sub.status === 'canceled' &&
+        sub.current_period_end &&
+        new Date(sub.current_period_end) > new Date();
+
+      if (isActive || isCanceledButValid) {
+        subscription = { tier: sub.tier, status: sub.status };
+      }
+    }
+
+    // If no local subscription found, check Stripe directly as fallback
+    // This handles cases where webhook failed to create local record
+    if (subscription.tier === 'starter' && subscription.status === 'none' && dbUser.stripe_customer_id) {
+      try {
+        const stripeSubscriptions = await stripe.subscriptions.list({
+          customer: dbUser.stripe_customer_id,
+          status: 'all',
+          limit: 1,
+        });
+
+        if (stripeSubscriptions.data.length > 0) {
+          const stripeSub = stripeSubscriptions.data[0];
+          const isActive = stripeSub.status === 'active' || stripeSub.status === 'trialing';
+          const isCanceledButValid = stripeSub.status === 'canceled' &&
+            stripeSub.current_period_end &&
+            stripeSub.current_period_end > Math.floor(Date.now() / 1000);
+
+          if (isActive || isCanceledButValid) {
+            // Determine tier from price ID
+            const priceId = stripeSub.items.data[0]?.price?.id;
+            const tier = priceId === config.stripe.proPriceId ? 'pro' :
+                        priceId === config.stripe.enterprisePriceId ? 'enterprise' : 'pro';
+            subscription = { tier, status: stripeSub.status };
+
+            logger.info('Subscription found in Stripe but not in local DB, syncing...', {
+              userId: dbUser.id,
+              stripeSubscriptionId: stripeSub.id,
+              tier,
+              status: stripeSub.status,
+            });
+
+            // Sync to local DB for future queries (fire and forget)
+            query(
+              `INSERT INTO subscriptions (user_id, organization_id, stripe_subscription_id, stripe_customer_id, tier, status, current_period_start, current_period_end, platform)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'stripe')
+               ON CONFLICT (stripe_subscription_id) DO UPDATE SET
+                 tier = EXCLUDED.tier,
+                 status = EXCLUDED.status,
+                 current_period_start = EXCLUDED.current_period_start,
+                 current_period_end = EXCLUDED.current_period_end,
+                 updated_at = NOW()`,
+              [
+                dbUser.id,
+                dbUser.organization_id,
+                stripeSub.id,
+                dbUser.stripe_customer_id,
+                tier,
+                stripeSub.status,
+                stripeSub.current_period_start ? new Date(stripeSub.current_period_start * 1000) : null,
+                stripeSub.current_period_end ? new Date(stripeSub.current_period_end * 1000) : null,
+              ]
+            ).catch(err => logger.error('Failed to sync subscription to local DB', { error: err }));
+          }
+        }
+      } catch (stripeError) {
+        logger.warn('Failed to check Stripe for subscription', { error: stripeError });
+      }
+    }
+
+    logger.debug('Current user fetched', { userId: payload.userId, tier: subscription.tier });
 
     return c.json({
       id: dbUser.id,
@@ -491,6 +673,8 @@ app.openapi(getCurrentUserRoute, async (c) => {
       createdAt: typeof dbUser.created_at === 'string'
         ? dbUser.created_at
         : dbUser.created_at.toISOString(),
+      // Include subscription info so frontend has it immediately
+      subscription,
     });
   } catch (error: any) {
     logger.error('Get current user error', {

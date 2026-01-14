@@ -3,8 +3,54 @@ import { authService } from '../services/auth';
 import { stripeService, stripe } from '../services/stripe';
 import { logger } from '../utils/logger';
 import { config } from '../config';
+import { query } from '../db';
+import type { SubscriptionPlatform } from '../db/models/subscription';
 
 const app = new OpenAPIHono();
+
+// Cache for billing portal configuration IDs (created once, reused)
+let cachedPaymentConfigId: string | null = null;
+let cachedSubscriptionConfigId: string | null = null;
+
+async function getOrCreatePortalConfigs() {
+  if (cachedPaymentConfigId && cachedSubscriptionConfigId) {
+    return { paymentConfigId: cachedPaymentConfigId, subscriptionConfigId: cachedSubscriptionConfigId };
+  }
+
+  // Create both configurations in parallel
+  const [paymentConfig, subscriptionConfig] = await Promise.all([
+    stripe.billingPortal.configurations.create({
+      features: {
+        payment_method_update: { enabled: true },
+        invoice_history: { enabled: false },
+        subscription_cancel: { enabled: false },
+        customer_update: { enabled: false },
+        subscription_update: { enabled: false }
+      },
+      business_profile: { headline: 'Manage your payment method' }
+    }),
+    stripe.billingPortal.configurations.create({
+      features: {
+        payment_method_update: { enabled: false },
+        invoice_history: { enabled: false },
+        subscription_cancel: { enabled: true },
+        customer_update: { enabled: false },
+        subscription_update: { enabled: false }
+      },
+      business_profile: { headline: 'Manage your subscription' }
+    })
+  ]);
+
+  cachedPaymentConfigId = paymentConfig.id;
+  cachedSubscriptionConfigId = subscriptionConfig.id;
+
+  logger.info('Portal configurations created and cached', {
+    paymentConfigId: cachedPaymentConfigId,
+    subscriptionConfigId: cachedSubscriptionConfigId
+  });
+
+  return { paymentConfigId: cachedPaymentConfigId, subscriptionConfigId: cachedSubscriptionConfigId };
+}
 
 // Billing history endpoint
 const billingHistoryRoute = createRoute({
@@ -267,6 +313,7 @@ const paymentInfoRoute = createRoute({
             manage_subscription_url: z.string().optional(),
             cancel_at: z.string().nullable(),
             canceled_at: z.string().nullable(),
+            platform: z.enum(['stripe', 'apple', 'google']).optional(),
           }),
         },
       },
@@ -301,6 +348,62 @@ app.openapi(paymentInfoRoute, async (c) => {
       return c.json({ error: 'User not found' }, 404);
     }
 
+    // Get subscription from database to check platform
+    const subscriptionRows = await query(
+      `SELECT * FROM subscriptions WHERE organization_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [user.organization_id]
+    );
+    const dbSubscription = subscriptionRows[0];
+    const platform: SubscriptionPlatform = dbSubscription?.platform || 'stripe';
+
+    // Check if user ever had a Stripe subscription (for trial eligibility)
+    // Users who previously had Stripe sub are not eligible for trial/discount
+    // Check via Stripe API if user has any subscription history
+    let hadStripeSubscription = false;
+    if (user.stripe_customer_id) {
+      const allSubscriptions = await stripe.subscriptions.list({
+        customer: user.stripe_customer_id,
+        status: 'all',
+        limit: 1,
+      });
+      hadStripeSubscription = allSubscriptions.data.length > 0;
+    }
+    const trialEligible = !hadStripeSubscription;
+
+    logger.info('Trial eligibility check', {
+      userId: user.id,
+      stripeCustomerId: user.stripe_customer_id,
+      hadStripeSubscription,
+      trialEligible,
+    });
+
+    // For Apple/Google subscriptions, return minimal info (managed in-app)
+    if (platform === 'apple' || platform === 'google') {
+      logger.info('User has mobile subscription, returning platform-specific info', {
+        userId: user.id,
+        platform,
+      });
+      return c.json({
+        payment_method: null,
+        manage_payment_url: null,
+        next_billing_date: dbSubscription?.current_period_end?.toISOString() || null,
+        subscription_status: dbSubscription?.status || 'none',
+        current_plan: dbSubscription?.tier === 'pro' ? {
+          name: 'Pro Plan',
+          price: 2999, // $29.99 in cents
+          currency: 'usd',
+          interval: 'month' as const,
+          description: 'Managed via ' + (platform === 'apple' ? 'App Store' : 'Google Play'),
+        } : null,
+        manage_subscription_url: null,
+        cancel_at: dbSubscription?.cancel_at?.toISOString() || null,
+        canceled_at: dbSubscription?.canceled_at?.toISOString() || null,
+        platform,
+        trial_eligible: trialEligible,
+        had_stripe_subscription: hadStripeSubscription,
+      });
+    }
+
     // If no Stripe customer, return empty/default data instead of error
     if (!user.stripe_customer_id) {
       logger.info('User has no stripe_customer_id, returning default payment info', {
@@ -316,245 +419,176 @@ app.openapi(paymentInfoRoute, async (c) => {
         manage_subscription_url: null,
         cancel_at: null,
         canceled_at: null,
+        platform: 'stripe' as SubscriptionPlatform,
+        trial_eligible: trialEligible,
+        had_stripe_subscription: hadStripeSubscription,
       });
     }
 
-    logger.info('Starting payment info retrieval', {
-      userId: user.id,
-      stripeCustomerId: user.stripe_customer_id
-    });
+    // Run all independent API calls in parallel for optimal performance
+    const [
+      paymentMethodsResult,
+      subscriptionsResult,
+      portalConfigs
+    ] = await Promise.all([
+      stripe.paymentMethods.list({ customer: user.stripe_customer_id, type: 'card', limit: 1 }),
+      stripe.subscriptions.list({ customer: user.stripe_customer_id, status: 'all', limit: 10, expand: ['data.discounts'] }),
+      getOrCreatePortalConfigs()
+    ]);
 
+    // Process payment method
     let paymentMethod = null;
-
-    // Get payment methods attached to customer using proper Stripe API
-    try {
-      const paymentMethods = await stripe.paymentMethods.list({
-        customer: user.stripe_customer_id,
-        type: 'card',
-        limit: 1,
-      });
-
-      logger.info('Payment methods retrieved', {
-        customerId: user.stripe_customer_id,
-        paymentMethodCount: paymentMethods.data.length
-      });
-
-      if (paymentMethods.data.length > 0) {
-        const pm = paymentMethods.data[0];
-        
-        logger.info('Payment method found', {
-          pmId: pm.id,
+    if (paymentMethodsResult.data.length > 0) {
+      const pm = paymentMethodsResult.data[0];
+      if (pm.card) {
+        paymentMethod = {
           type: pm.type,
-          hasCard: !!pm.card
-        });
-
-        if (pm.card) {
-          paymentMethod = {
-            type: pm.type,
-            last4: pm.card.last4,
-            brand: pm.card.brand,
-            exp_month: pm.card.exp_month,
-            exp_year: pm.card.exp_year,
-          };
-        }
-      } else {
-        logger.info('No payment methods attached to customer');
+          last4: pm.card.last4,
+          brand: pm.card.brand,
+          exp_month: pm.card.exp_month,
+          exp_year: pm.card.exp_year,
+        };
       }
-    } catch (pmError) {
-      logger.error('Failed to retrieve customer payment methods', { error: pmError });
     }
-
-    // Get all subscriptions for status and billing info
-    const allSubscriptions = await stripe.subscriptions.list({
-      customer: user.stripe_customer_id,
-      status: 'all',
-      limit: 10,
-    });
-
-    logger.info('All subscriptions retrieved', {
-      subscriptionCount: allSubscriptions.data.length,
-      subscriptions: allSubscriptions.data.map(s => ({
-        id: s.id,
-        status: s.status,
-        cancel_at: s.cancel_at,
-        canceled_at: s.canceled_at,
-      }))
-    });
 
     let subscriptionStatus = 'none';
     let nextBillingDate = null;
     let currentPlan = null;
     let cancelAt: string | null = null;
     let canceledAt: string | null = null;
+    let trialEnd: string | null = null;
+    let upcomingInvoiceAmount: number | null = null;
 
-    logger.info('Processing subscription data', {
-      subscriptionCount: allSubscriptions.data.length,
-      subscriptions: allSubscriptions.data.map(s => ({
-        id: s.id,
-        status: s.status,
-        hasItems: !!s.items,
-        itemsCount: s.items?.data?.length || 0
-      }))
-    });
+    // Process subscription - only consider active or trialing as having a valid plan
+    const activeSubscription = subscriptionsResult.data.find(s => s.status === 'active' || s.status === 'trialing');
+    const anySubscription = subscriptionsResult.data[0]; // For showing canceled/expired info
 
-    if (allSubscriptions.data.length > 0) {
-      try {
-        // Get the most recent active subscription, or any subscription if no active ones
-        const subscriptionFromList = allSubscriptions.data.find(s => s.status === 'active') || allSubscriptions.data[0];
+    // Check if we have a truly active subscription
+    const now = Math.floor(Date.now() / 1000);
 
-        // Retrieve the full subscription to get all fields including current_period_end
-        const activeSubscription = await stripe.subscriptions.retrieve(subscriptionFromList.id);
-        subscriptionStatus = activeSubscription.status;
+    if (activeSubscription) {
+      subscriptionStatus = activeSubscription.status;
 
-        // Log the raw subscription object to see all available fields
-        logger.info('Raw subscription object keys', {
-          keys: Object.keys(activeSubscription),
-          rawSubscription: JSON.stringify(activeSubscription)
-        });
+      // Get billing dates
+      const subscriptionItem = activeSubscription.items?.data?.[0];
+      if (subscriptionItem?.current_period_end) {
+        nextBillingDate = new Date(subscriptionItem.current_period_end * 1000).toISOString();
 
-        logger.info('Active subscription found', {
-          subscriptionId: activeSubscription.id,
-          status: activeSubscription.status,
-          cancel_at: activeSubscription.cancel_at,
-          canceled_at: activeSubscription.canceled_at,
-          cancel_at_period_end: activeSubscription.cancel_at_period_end,
-          hasItems: !!activeSubscription.items
-        });
-
-        // In newer Stripe API versions, current_period_end is on the subscription item, not the subscription
-        const subscriptionItem = activeSubscription.items?.data?.[0];
-        if (subscriptionItem?.current_period_end) {
-          nextBillingDate = new Date(subscriptionItem.current_period_end * 1000).toISOString();
-          logger.info('Next billing date set', { nextBillingDate });
-        }
-
-        // Extract cancellation dates from subscription
-        if (activeSubscription.cancel_at) {
-          cancelAt = new Date(activeSubscription.cancel_at * 1000).toISOString();
-          logger.info('Cancel at date set', { cancelAt });
-        }
-
-        if (activeSubscription.canceled_at) {
-          canceledAt = new Date(activeSubscription.canceled_at * 1000).toISOString();
-          logger.info('Canceled at date set', { canceledAt });
-        }
-
-        // Get plan details from subscription items
-        if (activeSubscription.items?.data?.length > 0) {
-          const priceItem = activeSubscription.items.data[0];
-          const price = priceItem.price;
-          
-          logger.info('Processing price item', {
-            priceId: price.id,
-            unitAmount: price.unit_amount,
-            currency: price.currency,
-            interval: price.recurring?.interval
+        // Double-check: if period has ended but status is still 'active', it might be stale
+        if (subscriptionItem.current_period_end < now && activeSubscription.status === 'active') {
+          logger.warn('Subscription appears expired but status is active, may need webhook sync', {
+            userId: user.id,
+            subscriptionId: activeSubscription.id,
+            periodEnd: subscriptionItem.current_period_end,
+            now,
           });
-          
-          // Map price ID to plan details
-          let planName = 'Custom Plan';
-          let planDescription = '';
-          
-          if (price.id === config.stripe.proPriceId) {
-            planName = 'Pro Plan';
-            planDescription = 'Perfect for growing businesses';
-          } else if (price.id === config.stripe.enterprisePriceId) {
-            planName = 'Enterprise Plan';  
-            planDescription = 'For large-scale operations';
+        }
+      }
+
+      if (activeSubscription.cancel_at) {
+        cancelAt = new Date(activeSubscription.cancel_at * 1000).toISOString();
+      }
+
+      if (activeSubscription.canceled_at) {
+        canceledAt = new Date(activeSubscription.canceled_at * 1000).toISOString();
+      }
+
+      if (activeSubscription.trial_end) {
+        trialEnd = new Date(activeSubscription.trial_end * 1000).toISOString();
+      }
+
+      // Process discounts - already expanded
+      const discounts = (activeSubscription as any).discounts;
+      if (discounts && discounts.length > 0 && typeof discounts[0] === 'object') {
+        const couponId = discounts[0].coupon || discounts[0].source?.coupon;
+        if (couponId) {
+          try {
+            const coupon = await stripe.coupons.retrieve(couponId);
+            const basePrice = subscriptionItem?.price?.unit_amount || 0;
+
+            if (coupon.amount_off) {
+              upcomingInvoiceAmount = basePrice - coupon.amount_off;
+            } else if (coupon.percent_off) {
+              upcomingInvoiceAmount = Math.round(basePrice * (1 - coupon.percent_off / 100));
+            }
+          } catch (e) {
+            // Coupon fetch failed, continue without discount info
           }
-
-          currentPlan = {
-            name: planName,
-            price: price.unit_amount || 0,
-            currency: price.currency,
-            interval: price.recurring?.interval || 'month',
-            description: planDescription
-          };
-          
-          logger.info('Current plan created', { currentPlan });
-        } else {
-          logger.info('No subscription items found');
         }
-      } catch (subscriptionError) {
-        logger.error('Error processing subscription data', { 
-          error: subscriptionError,
-          subscriptionId: allSubscriptions.data[0]?.id 
+      }
+
+      // Get plan details for active subscription
+      if (subscriptionItem?.price) {
+        const price = subscriptionItem.price;
+        let planName = 'Pro Plan'; // Default to Pro for unknown prices
+        let planDescription = '';
+
+        if (price.id === config.stripe.proPriceId) {
+          planName = 'Pro Plan';
+          planDescription = 'Perfect for growing businesses';
+        } else if (price.id === config.stripe.enterprisePriceId) {
+          planName = 'Enterprise Plan';
+          planDescription = 'For large-scale operations';
+        }
+
+        currentPlan = {
+          name: planName,
+          price: price.unit_amount || 0,
+          currency: price.currency,
+          interval: price.recurring?.interval || 'month',
+          description: planDescription
+        };
+      }
+    } else if (anySubscription) {
+      // No active subscription, but there's a canceled/expired one
+      subscriptionStatus = anySubscription.status; // Will be 'canceled', 'past_due', etc.
+
+      if (anySubscription.canceled_at) {
+        canceledAt = new Date(anySubscription.canceled_at * 1000).toISOString();
+      }
+
+      // Check if local DB needs to be synced (edge case: webhook missed)
+      if (dbSubscription && dbSubscription.status === 'active') {
+        logger.info('Local DB shows active but Stripe shows no active subscription, syncing...', {
+          userId: user.id,
+          dbStatus: dbSubscription.status,
+          stripeStatus: anySubscription.status,
         });
+
+        // Update local DB to reflect expired/canceled status
+        try {
+          await query(
+            `UPDATE subscriptions SET status = $1, canceled_at = $2, updated_at = NOW() WHERE organization_id = $3`,
+            [anySubscription.status, anySubscription.canceled_at ? new Date(anySubscription.canceled_at * 1000) : null, user.organization_id]
+          );
+          logger.info('Synced subscription status from Stripe to local DB', {
+            userId: user.id,
+            newStatus: anySubscription.status,
+          });
+        } catch (syncError) {
+          logger.error('Failed to sync subscription status to DB', { error: syncError });
+        }
       }
-    } else {
-      logger.info('No subscriptions found for customer');
+
+      // Don't show plan details for canceled/expired subscriptions
+      currentPlan = null;
     }
-
-    // Create billing portal configuration for payment methods only
-    logger.info('Creating payment portal configuration');
-    const paymentOnlyConfig = await stripe.billingPortal.configurations.create({
-      features: {
-        payment_method_update: {
-          enabled: true
-        },
-        invoice_history: {
-          enabled: false
-        },
-        subscription_cancel: {
-          enabled: false
-        },
-        customer_update: {
-          enabled: false
-        },
-        subscription_update: {
-          enabled: false
-        }
-      },
-      business_profile: {
-        headline: 'Manage your payment method'
-      }
-    });
-
-    // Create billing portal configuration for subscription management  
-    logger.info('Creating subscription portal configuration');
-    const subscriptionConfig = await stripe.billingPortal.configurations.create({
-      features: {
-        payment_method_update: {
-          enabled: false
-        },
-        invoice_history: {
-          enabled: false
-        },
-        subscription_cancel: {
-          enabled: true
-        },
-        customer_update: {
-          enabled: false
-        },
-        subscription_update: {
-          enabled: false
-        }
-      },
-      business_profile: {
-        headline: 'Manage your subscription'
-      }
-    });
 
     const returnUrl = config.email.dashboardUrl || config.email.siteUrl || 'https://portal.lumapos.co';
 
-    // Create payment management portal session
-    const paymentPortalSession = await stripe.billingPortal.sessions.create({
-      customer: user.stripe_customer_id,
-      configuration: paymentOnlyConfig.id,
-      return_url: `${returnUrl}/billing`,
-    });
-
-    // Create subscription management portal session
-    const subscriptionPortalSession = await stripe.billingPortal.sessions.create({
-      customer: user.stripe_customer_id,
-      configuration: subscriptionConfig.id,
-      return_url: `${returnUrl}/billing`,
-    });
-
-    logger.info('Billing portal sessions created', {
-      paymentSessionId: paymentPortalSession.id,
-      subscriptionSessionId: subscriptionPortalSession.id
-    });
+    // Create portal sessions in parallel
+    const [paymentPortalSession, subscriptionPortalSession] = await Promise.all([
+      stripe.billingPortal.sessions.create({
+        customer: user.stripe_customer_id,
+        configuration: portalConfigs.paymentConfigId,
+        return_url: `${returnUrl}/billing`,
+      }),
+      stripe.billingPortal.sessions.create({
+        customer: user.stripe_customer_id,
+        configuration: portalConfigs.subscriptionConfigId,
+        return_url: `${returnUrl}/billing`,
+      })
+    ]);
 
     logger.info('Payment info retrieved', {
       userId: user.id,
@@ -574,6 +608,11 @@ app.openapi(paymentInfoRoute, async (c) => {
       manage_subscription_url: subscriptionPortalSession.url,
       cancel_at: cancelAt,
       canceled_at: canceledAt,
+      trial_end: trialEnd,
+      upcoming_invoice_amount: upcomingInvoiceAmount,
+      platform: 'stripe' as SubscriptionPlatform,
+      trial_eligible: trialEligible,
+      had_stripe_subscription: hadStripeSubscription,
     });
 
   } catch (error: any) {
@@ -588,6 +627,202 @@ app.openapi(paymentInfoRoute, async (c) => {
       userId: payload?.userId
     });
     return c.json({ error: 'Failed to retrieve payment info' }, 500);
+  }
+});
+
+// Subscription info endpoint (for mobile app)
+const subscriptionInfoRoute = createRoute({
+  method: 'get',
+  path: '/billing/subscription-info',
+  summary: 'Get subscription info for mobile app',
+  description: 'Retrieve subscription status, tier, and platform for the authenticated user (used by mobile app)',
+  tags: ['Billing'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: {
+      description: 'Subscription info retrieved successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            tier: z.enum(['starter', 'pro', 'enterprise', 'none']),
+            status: z.enum(['active', 'past_due', 'canceled', 'trialing', 'none']),
+            platform: z.enum(['stripe', 'apple', 'google']),
+            current_plan: z.object({
+              name: z.string(),
+              price: z.number(),
+              currency: z.string(),
+              interval: z.enum(['month', 'year']),
+              description: z.string().optional(),
+            }).nullable(),
+            current_period_end: z.string().nullable(),
+            cancel_at: z.string().nullable(),
+            canceled_at: z.string().nullable(),
+            trial_end: z.string().nullable(),
+            manage_subscription_url: z.string().nullable(),
+          }),
+        },
+      },
+    },
+    401: { description: 'Unauthorized' },
+    404: { description: 'User not found' },
+    500: { description: 'Internal server error' },
+  },
+});
+
+app.openapi(subscriptionInfoRoute, async (c) => {
+  const authHeader = c.req.header('Authorization');
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    const payload = await authService.verifyToken(token);
+    const user = await authService.getUserById(payload.userId);
+
+    if (!user) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    // Get subscription from database
+    const subscriptionRows = await query(
+      `SELECT * FROM subscriptions WHERE organization_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [user.organization_id]
+    );
+    let dbSubscription = subscriptionRows[0];
+
+    // Default response for no subscription
+    if (!dbSubscription) {
+      return c.json({
+        tier: 'starter' as const,
+        status: 'none' as const,
+        platform: 'stripe' as SubscriptionPlatform,
+        current_plan: null,
+        current_period_end: null,
+        cancel_at: null,
+        canceled_at: null,
+        trial_end: null,
+        manage_subscription_url: null,
+      });
+    }
+
+    const platform: SubscriptionPlatform = dbSubscription.platform || 'stripe';
+    let manageSubscriptionUrl: string | null = null;
+
+    // Edge case: Check if subscription appears expired but DB shows active
+    // This can happen if webhooks failed to update our DB
+    const now = new Date();
+    const periodEnd = dbSubscription.current_period_end ? new Date(dbSubscription.current_period_end) : null;
+    const isExpiredInDb = periodEnd && periodEnd < now && dbSubscription.status === 'active';
+
+    if (isExpiredInDb && platform === 'stripe' && user.stripe_customer_id) {
+      logger.info('DB subscription appears expired, checking Stripe for actual status', {
+        userId: user.id,
+        dbStatus: dbSubscription.status,
+        periodEnd: periodEnd?.toISOString(),
+      });
+
+      try {
+        // Check Stripe for the actual subscription status
+        const stripeSubscriptions = await stripe.subscriptions.list({
+          customer: user.stripe_customer_id,
+          status: 'all',
+          limit: 1,
+        });
+
+        const stripeSub = stripeSubscriptions.data[0];
+        if (stripeSub && stripeSub.status !== 'active' && stripeSub.status !== 'trialing') {
+          // Stripe confirms subscription is not active - sync our DB
+          logger.info('Stripe confirms subscription expired, syncing DB', {
+            userId: user.id,
+            stripeStatus: stripeSub.status,
+          });
+
+          await query(
+            `UPDATE subscriptions SET status = $1, tier = 'starter', canceled_at = $2, updated_at = NOW() WHERE organization_id = $3`,
+            [stripeSub.status, stripeSub.canceled_at ? new Date(stripeSub.canceled_at * 1000) : null, user.organization_id]
+          );
+
+          // Update local variable to reflect the change
+          dbSubscription = {
+            ...dbSubscription,
+            status: stripeSub.status,
+            tier: 'starter',
+            canceled_at: stripeSub.canceled_at ? new Date(stripeSub.canceled_at * 1000) : null,
+          };
+        }
+      } catch (e) {
+        logger.warn('Failed to verify subscription with Stripe', { error: e });
+      }
+    }
+
+    // For Stripe subscriptions with active status, generate a billing portal URL
+    if (platform === 'stripe' && user.stripe_customer_id && dbSubscription.status === 'active') {
+      try {
+        const portalConfigs = await getOrCreatePortalConfigs();
+        const returnUrl = config.email.dashboardUrl || 'https://portal.lumapos.co';
+        const session = await stripe.billingPortal.sessions.create({
+          customer: user.stripe_customer_id,
+          configuration: portalConfigs.subscriptionConfigId,
+          return_url: `${returnUrl}/billing`,
+        });
+        manageSubscriptionUrl = session.url;
+      } catch (e) {
+        logger.warn('Failed to create billing portal session', { error: e });
+      }
+    }
+
+    // Build plan info based on tier - only show plan for active/trialing subscriptions
+    let currentPlan = null;
+    const isActiveSubscription = dbSubscription.status === 'active' || dbSubscription.status === 'trialing';
+
+    if (isActiveSubscription && dbSubscription.tier === 'pro') {
+      currentPlan = {
+        name: 'Pro Plan',
+        price: platform === 'stripe' ? 1900 : 2999, // $19 Stripe, $29.99 mobile
+        currency: 'usd',
+        interval: 'month' as const,
+        description: platform === 'apple'
+          ? 'Managed via App Store'
+          : platform === 'google'
+            ? 'Managed via Google Play'
+            : 'Unlimited features for your business',
+      };
+    } else if (isActiveSubscription && dbSubscription.tier === 'enterprise') {
+      currentPlan = {
+        name: 'Enterprise Plan',
+        price: dbSubscription.monthly_price || 29900,
+        currency: 'usd',
+        interval: 'month' as const,
+        description: 'Custom enterprise solution',
+      };
+    }
+
+    logger.info('Subscription info retrieved for mobile app', {
+      userId: user.id,
+      tier: dbSubscription.tier,
+      platform,
+      status: dbSubscription.status,
+      isActive: isActiveSubscription,
+    });
+
+    return c.json({
+      tier: dbSubscription.tier as 'starter' | 'pro' | 'enterprise',
+      status: dbSubscription.status as 'active' | 'past_due' | 'canceled' | 'trialing' | 'none',
+      platform,
+      current_plan: currentPlan,
+      current_period_end: dbSubscription.current_period_end?.toISOString() || null,
+      cancel_at: dbSubscription.cancel_at?.toISOString() || null,
+      canceled_at: dbSubscription.canceled_at?.toISOString() || null,
+      trial_end: dbSubscription.trial_end?.toISOString() || null,
+      manage_subscription_url: manageSubscriptionUrl,
+    });
+
+  } catch (error: any) {
+    logger.error('Subscription info retrieval failed', { error });
+    return c.json({ error: 'Failed to retrieve subscription info' }, 500);
   }
 });
 

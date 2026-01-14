@@ -67,6 +67,59 @@ async function verifyAuth(authHeader: string | undefined) {
   return authService.verifyToken(token);
 }
 
+// Helper to check if a catalog is locked based on subscription tier
+// Free/starter tier: only the OLDEST catalog is accessible (last when sorted by created_at DESC)
+async function checkCatalogAccess(
+  catalogId: string,
+  organizationId: string
+): Promise<{ allowed: boolean; reason?: string }> {
+  // Get subscription tier
+  const subscriptionResult = await query<{ tier: string; status: string }>(
+    `SELECT tier, status FROM subscriptions
+     WHERE organization_id = $1 AND status IN ('active', 'trialing')
+     LIMIT 1`,
+    [organizationId]
+  );
+
+  // No active subscription - allow access (will be handled by other checks)
+  if (subscriptionResult.length === 0) {
+    return { allowed: true };
+  }
+
+  const { tier } = subscriptionResult[0];
+
+  // Pro and Enterprise tiers have full access
+  if (tier !== 'starter' && tier !== 'free') {
+    return { allowed: true };
+  }
+
+  // For free/starter tier, check if this is the oldest (allowed) catalog
+  // Get all catalogs sorted by created_at DESC (newest first)
+  const catalogsResult = await query<{ id: string }>(
+    `SELECT id FROM catalogs
+     WHERE organization_id = $1
+     ORDER BY created_at DESC`,
+    [organizationId]
+  );
+
+  // If only 1 catalog, it's allowed
+  if (catalogsResult.length <= 1) {
+    return { allowed: true };
+  }
+
+  // The LAST catalog in this list (oldest) is the allowed one
+  const allowedCatalogId = catalogsResult[catalogsResult.length - 1].id;
+
+  if (catalogId === allowedCatalogId) {
+    return { allowed: true };
+  }
+
+  return {
+    allowed: false,
+    reason: 'This catalog is locked. Free tier accounts can only access their oldest catalog. Upgrade to Pro to unlock all catalogs.',
+  };
+}
+
 // List catalogs for organization
 const listCatalogsRoute = createRoute({
   method: 'get',
@@ -175,6 +228,15 @@ app.openapi(getCatalogRoute, async (c) => {
 
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    // Check if catalog is locked based on subscription tier
+    const accessCheck = await checkCatalogAccess(id, payload.organizationId);
+    if (!accessCheck.allowed) {
+      return c.json({
+        error: accessCheck.reason,
+        code: 'CATALOG_LOCKED'
+      }, 403);
+    }
 
     const rows = await query<Catalog & { product_count: number }>(
       `SELECT c.*,
@@ -342,6 +404,16 @@ app.openapi(updateCatalogRoute, async (c) => {
 
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    // Check if catalog is locked based on subscription tier
+    const accessCheck = await checkCatalogAccess(id, payload.organizationId);
+    if (!accessCheck.allowed) {
+      return c.json({
+        error: accessCheck.reason,
+        code: 'CATALOG_LOCKED'
+      }, 403);
+    }
+
     const body = await c.req.json();
 
     // Build update query dynamically
@@ -484,6 +556,15 @@ app.openapi(deleteCatalogRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
 
+    // Check if catalog is locked based on subscription tier
+    const accessCheck = await checkCatalogAccess(id, payload.organizationId);
+    if (!accessCheck.allowed) {
+      return c.json({
+        error: accessCheck.reason,
+        code: 'CATALOG_LOCKED'
+      }, 403);
+    }
+
     const result = await query(
       `DELETE FROM catalogs WHERE id = $1 AND organization_id = $2 RETURNING id`,
       [id, payload.organizationId]
@@ -551,6 +632,16 @@ app.openapi(duplicateCatalogRoute, async (c) => {
 
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    // Check if catalog is locked based on subscription tier
+    const accessCheck = await checkCatalogAccess(originalId, payload.organizationId);
+    if (!accessCheck.allowed) {
+      return c.json({
+        error: accessCheck.reason,
+        code: 'CATALOG_LOCKED'
+      }, 403);
+    }
+
     const body = await c.req.json().catch(() => ({}));
 
     return await transaction(async (client) => {

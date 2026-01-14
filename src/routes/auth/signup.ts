@@ -241,31 +241,34 @@ app.openapi(signupRoute, async (c) => {
       let subscriptionStatus = 'active';
       let stripeSubscriptionId = null;
       
-      // For pro tier, create subscription with immediate payment
+      // For pro tier, create subscription with trial and collect payment method
       if (validated.subscriptionTier === 'pro' && config.stripe.proPriceId) {
-        // Create subscription - this will create an invoice with a payment intent
+        // With a trial, we use pending_setup_intent to collect payment method upfront
+        // The customer won't be charged until the trial ends
         const subscription = await stripe.subscriptions.create({
           customer: stripeCustomer.id,
           items: [{ price: config.stripe.proPriceId }],
+          discounts: [{ coupon: 'first-month-discount' }],
+          trial_period_days: 7,
           payment_behavior: 'default_incomplete',
           payment_settings: {
             save_default_payment_method: 'on_subscription',
           },
-          expand: ['latest_invoice.confirmation_secret'],
+          expand: ['pending_setup_intent'],
         });
-        
+
         stripeSubscriptionId = subscription.id;
         subscriptionStatus = subscription.status || 'incomplete';
-        
-        // Get the client secret from the invoice's confirmation_secret (new Stripe pattern)
-        const invoice = subscription.latest_invoice as Stripe.Invoice;
-        
-        if (invoice && (invoice as any).confirmation_secret?.client_secret) {
-          paymentIntentClientSecret = (invoice as any).confirmation_secret.client_secret;
+
+        // With a trial, we get a SetupIntent instead of a PaymentIntent
+        const setupIntent = subscription.pending_setup_intent as Stripe.SetupIntent;
+
+        if (setupIntent?.client_secret) {
+          paymentIntentClientSecret = setupIntent.client_secret;
         } else {
-          logger.error('No confirmation secret found on subscription invoice', {
+          logger.error('No setup intent found on trial subscription', {
             subscriptionId: subscription.id,
-            invoiceId: invoice?.id
+            status: subscription.status
           });
         }
       } else if (validated.subscriptionTier === 'enterprise') {
