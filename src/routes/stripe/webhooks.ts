@@ -12,10 +12,22 @@ const app = new Hono();
 
 // Use plain Hono route (not OpenAPI) to get raw body for signature verification
 app.post('/stripe/webhook', async (c) => {
+  console.log('!!! WEBHOOK HIT !!! - /stripe/webhook received request');
+  console.log('!!! Headers:', JSON.stringify(Object.fromEntries(c.req.raw.headers.entries())));
+
   const signature = c.req.header('stripe-signature');
   const rawBody = await c.req.text();
 
+  console.log('!!! WEBHOOK - signature present:', !!signature, 'body length:', rawBody?.length);
+
+  logger.info('[WEBHOOK DEBUG] Received webhook request', {
+    hasSignature: !!signature,
+    bodyLength: rawBody?.length || 0,
+    webhookSecretConfigured: !!config.stripe.webhookSecret,
+  });
+
   if (!signature) {
+    logger.error('[WEBHOOK DEBUG] Missing stripe-signature header');
     return c.json({ error: 'Missing stripe-signature header' }, 400);
   }
 
@@ -26,27 +38,52 @@ app.post('/stripe/webhook', async (c) => {
       signature,
       config.stripe.webhookSecret
     );
+    logger.info('[WEBHOOK DEBUG] Signature verification PASSED', {
+      eventId: event.id,
+      eventType: event.type,
+    });
   } catch (error) {
-    logger.error('Webhook signature verification failed', error);
+    logger.error('[WEBHOOK DEBUG] Webhook signature verification FAILED', {
+      error: error instanceof Error ? error.message : String(error),
+      signaturePrefix: signature?.substring(0, 20),
+    });
     return c.json({ error: 'Invalid signature' }, 400);
   }
 
-  logger.info('Webhook received', {
+  logger.info('[WEBHOOK DEBUG] ========== WEBHOOK EVENT RECEIVED ==========', {
     type: event.type,
     id: event.id,
+    created: event.created,
+    livemode: event.livemode,
+    apiVersion: event.api_version,
   });
 
+  // Log full event data for payment-related events
+  if (event.type.startsWith('payment_intent') || event.type.startsWith('charge')) {
+    logger.info('[WEBHOOK DEBUG] Payment event full data', {
+      eventType: event.type,
+      eventId: event.id,
+      dataObject: JSON.stringify(event.data.object, null, 2),
+    });
+  }
+
   try {
+    logger.info('[WEBHOOK DEBUG] Processing event type', { eventType: event.type });
+
     switch (event.type) {
       case 'payment_intent.succeeded':
+        logger.info('[WEBHOOK DEBUG] >>> Matched payment_intent.succeeded - calling handler');
         await handlePaymentIntentSucceeded(event.data.object);
+        logger.info('[WEBHOOK DEBUG] <<< Finished payment_intent.succeeded handler');
         break;
 
       case 'payment_intent.payment_failed':
+        logger.info('[WEBHOOK DEBUG] >>> Matched payment_intent.payment_failed');
         await handlePaymentIntentFailed(event.data.object);
         break;
 
       case 'charge.refunded':
+        logger.info('[WEBHOOK DEBUG] >>> Matched charge.refunded');
         await handleChargeRefunded(event.data.object);
         break;
 
@@ -99,30 +136,97 @@ app.post('/stripe/webhook', async (c) => {
         break;
 
       default:
-        logger.info('Unhandled webhook event type', { type: event.type });
+        logger.info('[WEBHOOK DEBUG] Unhandled webhook event type (no handler)', { type: event.type });
     }
 
+    logger.info('[WEBHOOK DEBUG] ========== WEBHOOK PROCESSING COMPLETE - Returning 200 ==========', {
+      eventType: event.type,
+      eventId: event.id,
+    });
     return c.json({ received: true });
   } catch (error) {
-    logger.error('Error processing webhook', { error, eventType: event.type });
+    logger.error('[WEBHOOK DEBUG] ========== ERROR PROCESSING WEBHOOK ==========', {
+      error: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      eventType: event.type,
+      eventId: event.id,
+    });
     return c.json({ error: 'Webhook processing failed' }, 500);
   }
 });
 
 async function handlePaymentIntentSucceeded(paymentIntent: any) {
+  logger.info('[WEBHOOK DEBUG] ========== handlePaymentIntentSucceeded START ==========');
+  logger.info('[WEBHOOK DEBUG] PaymentIntent details', {
+    id: paymentIntent.id,
+    amount: paymentIntent.amount,
+    amountInDollars: paymentIntent.amount / 100,
+    currency: paymentIntent.currency,
+    status: paymentIntent.status,
+    latestCharge: paymentIntent.latest_charge,
+    paymentMethodType: paymentIntent.payment_method_types,
+    metadata: paymentIntent.metadata,
+    transferData: paymentIntent.transfer_data,
+    onBehalfOf: paymentIntent.on_behalf_of,
+    applicationFeeAmount: paymentIntent.application_fee_amount,
+  });
+
   await transaction(async (client) => {
+    logger.info('[WEBHOOK DEBUG] Looking for order with stripe_payment_intent_id', {
+      paymentIntentId: paymentIntent.id,
+    });
+
+    // First, let's check if the order exists at all
+    const checkResult = await client.query(
+      `SELECT id, status, stripe_payment_intent_id, organization_id, total_amount
+       FROM orders
+       WHERE stripe_payment_intent_id = $1`,
+      [paymentIntent.id]
+    );
+
+    logger.info('[WEBHOOK DEBUG] Order lookup result (before update)', {
+      found: checkResult.rows.length > 0,
+      rowCount: checkResult.rows.length,
+      order: checkResult.rows[0] || null,
+    });
+
+    if (checkResult.rows.length === 0) {
+      // Let's check recent orders to see what payment intent IDs they have
+      const recentOrders = await client.query(
+        `SELECT id, status, stripe_payment_intent_id, created_at
+         FROM orders
+         ORDER BY created_at DESC
+         LIMIT 5`
+      );
+      logger.warn('[WEBHOOK DEBUG] No order found! Recent orders for debugging', {
+        recentOrders: recentOrders.rows,
+        searchedFor: paymentIntent.id,
+      });
+    }
+
     const result = await client.query(
       `UPDATE orders
        SET status = 'completed',
            stripe_charge_id = $1,
            updated_at = NOW()
        WHERE stripe_payment_intent_id = $2
-       RETURNING id, organization_id, total_amount`,
+       RETURNING id, organization_id, total_amount, status`,
       [paymentIntent.latest_charge, paymentIntent.id]
     );
 
+    logger.info('[WEBHOOK DEBUG] Update query result', {
+      rowsUpdated: result.rowCount,
+      updatedOrder: result.rows[0] || null,
+    });
+
     if (result.rows.length > 0) {
       const order = result.rows[0];
+      logger.info('[WEBHOOK DEBUG] Order updated successfully, emitting socket events', {
+        orderId: order.id,
+        organizationId: order.organization_id,
+        totalAmount: order.total_amount,
+        newStatus: order.status,
+      });
 
       // Emit socket events for real-time updates
       socketService.emitToOrganization(order.organization_id, SocketEvents.ORDER_COMPLETED, {
@@ -135,13 +239,20 @@ async function handlePaymentIntentSucceeded(paymentIntent: any) {
         amount: order.total_amount,
         timestamp: new Date(),
       });
+
+      logger.info('[WEBHOOK DEBUG] Socket events emitted successfully');
+    } else {
+      logger.warn('[WEBHOOK DEBUG] No order was updated! The order might not exist or already be completed');
     }
 
-    logger.info('Payment intent succeeded', {
+    logger.info('[WEBHOOK DEBUG] Payment intent succeeded handler completed', {
       paymentIntentId: paymentIntent.id,
       amount: paymentIntent.amount / 100,
+      orderFound: result.rows.length > 0,
     });
   });
+
+  logger.info('[WEBHOOK DEBUG] ========== handlePaymentIntentSucceeded END ==========');
 }
 
 async function handlePaymentIntentFailed(paymentIntent: any) {
@@ -345,9 +456,9 @@ async function handleCheckoutSessionCompleted(session: any) {
     const features = DEFAULT_FEATURES_BY_TIER[tier];
 
     if (user.subscription_id) {
-      // Update existing subscription
+      // Update existing subscription - always set platform to 'stripe' for Stripe checkouts
       await client.query(
-        `UPDATE subscriptions 
+        `UPDATE subscriptions
          SET stripe_subscription_id = $1,
              stripe_customer_id = $2,
              tier = $3,
@@ -356,6 +467,7 @@ async function handleCheckoutSessionCompleted(session: any) {
              transaction_fee_rate = $5,
              features = $6,
              current_period_start = NOW(),
+             platform = 'stripe',
              updated_at = NOW()
          WHERE id = $7`,
         [
@@ -374,8 +486,8 @@ async function handleCheckoutSessionCompleted(session: any) {
         `INSERT INTO subscriptions (
           user_id, organization_id, stripe_subscription_id,
           stripe_customer_id, tier, status, monthly_price,
-          transaction_fee_rate, features, current_period_start
-        ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, NOW())`,
+          transaction_fee_rate, features, current_period_start, platform
+        ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, NOW(), 'stripe')`,
         [
           user.id,
           user.organization_id,

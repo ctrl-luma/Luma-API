@@ -3,29 +3,11 @@ import { z } from 'zod';
 import { query } from '../../db';
 import { StripeConnectedAccount } from '../../db/models';
 import { stripe } from '../../services/stripe';
+import { emailService } from '../../services/email';
 import { logger } from '../../utils/logger';
+import { calculatePlatformFee, SubscriptionTier } from '../../config/platform-fees';
 
 const app = new OpenAPIHono();
-
-// Subscription tier type
-type SubscriptionTier = 'starter' | 'pro' | 'enterprise';
-
-// Platform fee configuration (in addition to Stripe's 2.7% + $0.15 for Tap to Pay)
-const PLATFORM_FEES = {
-  // Free plan: 2.9% + $0.18 total, Stripe takes 2.7% + $0.15, platform gets 0.2% + $0.03
-  starter: { percentRate: 0.002, fixedCents: 3 },
-  // Pro plan: 2.8% + $0.16 total, Stripe takes 2.7% + $0.15, platform gets 0.1% + $0.01
-  pro: { percentRate: 0.001, fixedCents: 1 },
-  // Enterprise: custom pricing, default to no platform fee
-  enterprise: { percentRate: 0, fixedCents: 0 },
-};
-
-// Calculate platform fee in cents
-function calculatePlatformFee(amountCents: number, tier: SubscriptionTier): number {
-  const feeConfig = PLATFORM_FEES[tier] || PLATFORM_FEES.starter;
-  const fee = Math.round(amountCents * feeConfig.percentRate) + feeConfig.fixedCents;
-  return Math.max(0, fee); // Ensure non-negative
-}
 
 // Helper to verify auth and get connected account
 async function getConnectedAccount(authHeader: string | undefined) {
@@ -300,8 +282,8 @@ app.openapi(connectionTokenRoute, async (c) => {
 const createPaymentIntentRoute = createRoute({
   method: 'post',
   path: '/stripe/terminal/payment-intent',
-  summary: 'Create a payment intent for terminal/tap-to-pay payment',
-  description: 'Creates a PaymentIntent configured for card_present payments via Stripe Terminal',
+  summary: 'Create a payment intent for terminal/tap-to-pay or manual card payment',
+  description: 'Creates a PaymentIntent configured for card_present (Tap to Pay) or card (manual entry) payments',
   tags: ['Stripe Terminal'],
   security: [{ bearerAuth: [] }],
   request: {
@@ -314,6 +296,8 @@ const createPaymentIntentRoute = createRoute({
             description: z.string().optional(),
             metadata: z.record(z.string()).optional(),
             receiptEmail: z.string().email().optional(),
+            captureMethod: z.enum(['automatic', 'manual']).optional().default('automatic').describe('Capture method for the payment'),
+            paymentMethodType: z.enum(['card_present', 'card']).optional().default('card_present').describe('Payment method type: card_present for Tap to Pay, card for manual entry'),
           }),
         },
       },
@@ -330,6 +314,7 @@ const createPaymentIntentRoute = createRoute({
             amount: z.number(),
             currency: z.string(),
             status: z.string(),
+            stripeAccountId: z.string(),
           }),
         },
       },
@@ -357,37 +342,99 @@ app.openapi(createPaymentIntentRoute, async (c) => {
     // Calculate platform fee based on subscription tier
     const platformFee = calculatePlatformFee(amountInCents, subscriptionTier);
 
-    // Create payment intent for the connected account with platform fee
-    const paymentIntent = await stripe.paymentIntents.create(
-      {
-        amount: amountInCents,
-        currency: body.currency || 'usd',
-        payment_method_types: ['card_present'],
-        capture_method: 'automatic',
-        description: body.description || 'Tap to Pay payment',
-        receipt_email: body.receiptEmail,
-        application_fee_amount: platformFee > 0 ? platformFee : undefined,
-        metadata: {
-          ...body.metadata,
-          organization_id: payload.organizationId,
-          user_id: payload.userId,
-          source: 'mobile_app',
-          subscription_tier: subscriptionTier,
-          platform_fee_cents: platformFee.toString(),
-        },
-      },
-      {
-        stripeAccount: connectedAccount.stripe_account_id,
-      }
-    );
+    // Determine payment method type and capture method
+    const paymentMethodType = body.paymentMethodType || 'card_present';
+    const captureMethod = body.captureMethod || 'automatic';
+    const isManualCardEntry = paymentMethodType === 'card';
 
-    logger.info('Terminal payment intent created', {
+    // Look up catalogId from order if orderId is provided in metadata
+    let catalogId: string | null = null;
+    if (body.metadata?.orderId) {
+      const orderRows = await query<{ catalog_id: string | null }>(
+        'SELECT catalog_id FROM orders WHERE id = $1 AND organization_id = $2',
+        [body.metadata.orderId, payload.organizationId]
+      );
+      if (orderRows.length > 0) {
+        catalogId = orderRows[0].catalog_id;
+      }
+    }
+
+    let paymentIntent;
+
+    if (isManualCardEntry) {
+      // For manual card entry, use DIRECT CHARGES (created on connected account)
+      // The mobile app passes stripeAccountId to StripeProvider to confirm on connected account
+      // Note: Manual card entry has higher Stripe fees (2.9% + 30¢ vs 2.7% + 5¢ for Tap to Pay)
+      paymentIntent = await stripe.paymentIntents.create(
+        {
+          amount: amountInCents,
+          currency: body.currency || 'usd',
+          payment_method_types: ['card'],
+          capture_method: captureMethod,
+          description: body.description || 'Manual card payment',
+          receipt_email: body.receiptEmail,
+          application_fee_amount: platformFee > 0 ? platformFee : undefined,
+          metadata: {
+            ...body.metadata,
+            organization_id: payload.organizationId,
+            user_id: payload.userId,
+            source: 'mobile_app',
+            subscription_tier: subscriptionTier,
+            platform_fee_cents: platformFee.toString(),
+            payment_method_type: paymentMethodType,
+            ...(catalogId && { catalogId }),
+          },
+        },
+        {
+          stripeAccount: connectedAccount.stripe_account_id,
+        }
+      );
+    } else {
+      // For Tap to Pay (card_present), use DIRECT CHARGES (created on connected account)
+      // This is required because the terminal reader is registered to the connected account
+      paymentIntent = await stripe.paymentIntents.create(
+        {
+          amount: amountInCents,
+          currency: body.currency || 'usd',
+          payment_method_types: ['card_present'],
+          capture_method: captureMethod,
+          description: body.description || 'Tap to Pay payment',
+          receipt_email: body.receiptEmail,
+          application_fee_amount: platformFee > 0 ? platformFee : undefined,
+          metadata: {
+            ...body.metadata,
+            organization_id: payload.organizationId,
+            user_id: payload.userId,
+            source: 'mobile_app',
+            subscription_tier: subscriptionTier,
+            platform_fee_cents: platformFee.toString(),
+            payment_method_type: paymentMethodType,
+            ...(catalogId && { catalogId }),
+          },
+        },
+        {
+          stripeAccount: connectedAccount.stripe_account_id,
+        }
+      );
+    }
+
+    logger.info('[TERMINAL DEBUG] ========== Payment Intent Created ==========', {
       paymentIntentId: paymentIntent.id,
+      clientSecret: paymentIntent.client_secret ? 'present' : 'missing',
       amount: body.amount,
+      amountInCents: paymentIntent.amount,
       platformFee,
       subscriptionTier,
-      accountId: connectedAccount.stripe_account_id,
+      paymentMethodType,
+      captureMethod,
+      isManualCardEntry: paymentMethodType === 'card',
+      chargeType: 'DIRECT (connected account)',
+      connectedAccountId: connectedAccount.stripe_account_id,
       organizationId: payload.organizationId,
+      metadata: paymentIntent.metadata,
+    });
+    logger.info('[TERMINAL DEBUG] Webhook that should receive payment_intent.succeeded:', {
+      expectedWebhook: '/stripe/webhook-connect (connect)',
     });
 
     return c.json({
@@ -396,6 +443,7 @@ app.openapi(createPaymentIntentRoute, async (c) => {
       amount: paymentIntent.amount,
       currency: paymentIntent.currency,
       status: paymentIntent.status,
+      stripeAccountId: connectedAccount.stripe_account_id,
     });
   } catch (error: any) {
     logger.error('Error creating terminal payment intent', { error: error.message });
@@ -708,22 +756,51 @@ app.openapi(sendReceiptRoute, async (c) => {
       return c.json({ error: 'Payment must be completed before sending receipt' }, 400);
     }
 
-    if (!paymentIntent.latest_charge || typeof paymentIntent.latest_charge !== 'object') {
+    // Get the charge from the payment intent (already expanded)
+    if (!paymentIntent.latest_charge) {
       return c.json({ error: 'No charge found for this payment' }, 400);
     }
 
-    const chargeId = paymentIntent.latest_charge.id;
+    // Get charge details - it's already expanded so it's an object
+    const charge = typeof paymentIntent.latest_charge === 'object'
+      ? paymentIntent.latest_charge
+      : await stripe.charges.retrieve(
+          paymentIntent.latest_charge,
+          { stripeAccount: connectedAccount.stripe_account_id }
+        );
 
-    // Update the charge with the receipt email - this triggers Stripe to send the email
-    const updatedCharge = await stripe.charges.update(
-      chargeId,
-      {
-        receipt_email: email,
-      },
-      {
-        stripeAccount: connectedAccount.stripe_account_id,
-      }
+    const receiptUrl = charge.receipt_url || null;
+
+    // Extract card details from the charge
+    const paymentMethodDetails = charge.payment_method_details;
+    let cardBrand: string | undefined;
+    let cardLast4: string | undefined;
+
+    if (paymentMethodDetails?.type === 'card_present' && paymentMethodDetails.card_present) {
+      cardBrand = paymentMethodDetails.card_present.brand || undefined;
+      cardLast4 = paymentMethodDetails.card_present.last4 || undefined;
+    } else if (paymentMethodDetails?.type === 'card' && paymentMethodDetails.card) {
+      cardBrand = paymentMethodDetails.card.brand || undefined;
+      cardLast4 = paymentMethodDetails.card.last4 || undefined;
+    }
+
+    // Get organization name for merchant name
+    const orgRows = await query<{ name: string }>(
+      'SELECT name FROM organizations WHERE id = $1',
+      [payload.organizationId]
     );
+    const merchantName = orgRows[0]?.name || undefined;
+
+    // Send receipt via our email service (works in test mode!)
+    await emailService.sendReceipt(email, {
+      amount: paymentIntent.amount,
+      orderNumber: paymentIntent.metadata?.orderNumber || undefined,
+      cardBrand,
+      cardLast4,
+      date: new Date(charge.created * 1000),
+      receiptUrl: receiptUrl || undefined,
+      merchantName,
+    });
 
     // Also save/update customer in our database
     // NOTE: We do NOT increment total_orders/total_spent here because that was already
@@ -767,16 +844,16 @@ app.openapi(sendReceiptRoute, async (c) => {
       logger.error('Failed to save customer email', { error: dbError, email });
     }
 
-    logger.info('Receipt email sent', {
+    logger.info('Receipt email sent via SES', {
       paymentIntentId,
-      chargeId,
       email,
       accountId: connectedAccount.stripe_account_id,
+      receiptUrl,
     });
 
     return c.json({
       success: true,
-      receiptUrl: updatedCharge.receipt_url,
+      receiptUrl,
     });
   } catch (error: any) {
     logger.error('Error sending receipt', { error: error.message });

@@ -158,21 +158,128 @@ export class EmailService {
     });
   }
 
-  async sendReceipt(to: string, receiptData: any): Promise<void> {
+  async sendReceipt(to: string, receiptData: {
+    amount: number; // in cents
+    orderNumber?: string;
+    cardBrand?: string;
+    cardLast4?: string;
+    date: Date;
+    receiptUrl?: string;
+    merchantName?: string;
+  }): Promise<void> {
+    const formattedAmount = (receiptData.amount / 100).toFixed(2);
+    const formattedDate = receiptData.date.toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+    const paymentMethod = receiptData.cardBrand && receiptData.cardLast4
+      ? `${receiptData.cardBrand.toUpperCase()} •••• ${receiptData.cardLast4}`
+      : 'Card';
+
     const html = `
-      <h1>Receipt</h1>
-      <p>Thank you for your purchase!</p>
-      <p>Transaction ID: ${receiptData.transactionId}</p>
-      <p>Date: ${new Date(receiptData.date).toLocaleString()}</p>
-      <p>Total: $${receiptData.total.toFixed(2)}</p>
-      <p>Payment Method: ${receiptData.paymentMethod}</p>
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      </head>
+      <body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f5f5f5;">
+        <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f5f5f5; padding: 40px 20px;">
+          <tr>
+            <td align="center">
+              <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 480px; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
+                <!-- Header -->
+                <tr>
+                  <td style="background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%); padding: 32px 24px; text-align: center;">
+                    <h1 style="margin: 0; color: #ffffff; font-size: 24px; font-weight: 600;">Payment Receipt</h1>
+                  </td>
+                </tr>
+
+                <!-- Amount -->
+                <tr>
+                  <td style="padding: 32px 24px 16px; text-align: center;">
+                    <p style="margin: 0 0 8px; color: #6b7280; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px;">Amount Paid</p>
+                    <p style="margin: 0; color: #111827; font-size: 48px; font-weight: 700;">$${formattedAmount}</p>
+                  </td>
+                </tr>
+
+                <!-- Success Badge -->
+                <tr>
+                  <td style="padding: 0 24px 24px; text-align: center;">
+                    <span style="display: inline-block; background-color: #dcfce7; color: #16a34a; padding: 8px 16px; border-radius: 9999px; font-size: 14px; font-weight: 500;">
+                      ✓ Payment Successful
+                    </span>
+                  </td>
+                </tr>
+
+                <!-- Details -->
+                <tr>
+                  <td style="padding: 0 24px 24px;">
+                    <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f9fafb; border-radius: 8px; padding: 16px;">
+                      <tr>
+                        <td style="padding: 12px 16px; border-bottom: 1px solid #e5e7eb;">
+                          <p style="margin: 0; color: #6b7280; font-size: 13px;">Date</p>
+                          <p style="margin: 4px 0 0; color: #111827; font-size: 15px; font-weight: 500;">${formattedDate}</p>
+                        </td>
+                      </tr>
+                      ${receiptData.orderNumber ? `
+                      <tr>
+                        <td style="padding: 12px 16px; border-bottom: 1px solid #e5e7eb;">
+                          <p style="margin: 0; color: #6b7280; font-size: 13px;">Order Number</p>
+                          <p style="margin: 4px 0 0; color: #111827; font-size: 15px; font-weight: 500;">#${receiptData.orderNumber}</p>
+                        </td>
+                      </tr>
+                      ` : ''}
+                      <tr>
+                        <td style="padding: 12px 16px;">
+                          <p style="margin: 0; color: #6b7280; font-size: 13px;">Payment Method</p>
+                          <p style="margin: 4px 0 0; color: #111827; font-size: 15px; font-weight: 500;">${paymentMethod}</p>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+
+                ${receiptData.receiptUrl ? `
+                <!-- View Full Receipt Button -->
+                <tr>
+                  <td style="padding: 0 24px 32px; text-align: center;">
+                    <a href="${receiptData.receiptUrl}" style="display: inline-block; background-color: #2563eb; color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-size: 15px; font-weight: 600;">View Full Receipt</a>
+                  </td>
+                </tr>
+                ` : ''}
+
+                <!-- Footer -->
+                <tr>
+                  <td style="padding: 24px; background-color: #f9fafb; text-align: center; border-top: 1px solid #e5e7eb;">
+                    <p style="margin: 0; color: #6b7280; font-size: 13px;">
+                      ${receiptData.merchantName ? `Thank you for your purchase from ${receiptData.merchantName}` : 'Thank you for your purchase'}
+                    </p>
+                    <p style="margin: 8px 0 0; color: #9ca3af; font-size: 12px;">
+                      Powered by Luma POS
+                    </p>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </body>
+      </html>
     `;
+
+    const subject = receiptData.orderNumber
+      ? `Receipt for Order #${receiptData.orderNumber}`
+      : `Payment Receipt - $${formattedAmount}`;
 
     await this.sendEmail({
       to,
-      subject: `Receipt - ${receiptData.transactionId}`,
+      subject,
       html,
-      text: `Receipt\n\nThank you for your purchase!\nTransaction ID: ${receiptData.transactionId}\nDate: ${new Date(receiptData.date).toLocaleString()}\nTotal: $${receiptData.total.toFixed(2)}`,
+      text: `Payment Receipt\n\nAmount: $${formattedAmount}\nDate: ${formattedDate}${receiptData.orderNumber ? `\nOrder: #${receiptData.orderNumber}` : ''}\nPayment Method: ${paymentMethod}${receiptData.receiptUrl ? `\n\nView full receipt: ${receiptData.receiptUrl}` : ''}\n\nThank you for your purchase!`,
     });
   }
 

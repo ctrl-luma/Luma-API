@@ -47,6 +47,12 @@ const envSchema = z.object({
   IMAGE_MAX_SIZE_BYTES: z.string().transform(Number).default('5242880'), // 5MB default
   IMAGE_STORAGE_PATH: z.string().default('/data/images'),
 
+  // Apple App Store IAP
+  APPLE_APP_BUNDLE_ID: z.string().optional(),
+  APPLE_APP_STORE_KEY_ID: z.string().optional(),
+  APPLE_APP_STORE_ISSUER_ID: z.string().optional(),
+  APPLE_APP_STORE_PRIVATE_KEY: z.string().optional(), // Base64 encoded .p8 key
+
   // Google Play Billing
   GOOGLE_PLAY_PACKAGE_NAME: z.string().optional(),
   GOOGLE_PLAY_CREDENTIALS: z.string().optional(), // JSON string of service account credentials
@@ -119,6 +125,12 @@ export const config = {
     fileServerUrl: env.IMAGE_FILE_SERVER_URL,
     maxSizeBytes: env.IMAGE_MAX_SIZE_BYTES,
     storagePath: env.IMAGE_STORAGE_PATH,
+  },
+  appleIap: {
+    bundleId: env.APPLE_APP_BUNDLE_ID,
+    keyId: env.APPLE_APP_STORE_KEY_ID,
+    issuerId: env.APPLE_APP_STORE_ISSUER_ID,
+    privateKey: env.APPLE_APP_STORE_PRIVATE_KEY,
   },
   googlePlay: {
     packageName: env.GOOGLE_PLAY_PACKAGE_NAME,

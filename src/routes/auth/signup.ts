@@ -13,6 +13,7 @@ import { config } from '../../config';
 // import { sendWelcomeEmail } from '../../services/email/template-sender';
 import { queueService, QueueName } from '../../services/queue';
 import Stripe from 'stripe';
+import { syncAccountFromStripe } from '../stripe/connect';
 
 const app = new OpenAPIHono();
 
@@ -280,8 +281,8 @@ app.openapi(signupRoute, async (c) => {
           user_id, organization_id, stripe_customer_id,
           tier, status, stripe_subscription_id,
           monthly_price, transaction_fee_rate, features,
-          metadata
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+          metadata, platform
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'stripe')
         RETURNING *`,
         [
           user.id,
@@ -323,6 +324,46 @@ app.openapi(signupRoute, async (c) => {
       return { user, organization, subscription, stripeSubscriptionId, paymentIntentClientSecret };
     });
 
+    // 7.5 Create Stripe Connect account for the organization (non-blocking)
+    // This allows users to start using Tap to Pay immediately after signup
+    try {
+      logger.info('Creating Stripe Connect account for new organization', {
+        organizationId: result.organization.id,
+        email: normalizedEmail,
+      });
+
+      const connectAccount = await stripeService.createConnectedAccount({
+        email: normalizedEmail,
+        country: 'US',
+        business_type: 'individual',
+        metadata: {
+          organization_id: result.organization.id,
+          organization_name: validated.organizationName,
+          user_id: result.user.id,
+        },
+      });
+
+      // Sync the account to our database
+      await syncAccountFromStripe(connectAccount, result.organization.id);
+
+      logger.info('Stripe Connect account created successfully', {
+        organizationId: result.organization.id,
+        stripeAccountId: connectAccount.id,
+        chargesEnabled: connectAccount.charges_enabled,
+      });
+    } catch (connectError: any) {
+      // Don't fail signup if Connect account creation fails
+      // User can create it later from the app or vendor portal
+      logger.error('Failed to create Stripe Connect account during signup (non-critical)', {
+        error: {
+          message: connectError?.message || 'Unknown error',
+          code: connectError?.code,
+          type: connectError?.type,
+        },
+        organizationId: result.organization.id,
+        email: normalizedEmail,
+      });
+    }
 
     // 8. Authenticate user with Cognito to get tokens
     const tokens = await authService.login(normalizedEmail, validated.password);

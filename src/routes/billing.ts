@@ -900,6 +900,31 @@ app.openapi(createUpgradeSessionRoute, async (c) => {
       return c.json({ error: 'Pro plan not configured' }, 400);
     }
 
+    // Check if user has an active Apple/Google subscription
+    // If they do, they must manage their subscription through the respective app store
+    const existingSubRows = await query(
+      `SELECT * FROM subscriptions WHERE organization_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [user.organization_id]
+    );
+    const existingSub = existingSubRows[0];
+
+    if (existingSub) {
+      const isActive = existingSub.status === 'active' || existingSub.status === 'trialing';
+      const isMobilePlatform = existingSub.platform === 'apple' || existingSub.platform === 'google';
+
+      if (isActive && isMobilePlatform && existingSub.tier !== 'starter') {
+        const storeName = existingSub.platform === 'apple' ? 'App Store' : 'Google Play';
+        logger.info('User tried to create Stripe upgrade but has active mobile subscription', {
+          userId: user.id,
+          platform: existingSub.platform,
+          tier: existingSub.tier,
+        });
+        return c.json({
+          error: `You have an active subscription through ${storeName}. Please manage your subscription in the ${storeName}.`,
+        }, 400);
+      }
+    }
+
     // Ensure user has a Stripe customer ID
     let customerId = user.stripe_customer_id;
     if (!customerId) {
@@ -915,7 +940,6 @@ app.openapi(createUpgradeSessionRoute, async (c) => {
       customerId = customer.id;
 
       // Update user with Stripe customer ID
-      const { query } = await import('../db');
       await query(
         'UPDATE users SET stripe_customer_id = $1 WHERE id = $2',
         [customerId, user.id]
@@ -927,7 +951,7 @@ app.openapi(createUpgradeSessionRoute, async (c) => {
       });
     }
 
-    // Check if user already has an active subscription
+    // Check if user already has an active Stripe subscription
     const subscriptions = await stripe.subscriptions.list({
       customer: customerId,
       status: 'active',
@@ -963,6 +987,307 @@ app.openapi(createUpgradeSessionRoute, async (c) => {
   } catch (error: any) {
     logger.error('Failed to create upgrade session', { error });
     return c.json({ error: 'Failed to create checkout session' }, 500);
+  }
+});
+
+// ============================================
+// IAP Receipt Validation Endpoint
+// ============================================
+
+// Pricing constants for IAP subscriptions
+const IAP_PRICING = {
+  pro: {
+    monthly_price: 2999, // $29.99
+    transaction_fee_rate: 0.028, // 2.8%
+    features: ['unlimited_catalogs', 'unlimited_events', 'unlimited_staff', 'analytics', 'export'],
+  },
+};
+
+// Validate Apple receipt with App Store Server API
+async function validateAppleReceipt(_receipt: string, transactionId: string): Promise<{
+  valid: boolean;
+  productId?: string;
+  expiresAt?: Date;
+  isTrialPeriod?: boolean;
+  autoRenewing?: boolean;
+  originalTransactionId?: string;
+}> {
+  // For production, implement App Store Server API v2 verification
+  // https://developer.apple.com/documentation/appstoreserverapi
+
+  // Check if Apple IAP is configured
+  if (!config.appleIap.keyId || !config.appleIap.issuerId || !config.appleIap.privateKey) {
+    logger.warn('Apple IAP not configured, using test mode validation');
+    // In development/test mode, accept the receipt as valid
+    // This allows testing the flow without full Apple integration
+    return {
+      valid: true,
+      productId: 'lumaproplan',
+      expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days from now
+      isTrialPeriod: false,
+      autoRenewing: true,
+      originalTransactionId: transactionId,
+    };
+  }
+
+  try {
+    // TODO: Implement full App Store Server API v2 verification
+    // 1. Create JWT using the private key
+    // 2. Call App Store Server API to verify the transaction
+    // 3. Parse and return the subscription info
+
+    logger.info('Apple receipt validation - production mode not yet implemented', { transactionId });
+    return { valid: false };
+  } catch (error) {
+    logger.error('Apple receipt validation failed', { error, transactionId });
+    return { valid: false };
+  }
+}
+
+// Validate Google Play purchase
+async function validateGooglePurchase(_purchaseToken: string, productId: string): Promise<{
+  valid: boolean;
+  expiresAt?: Date;
+  isTrialPeriod?: boolean;
+  autoRenewing?: boolean;
+}> {
+  // Check if Google Play is configured
+  if (!config.googlePlay.packageName || !config.googlePlay.credentials) {
+    logger.warn('Google Play not configured, using test mode validation');
+    // In development/test mode, accept the purchase as valid
+    return {
+      valid: true,
+      expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days from now
+      isTrialPeriod: false,
+      autoRenewing: true,
+    };
+  }
+
+  try {
+    // TODO: Implement full Google Play Developer API verification
+    // 1. Create OAuth2 client using service account credentials
+    // 2. Call subscriptions.get to verify the purchase
+    // 3. Parse and return the subscription info
+
+    logger.info('Google Play validation - production mode not yet implemented', { productId });
+    return { valid: false };
+  } catch (error) {
+    logger.error('Google Play validation failed', { error, productId });
+    return { valid: false };
+  }
+}
+
+// IAP Receipt Validation Route
+const validateReceiptRoute = createRoute({
+  method: 'post',
+  path: '/billing/validate-receipt',
+  summary: 'Validate IAP receipt and activate subscription',
+  description: 'Validates an Apple App Store or Google Play receipt and activates/updates the subscription',
+  tags: ['Billing'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: z.object({
+            platform: z.enum(['ios', 'android']),
+            productId: z.string(),
+            receipt: z.string(), // transactionReceipt (iOS) or purchaseToken (Android)
+            transactionId: z.string(),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Receipt validated successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            valid: z.boolean(),
+            isActive: z.boolean().optional(),
+            expiresAt: z.string().optional(),
+            isTrialPeriod: z.boolean().optional(),
+            autoRenewing: z.boolean().optional(),
+          }),
+        },
+      },
+    },
+    400: { description: 'Invalid receipt' },
+    401: { description: 'Unauthorized' },
+    500: { description: 'Internal server error' },
+  },
+});
+
+app.openapi(validateReceiptRoute, async (c) => {
+  const authHeader = c.req.header('Authorization');
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    const payload = await authService.verifyToken(token);
+    const user = await authService.getUserById(payload.userId);
+
+    if (!user) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    const body = await c.req.json();
+    const { platform, productId, receipt, transactionId } = body;
+
+    logger.info('IAP receipt validation requested', {
+      userId: user.id,
+      platform,
+      productId,
+      transactionId,
+    });
+
+    // Validate receipt based on platform
+    let validationResult: {
+      valid: boolean;
+      productId?: string;
+      expiresAt?: Date;
+      isTrialPeriod?: boolean;
+      autoRenewing?: boolean;
+      originalTransactionId?: string;
+    };
+
+    if (platform === 'ios') {
+      validationResult = await validateAppleReceipt(receipt, transactionId);
+    } else {
+      const googleResult = await validateGooglePurchase(receipt, productId);
+      validationResult = {
+        ...googleResult,
+        productId,
+        originalTransactionId: transactionId,
+      };
+    }
+
+    if (!validationResult.valid) {
+      logger.warn('IAP receipt validation failed', {
+        userId: user.id,
+        platform,
+        productId,
+      });
+      return c.json({ valid: false, isActive: false }, 200);
+    }
+
+    // Determine the subscription platform
+    const subscriptionPlatform: SubscriptionPlatform = platform === 'ios' ? 'apple' : 'google';
+
+    // Check for existing subscription
+    const existingSubRows = await query(
+      `SELECT * FROM subscriptions WHERE organization_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [user.organization_id]
+    );
+    const existingSub = existingSubRows[0];
+
+    // Check if user has had a PAID Stripe subscription before - they should use Stripe instead
+    // Only block if: platform is stripe, tier is pro/enterprise, and they completed payment (not 'incomplete')
+    const hasPaidStripeSubscription = existingSub &&
+      existingSub.platform === 'stripe' &&
+      (existingSub.tier === 'pro' || existingSub.tier === 'enterprise') &&
+      existingSub.status !== 'incomplete';
+
+    if (hasPaidStripeSubscription) {
+      logger.warn('User has existing paid Stripe subscription, cannot use IAP', {
+        userId: user.id,
+        existingTier: existingSub.tier,
+        existingPlatform: existingSub.platform,
+        existingStatus: existingSub.status,
+      });
+      return c.json({
+        valid: false,
+        isActive: false,
+        error: 'Please manage your subscription through the web portal',
+      }, 400);
+    }
+
+    // Create or update subscription
+    if (existingSub) {
+      // Update existing subscription
+      await query(
+        `UPDATE subscriptions SET
+          tier = 'pro',
+          status = 'active',
+          platform = $1,
+          current_period_end = $2,
+          monthly_price = $3,
+          transaction_fee_rate = $4,
+          features = $5,
+          apple_original_transaction_id = $6,
+          google_purchase_token = $7,
+          cancel_at = NULL,
+          canceled_at = NULL,
+          updated_at = NOW()
+        WHERE id = $8`,
+        [
+          subscriptionPlatform,
+          validationResult.expiresAt,
+          IAP_PRICING.pro.monthly_price,
+          IAP_PRICING.pro.transaction_fee_rate,
+          IAP_PRICING.pro.features,
+          platform === 'ios' ? validationResult.originalTransactionId : null,
+          platform === 'android' ? receipt : null,
+          existingSub.id,
+        ]
+      );
+
+      logger.info('Updated subscription via IAP', {
+        userId: user.id,
+        subscriptionId: existingSub.id,
+        platform: subscriptionPlatform,
+        expiresAt: validationResult.expiresAt,
+      });
+    } else {
+      // Create new subscription
+      await query(
+        `INSERT INTO subscriptions (
+          user_id, organization_id, tier, status, platform,
+          current_period_end, monthly_price, transaction_fee_rate, features,
+          apple_original_transaction_id, google_purchase_token
+        ) VALUES ($1, $2, 'pro', 'active', $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          user.id,
+          user.organization_id,
+          subscriptionPlatform,
+          validationResult.expiresAt,
+          IAP_PRICING.pro.monthly_price,
+          IAP_PRICING.pro.transaction_fee_rate,
+          IAP_PRICING.pro.features,
+          platform === 'ios' ? validationResult.originalTransactionId : null,
+          platform === 'android' ? receipt : null,
+        ]
+      );
+
+      logger.info('Created subscription via IAP', {
+        userId: user.id,
+        platform: subscriptionPlatform,
+        expiresAt: validationResult.expiresAt,
+      });
+    }
+
+    return c.json({
+      valid: true,
+      isActive: true,
+      expiresAt: validationResult.expiresAt?.toISOString(),
+      isTrialPeriod: validationResult.isTrialPeriod || false,
+      autoRenewing: validationResult.autoRenewing || true,
+    });
+
+  } catch (error: any) {
+    logger.error('IAP receipt validation error', { error: error.message });
+
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    return c.json({ error: 'Failed to validate receipt' }, 500);
   }
 });
 

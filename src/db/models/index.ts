@@ -26,6 +26,7 @@ export interface User {
   email_alerts: boolean;
   marketing_emails: boolean;
   weekly_reports: boolean;
+  onboarding_completed: boolean;
   avatar_image_id: string | null;
   session_version: number; // For single session enforcement
   // Staff invite fields

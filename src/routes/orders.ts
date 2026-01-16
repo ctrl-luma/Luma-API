@@ -290,6 +290,12 @@ app.openapi(updateOrderPaymentIntentRoute, async (c) => {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
 
+    logger.info('[ORDER DEBUG] Updating order with payment intent', {
+      orderId: id,
+      stripePaymentIntentId: body.stripePaymentIntentId,
+      organizationId: payload.organizationId,
+    });
+
     const rows = await query(
       `UPDATE orders
        SET stripe_payment_intent_id = $1, status = 'processing', updated_at = NOW()
@@ -299,14 +305,20 @@ app.openapi(updateOrderPaymentIntentRoute, async (c) => {
     );
 
     if (rows.length === 0) {
+      logger.warn('[ORDER DEBUG] Order not found for update', {
+        orderId: id,
+        organizationId: payload.organizationId,
+      });
       return c.json({ error: 'Order not found' }, 404);
     }
 
     const order = rows[0] as any;
 
-    logger.info('Order linked to PaymentIntent', {
+    logger.info('[ORDER DEBUG] Order successfully linked to PaymentIntent', {
       orderId: id,
       paymentIntentId: body.stripePaymentIntentId,
+      orderStatus: order.status,
+      stripePaymentIntentIdInDB: order.stripe_payment_intent_id,
     });
 
     return c.json({

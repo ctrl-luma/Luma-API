@@ -36,6 +36,7 @@ const LoginResponseSchema = z.object({
     marketingEmails: z.boolean(),
     weeklyReports: z.boolean(),
     avatarUrl: z.string().nullable(),
+    onboardingCompleted: z.boolean(),
   }),
   tokens: z.object({
     accessToken: z.string(),
@@ -167,14 +168,16 @@ app.openapi(loginRoute, async (c) => {
         });
 
         if (stripeSubscriptions.data.length > 0) {
-          const stripeSub = stripeSubscriptions.data[0];
+          const stripeSub = stripeSubscriptions.data[0] as any;
           const isActive = stripeSub.status === 'active' || stripeSub.status === 'trialing';
+          const periodEnd = stripeSub.current_period_end as number | undefined;
+          const periodStart = stripeSub.current_period_start as number | undefined;
           const isCanceledButValid = stripeSub.status === 'canceled' &&
-            stripeSub.current_period_end &&
-            stripeSub.current_period_end > Math.floor(Date.now() / 1000);
+            periodEnd &&
+            periodEnd > Math.floor(Date.now() / 1000);
 
           if (isActive || isCanceledButValid) {
-            const priceId = stripeSub.items.data[0]?.price?.id;
+            const priceId = stripeSub.items?.data?.[0]?.price?.id;
             const tier = priceId === config.stripe.proPriceId ? 'pro' :
                         priceId === config.stripe.enterprisePriceId ? 'enterprise' : 'pro';
             subscription = { tier, status: stripeSub.status };
@@ -203,8 +206,8 @@ app.openapi(loginRoute, async (c) => {
                 user.stripe_customer_id,
                 tier,
                 stripeSub.status,
-                stripeSub.current_period_start ? new Date(stripeSub.current_period_start * 1000) : null,
-                stripeSub.current_period_end ? new Date(stripeSub.current_period_end * 1000) : null,
+                periodStart ? new Date(periodStart * 1000) : null,
+                periodEnd ? new Date(periodEnd * 1000) : null,
               ]
             ).catch(err => logger.error('Failed to sync subscription to local DB', { error: err }));
           }
@@ -229,6 +232,7 @@ app.openapi(loginRoute, async (c) => {
         marketingEmails: user.marketing_emails,
         weeklyReports: user.weekly_reports,
         avatarUrl: imageService.getUrl(user.avatar_image_id),
+        onboardingCompleted: user.onboarding_completed ?? false,
       },
       organization: org ? {
         id: org.id,
@@ -543,6 +547,7 @@ const getCurrentUserRoute = createRoute({
             marketingEmails: z.boolean(),
             weeklyReports: z.boolean(),
             avatarUrl: z.string().nullable(),
+            onboardingCompleted: z.boolean(),
             createdAt: z.string(),
           }),
         },
@@ -607,15 +612,17 @@ app.openapi(getCurrentUserRoute, async (c) => {
         });
 
         if (stripeSubscriptions.data.length > 0) {
-          const stripeSub = stripeSubscriptions.data[0];
+          const stripeSub = stripeSubscriptions.data[0] as any;
           const isActive = stripeSub.status === 'active' || stripeSub.status === 'trialing';
+          const periodEnd = stripeSub.current_period_end as number | undefined;
+          const periodStart = stripeSub.current_period_start as number | undefined;
           const isCanceledButValid = stripeSub.status === 'canceled' &&
-            stripeSub.current_period_end &&
-            stripeSub.current_period_end > Math.floor(Date.now() / 1000);
+            periodEnd &&
+            periodEnd > Math.floor(Date.now() / 1000);
 
           if (isActive || isCanceledButValid) {
             // Determine tier from price ID
-            const priceId = stripeSub.items.data[0]?.price?.id;
+            const priceId = stripeSub.items?.data?.[0]?.price?.id;
             const tier = priceId === config.stripe.proPriceId ? 'pro' :
                         priceId === config.stripe.enterprisePriceId ? 'enterprise' : 'pro';
             subscription = { tier, status: stripeSub.status };
@@ -644,8 +651,8 @@ app.openapi(getCurrentUserRoute, async (c) => {
                 dbUser.stripe_customer_id,
                 tier,
                 stripeSub.status,
-                stripeSub.current_period_start ? new Date(stripeSub.current_period_start * 1000) : null,
-                stripeSub.current_period_end ? new Date(stripeSub.current_period_end * 1000) : null,
+                periodStart ? new Date(periodStart * 1000) : null,
+                periodEnd ? new Date(periodEnd * 1000) : null,
               ]
             ).catch(err => logger.error('Failed to sync subscription to local DB', { error: err }));
           }
@@ -669,6 +676,7 @@ app.openapi(getCurrentUserRoute, async (c) => {
       marketingEmails: dbUser.marketing_emails,
       weeklyReports: dbUser.weekly_reports,
       avatarUrl: imageService.getUrl(dbUser.avatar_image_id),
+      onboardingCompleted: dbUser.onboarding_completed ?? false,
       // Handle both Date object (from DB) and string (from cache)
       createdAt: typeof dbUser.created_at === 'string'
         ? dbUser.created_at
@@ -1357,6 +1365,73 @@ app.openapi(updateNotificationPreferencesRoute, async (c) => {
     }
     
     return c.json({ error: 'Failed to update notification preferences' }, 500);
+  }
+});
+
+// Complete onboarding endpoint
+const completeOnboardingRoute = createRoute({
+  method: 'post',
+  path: '/auth/complete-onboarding',
+  summary: 'Mark onboarding as complete',
+  description: 'Marks the user onboarding (e.g., Tap to Pay setup) as complete so it is not shown again',
+  tags: ['Authentication'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: {
+      description: 'Onboarding marked as complete',
+      content: {
+        'application/json': {
+          schema: z.object({
+            onboardingCompleted: z.boolean(),
+          }),
+        },
+      },
+    },
+    401: {
+      description: 'Unauthorized',
+    },
+    500: {
+      description: 'Internal server error',
+    },
+  },
+});
+
+app.openapi(completeOnboardingRoute, async (c) => {
+  const authHeader = c.req.header('Authorization');
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    const payload = await authService.verifyToken(token);
+
+    // Update the user's onboarding_completed flag
+    await query(
+      `UPDATE users SET onboarding_completed = TRUE, updated_at = NOW() WHERE id = $1`,
+      [payload.userId]
+    );
+
+    // Invalidate user cache
+    await cacheService.del(CacheKeys.user(payload.userId));
+    const user = await authService.getUserById(payload.userId);
+    if (user) {
+      await cacheService.del(CacheKeys.userByEmail(user.email));
+    }
+
+    logger.info('Onboarding completed', { userId: payload.userId });
+
+    return c.json({ onboardingCompleted: true });
+  } catch (error: any) {
+    logger.error('Complete onboarding error', { error });
+
+    if (error.message === 'Invalid token' || error.message === 'Token expired') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    return c.json({ error: 'Failed to complete onboarding' }, 500);
   }
 });
 
