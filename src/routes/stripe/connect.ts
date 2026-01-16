@@ -2492,6 +2492,93 @@ app.openapi(analyticsRoute, async (c) => {
   }
 });
 
+// ============================================
+// POST /stripe/connect/account-session - Create an Account Session for embedded onboarding
+// ============================================
+const createAccountSessionRoute = createRoute({
+  method: 'post',
+  path: '/stripe/connect/account-session',
+  summary: 'Create an Account Session for embedded onboarding',
+  description: 'Creates an Account Session that allows the embedded onboarding component to collect account information',
+  tags: ['Stripe Connect'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: {
+      description: 'Account session created successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            clientSecret: z.string(),
+            expiresAt: z.number(),
+            stripeAccountId: z.string(),
+          }),
+        },
+      },
+    },
+    401: { description: 'Unauthorized' },
+    404: { description: 'No connected account found' },
+  },
+});
+
+app.openapi(createAccountSessionRoute, async (c) => {
+  const authHeader = c.req.header('Authorization');
+  if (!authHeader?.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  try {
+    const token = authHeader.substring(7);
+    const { authService } = await import('../../services/auth');
+    const payload = await authService.verifyToken(token);
+
+    // Get the connected account for this organization
+    const rows = await query<StripeConnectedAccount>(
+      'SELECT * FROM stripe_connected_accounts WHERE organization_id = $1',
+      [payload.organizationId]
+    );
+
+    if (rows.length === 0) {
+      return c.json({ error: 'No connected account found' }, 404);
+    }
+
+    const connectedAccount = rows[0];
+
+    // Create an Account Session for embedded onboarding
+    const accountSession = await stripe.accountSessions.create({
+      account: connectedAccount.stripe_account_id,
+      components: {
+        account_onboarding: {
+          enabled: true,
+          features: {
+            external_account_collection: true,
+          },
+        },
+      },
+    });
+
+    logger.info('Account session created for embedded onboarding', {
+      organizationId: payload.organizationId,
+      stripeAccountId: connectedAccount.stripe_account_id,
+      expiresAt: accountSession.expires_at,
+    });
+
+    return c.json({
+      clientSecret: accountSession.client_secret,
+      expiresAt: accountSession.expires_at,
+      stripeAccountId: connectedAccount.stripe_account_id,
+    });
+  } catch (error: any) {
+    logger.error('Error creating account session', {
+      error: error.message || error,
+      stack: error.stack,
+    });
+    if (error instanceof Error && error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    return c.json({ error: 'Failed to create account session' }, 500);
+  }
+});
+
 export default app;
 
 // Export the sync function for use in webhooks
