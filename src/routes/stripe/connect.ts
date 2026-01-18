@@ -1083,7 +1083,7 @@ const listTransactionsRoute = createRoute({
       starting_after: z.string().optional(),
       ending_before: z.string().optional(),
       catalog_id: z.string().uuid().optional(),
-      customer_email: z.string().email().optional(),
+      customer_email: z.string().optional(), // Allow partial email for "contains" search
       date_from: z.string().transform(Number).optional(), // Unix timestamp
       date_to: z.string().transform(Number).optional(), // Unix timestamp
       amount_min: z.string().transform(Number).optional(), // In cents
@@ -1194,7 +1194,7 @@ app.openapi(listTransactionsRoute, async (c) => {
     }
     if (customerEmailFilter) {
       filteredCharges = filteredCharges.filter(
-        (charge) => charge.receipt_email?.toLowerCase() === customerEmailFilter
+        (charge) => charge.receipt_email?.toLowerCase().includes(customerEmailFilter)
       );
     }
     if (amountMin !== undefined) {

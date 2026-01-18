@@ -295,7 +295,10 @@ const createPaymentIntentRoute = createRoute({
             currency: z.string().length(3).optional().default('usd'),
             description: z.string().optional(),
             metadata: z.record(z.string()).optional(),
-            receiptEmail: z.string().email().optional(),
+            receiptEmail: z.preprocess(
+              (val) => (typeof val === 'string' && val.trim() === '' ? undefined : val),
+              z.string().email().optional()
+            ),
             captureMethod: z.enum(['automatic', 'manual']).optional().default('automatic').describe('Capture method for the payment'),
             paymentMethodType: z.enum(['card_present', 'card']).optional().default('card_present').describe('Payment method type: card_present for Tap to Pay, card for manual entry'),
           }),

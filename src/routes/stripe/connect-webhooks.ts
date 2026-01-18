@@ -222,14 +222,15 @@ async function handleConnectPayoutCreated(payout: any, connectedAccountId: strin
     const org = orgResult.rows[0];
 
     // Record the payout
-    await client.query(
+    const payoutResult = await client.query(
       `INSERT INTO payouts (
         organization_id, stripe_payout_id, amount, status,
         type, description, created_at
       ) VALUES ($1, $2, $3, 'processing', 'connect_payout', $4, NOW())
       ON CONFLICT (stripe_payout_id) DO UPDATE
       SET status = 'processing',
-          updated_at = NOW()`,
+          updated_at = NOW()
+      RETURNING id`,
       [
         org.id,
         payout.id,
@@ -246,7 +247,7 @@ async function handleConnectPayoutCreated(payout: any, connectedAccountId: strin
         org.id,
         'connect_payout.created',
         'payout',
-        payout.id,
+        payoutResult.rows[0].id,
         {
           amount: payout.amount / 100,
           currency: payout.currency,
@@ -267,31 +268,40 @@ async function handleConnectPayoutCreated(payout: any, connectedAccountId: strin
 
 async function handleConnectPayoutFailed(payout: any, connectedAccountId: string | undefined) {
   await transaction(async (client) => {
-    // Update payout status to failed
-    await client.query(
-      `UPDATE payouts 
+    // Update payout status to failed and get the payout UUID
+    const payoutResult = await client.query(
+      `UPDATE payouts
        SET status = 'failed',
            updated_at = NOW()
-       WHERE stripe_payout_id = $1`,
+       WHERE stripe_payout_id = $1
+       RETURNING id, organization_id`,
       [payout.id]
     );
 
-    // Find organization for logging
-    const orgResult = await client.query(
-      `SELECT id FROM organizations WHERE stripe_account_id = $1`,
-      [connectedAccountId]
-    );
+    // Find organization for logging (use payout record if available, otherwise query)
+    let orgId: string | null = null;
+    if (payoutResult.rows.length > 0) {
+      orgId = payoutResult.rows[0].organization_id;
+    } else {
+      const orgResult = await client.query(
+        `SELECT id FROM organizations WHERE stripe_account_id = $1`,
+        [connectedAccountId]
+      );
+      if (orgResult.rows.length > 0) {
+        orgId = orgResult.rows[0].id;
+      }
+    }
 
-    if (orgResult.rows.length > 0) {
+    if (orgId && payoutResult.rows.length > 0) {
       await client.query(
         `INSERT INTO audit_logs (
           organization_id, action, entity_type, entity_id, changes
         ) VALUES ($1, $2, $3, $4, $5)`,
         [
-          orgResult.rows[0].id,
+          orgId,
           'connect_payout.failed',
           'payout',
-          payout.id,
+          payoutResult.rows[0].id,
           {
             failure_code: payout.failure_code,
             failure_message: payout.failure_message,

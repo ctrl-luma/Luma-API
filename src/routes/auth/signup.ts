@@ -15,7 +15,27 @@ import { queueService, QueueName } from '../../services/queue';
 import Stripe from 'stripe';
 import { syncAccountFromStripe } from '../stripe/connect';
 
-const app = new OpenAPIHono();
+const app = new OpenAPIHono({
+  defaultHook: (result, c) => {
+    if (!result.success) {
+      logger.error('[Signup OpenAPI Validation Error]', {
+        path: c.req.path,
+        method: c.req.method,
+        errors: result.error.issues,
+        errorFlat: result.error.flatten(),
+      });
+      return c.json(
+        {
+          error: 'VALIDATION_ERROR',
+          message: 'Request validation failed',
+          details: result.error.issues,
+        },
+        400
+      );
+    }
+    return undefined;
+  },
+});
 
 const SignupRequestSchema = z.object({
   email: z.string().email(),
@@ -32,6 +52,14 @@ const SignupRequestSchema = z.object({
   expectedVolume: z.string().optional(),
   useCase: z.string().optional(),
   additionalRequirements: z.string().optional(),
+  // Signup source platform - determines subscription platform
+  // 'ios' -> 'apple', 'android' -> 'google', undefined -> 'stripe' (web)
+  signupPlatform: z.enum(['ios', 'android', 'web']).optional(),
+  // For in-app purchase (IAP) - mobile app signups with Pro purchase
+  iapPlatform: z.enum(['ios', 'android']).optional(),
+  iapReceipt: z.string().optional(), // Purchase token (Android) or receipt (iOS)
+  iapTransactionId: z.string().optional(), // Transaction ID from the IAP
+  iapProductId: z.string().optional(), // Product ID (e.g., 'lumaproplan')
 });
 
 const SignupResponseSchema = z.object({
@@ -97,13 +125,83 @@ const signupRoute = createRoute({
 });
 
 app.openapi(signupRoute, async (c) => {
-  const body = await c.req.json();
-  const validated = SignupRequestSchema.parse(body);
+  // Log raw request first
+  let body: any;
+  try {
+    body = await c.req.json();
+    logger.info('[Signup] ========== RAW REQUEST RECEIVED ==========', {
+      hasBody: !!body,
+      bodyKeys: body ? Object.keys(body) : [],
+      email: body?.email,
+      hasPassword: !!body?.password,
+      passwordLength: body?.password?.length || 0,
+      firstName: body?.firstName,
+      lastName: body?.lastName,
+      organizationName: body?.organizationName,
+      subscriptionTier: body?.subscriptionTier,
+      acceptTerms: body?.acceptTerms,
+      acceptPrivacy: body?.acceptPrivacy,
+      hasIapData: !!(body?.iapPlatform && body?.iapReceipt),
+      iapPlatform: body?.iapPlatform,
+    });
+  } catch (parseError: any) {
+    logger.error('[Signup] Failed to parse request body', {
+      error: parseError.message,
+    });
+    return c.json({
+      error: 'INVALID_JSON',
+      message: 'Failed to parse request body as JSON'
+    }, 400);
+  }
+
+  // Validate with Zod
+  let validated;
+  try {
+    validated = SignupRequestSchema.parse(body);
+    logger.info('[Signup] Zod validation passed');
+  } catch (zodError: any) {
+    logger.error('[Signup] ========== ZOD VALIDATION FAILED ==========', {
+      errors: zodError.errors || zodError.issues,
+      message: zodError.message,
+      body: {
+        email: body?.email,
+        hasPassword: !!body?.password,
+        passwordLength: body?.password?.length || 0,
+        firstName: body?.firstName,
+        lastName: body?.lastName,
+        organizationName: body?.organizationName,
+        subscriptionTier: body?.subscriptionTier,
+        acceptTerms: body?.acceptTerms,
+        acceptPrivacy: body?.acceptPrivacy,
+      }
+    });
+    return c.json({
+      error: 'VALIDATION_ERROR',
+      message: 'Request validation failed',
+      details: zodError.errors || zodError.issues,
+    }, 400);
+  }
+
+  // Log incoming signup request
+  logger.info('[Signup] ========== NEW SIGNUP REQUEST ==========', {
+    email: validated.email,
+    tier: validated.subscriptionTier,
+    hasIapData: !!(validated.iapPlatform && validated.iapReceipt),
+    iapPlatform: validated.iapPlatform || null,
+    iapProductId: validated.iapProductId || null,
+    iapTransactionId: validated.iapTransactionId || null,
+    iapReceiptLength: validated.iapReceipt?.length || 0,
+    iapReceiptPreview: validated.iapReceipt ? validated.iapReceipt.substring(0, 30) + '...' : null,
+  });
 
   if (!validated.acceptTerms || !validated.acceptPrivacy) {
-    return c.json({ 
+    logger.warn('[Signup] Terms/Privacy not accepted', {
+      acceptTerms: validated.acceptTerms,
+      acceptPrivacy: validated.acceptPrivacy,
+    });
+    return c.json({
       error: 'TERMS_NOT_ACCEPTED',
-      message: 'You must accept the terms of service and privacy policy to create an account' 
+      message: 'You must accept the terms of service and privacy policy to create an account'
     }, 400);
   }
 
@@ -235,15 +333,52 @@ app.openapi(signupRoute, async (c) => {
         }
       }
 
-      // 5. Create subscription based on tier
+      // 5. Create subscription based on tier and payment method
       const pricing = PRICING_BY_TIER[validated.subscriptionTier];
       const features = DEFAULT_FEATURES_BY_TIER[validated.subscriptionTier];
-      
+
       let subscriptionStatus = 'active';
       let stripeSubscriptionId = null;
-      
-      // For pro tier, create subscription with trial and collect payment method
-      if (validated.subscriptionTier === 'pro' && config.stripe.proPriceId) {
+
+      // Determine subscription platform based on signup source
+      // Mobile app signups (ios/android) get 'apple'/'google' platform
+      // Web signups get 'stripe' platform
+      let subscriptionPlatform: 'stripe' | 'apple' | 'google' = 'stripe';
+      if (validated.signupPlatform === 'ios') {
+        subscriptionPlatform = 'apple';
+      } else if (validated.signupPlatform === 'android') {
+        subscriptionPlatform = 'google';
+      }
+
+      // Check if this is an IAP (in-app purchase) signup with a Pro purchase
+      const isIapSignup = validated.iapPlatform && validated.iapReceipt;
+
+      logger.info('[Signup] Platform check', {
+        signupPlatform: validated.signupPlatform,
+        subscriptionPlatform,
+        isIapSignup,
+        iapPlatform: validated.iapPlatform,
+        hasReceipt: !!validated.iapReceipt,
+        receiptLength: validated.iapReceipt?.length || 0,
+      });
+
+      if (isIapSignup) {
+        // IAP signup with Pro purchase - the purchase was already made in the app
+        // Platform should already be set from signupPlatform, but ensure consistency
+        subscriptionPlatform = validated.iapPlatform === 'ios' ? 'apple' : 'google';
+        subscriptionStatus = 'active'; // IAP purchase already completed
+
+        logger.info('[Signup] ========== IAP SIGNUP DETECTED ==========', {
+          platform: validated.iapPlatform,
+          productId: validated.iapProductId,
+          transactionId: validated.iapTransactionId,
+          tier: validated.subscriptionTier,
+          receiptPreview: validated.iapReceipt?.substring(0, 50) + '...',
+          willStoreAsGoogleToken: validated.iapPlatform === 'android',
+          willStoreAsAppleTransaction: validated.iapPlatform === 'ios',
+        });
+      } else if (subscriptionPlatform === 'stripe' && validated.subscriptionTier === 'pro' && config.stripe.proPriceId) {
+        // Web/Stripe signup - create subscription with trial
         // With a trial, we use pending_setup_intent to collect payment method upfront
         // The customer won't be charged until the trial ends
         const subscription = await stripe.subscriptions.create({
@@ -276,13 +411,31 @@ app.openapi(signupRoute, async (c) => {
         subscriptionStatus = 'pending_approval';
       }
 
+      // Build subscription insert query based on whether it's IAP or Stripe
+      // Prepare values for logging
+      const appleTransactionToStore = validated.iapPlatform === 'ios' ? validated.iapTransactionId : null;
+      const googleTokenToStore = validated.iapPlatform === 'android' ? validated.iapReceipt : null;
+
+      logger.info('[Signup] Preparing subscription INSERT', {
+        userId: user.id,
+        organizationId: organization.id,
+        tier: validated.subscriptionTier,
+        status: subscriptionStatus,
+        platform: subscriptionPlatform,
+        isIapSignup,
+        appleTransactionId: appleTransactionToStore,
+        googlePurchaseTokenLength: googleTokenToStore?.length || 0,
+        googlePurchaseTokenPreview: googleTokenToStore ? googleTokenToStore.substring(0, 50) + '...' : null,
+      });
+
       const subscriptionResult = await client.query(
         `INSERT INTO subscriptions (
           user_id, organization_id, stripe_customer_id,
           tier, status, stripe_subscription_id,
           monthly_price, transaction_fee_rate, features,
-          metadata, platform
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'stripe')
+          metadata, platform,
+          apple_original_transaction_id, google_purchase_token
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         RETURNING *`,
         [
           user.id,
@@ -294,10 +447,39 @@ app.openapi(signupRoute, async (c) => {
           pricing.monthly_price,
           pricing.transaction_fee_rate,
           features,
-          validated.subscriptionTier === 'pro' ? { price_id: config.stripe.proPriceId } : {},
+          validated.subscriptionTier === 'pro' && !isIapSignup ? { price_id: config.stripe.proPriceId } : {},
+          subscriptionPlatform,
+          // Store IAP identifiers
+          appleTransactionToStore,
+          googleTokenToStore,
         ]
       );
       const subscription = subscriptionResult.rows[0];
+
+      logger.info('[Signup] Subscription created in database', {
+        subscriptionId: subscription.id,
+        platform: subscription.platform,
+        status: subscription.status,
+        tier: subscription.tier,
+        hasGoogleToken: !!subscription.google_purchase_token,
+        hasAppleTransaction: !!subscription.apple_original_transaction_id,
+        googleTokenInDb: subscription.google_purchase_token ? subscription.google_purchase_token.substring(0, 30) + '...' : null,
+      });
+
+      if (isIapSignup) {
+        logger.info('[Signup] ========== IAP SUBSCRIPTION SAVED ==========', {
+          subscriptionId: subscription.id,
+          userId: user.id,
+          organizationId: organization.id,
+          platform: subscriptionPlatform,
+          tier: validated.subscriptionTier,
+          status: subscriptionStatus,
+          googlePurchaseToken: validated.iapPlatform === 'android' ? validated.iapReceipt?.substring(0, 30) + '...' : null,
+          googlePurchaseTokenFullLength: validated.iapPlatform === 'android' ? validated.iapReceipt?.length : null,
+          appleTransactionId: validated.iapPlatform === 'ios' ? validated.iapTransactionId : null,
+          storedInColumn: validated.iapPlatform === 'android' ? 'google_purchase_token' : 'apple_original_transaction_id',
+        });
+      }
 
       // 6. Handle tier-specific flows
       // Note: Stripe Connect account creation has been disabled

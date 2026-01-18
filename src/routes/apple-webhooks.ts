@@ -3,6 +3,8 @@ import { logger } from '../utils/logger';
 import { query } from '../db';
 import { DEFAULT_FEATURES_BY_TIER, PRICING_BY_TIER } from '../db/models/subscription';
 import { staffService } from '../services/staff';
+import { socketService, SocketEvents } from '../services/socket';
+import { cacheService, CacheKeys } from '../services/redis/cache';
 
 const app = new Hono();
 
@@ -223,7 +225,7 @@ async function handleAppleSubscribed(transaction: AppleTransactionInfo, _renewal
 
   // Find subscription by Apple original transaction ID
   const subRows = await query(
-    `SELECT s.*, u.organization_id
+    `SELECT s.*, u.organization_id, u.email as user_email
      FROM subscriptions s
      JOIN users u ON s.user_id = u.id
      WHERE s.apple_original_transaction_id = $1`,
@@ -260,12 +262,25 @@ async function handleAppleSubscribed(transaction: AppleTransactionInfo, _renewal
     ]
   );
 
+  // Invalidate user cache since subscription data is included in /auth/me
+  await cacheService.del(CacheKeys.user(sub.user_id));
+  if (sub.user_email) {
+    await cacheService.del(CacheKeys.userByEmail(sub.user_email));
+  }
+
   // Re-enable staff accounts if needed
   try {
     await staffService.enableAllStaff(sub.organization_id);
   } catch (error) {
     logger.error('Failed to enable staff accounts', { error, organizationId: sub.organization_id });
   }
+
+  // Emit socket event so app UI updates
+  socketService.emitToOrganization(sub.organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+    status: 'active',
+    tier: 'pro',
+    platform: 'apple',
+  });
 }
 
 async function handleAppleRenewed(transaction: AppleTransactionInfo, _renewal: AppleRenewalInfo | null) {
@@ -275,6 +290,15 @@ async function handleAppleRenewed(transaction: AppleTransactionInfo, _renewal: A
     originalTransactionId,
     newExpiresDate: expiresDate ? new Date(expiresDate) : null,
   });
+
+  // Get the subscription to find organization_id for socket event
+  const subRows = await query<{ id: string; organization_id: string; user_id: string; user_email: string }>(
+    `SELECT s.id, s.user_id, u.organization_id, u.email as user_email
+     FROM subscriptions s
+     JOIN users u ON s.user_id = u.id
+     WHERE s.apple_original_transaction_id = $1`,
+    [originalTransactionId]
+  );
 
   await query(
     `UPDATE subscriptions
@@ -287,6 +311,21 @@ async function handleAppleRenewed(transaction: AppleTransactionInfo, _renewal: A
       originalTransactionId,
     ]
   );
+
+  // Emit socket event so app UI updates
+  if (subRows.length > 0) {
+    // Invalidate user cache since subscription data is included in /auth/me
+    await cacheService.del(CacheKeys.user(subRows[0].user_id));
+    if (subRows[0].user_email) {
+      await cacheService.del(CacheKeys.userByEmail(subRows[0].user_email));
+    }
+
+    socketService.emitToOrganization(subRows[0].organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+      status: 'active',
+      tier: 'pro',
+      platform: 'apple',
+    });
+  }
 }
 
 async function handleAppleRenewalFailed(transaction: AppleTransactionInfo, renewal: AppleRenewalInfo) {
@@ -299,6 +338,15 @@ async function handleAppleRenewalFailed(transaction: AppleTransactionInfo, renew
     isInBillingRetryPeriod,
   });
 
+  // Get the subscription to find organization_id for socket event
+  const subRows = await query<{ id: string; organization_id: string; user_id: string; user_email: string }>(
+    `SELECT s.id, s.user_id, u.organization_id, u.email as user_email
+     FROM subscriptions s
+     JOIN users u ON s.user_id = u.id
+     WHERE s.apple_original_transaction_id = $1`,
+    [originalTransactionId]
+  );
+
   // Set to past_due but don't cancel yet (Apple has grace period and retry)
   await query(
     `UPDATE subscriptions
@@ -307,6 +355,21 @@ async function handleAppleRenewalFailed(transaction: AppleTransactionInfo, renew
      WHERE apple_original_transaction_id = $1`,
     [originalTransactionId]
   );
+
+  // Emit socket event so app UI updates
+  if (subRows.length > 0) {
+    // Invalidate user cache since subscription data is included in /auth/me
+    await cacheService.del(CacheKeys.user(subRows[0].user_id));
+    if (subRows[0].user_email) {
+      await cacheService.del(CacheKeys.userByEmail(subRows[0].user_email));
+    }
+
+    socketService.emitToOrganization(subRows[0].organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+      status: 'past_due',
+      tier: 'pro',
+      platform: 'apple',
+    });
+  }
 }
 
 async function handleAppleExpired(transaction: AppleTransactionInfo, subtype?: string) {
@@ -317,8 +380,8 @@ async function handleAppleExpired(transaction: AppleTransactionInfo, subtype?: s
     subtype,
   });
 
-  const subRows = await query(
-    `SELECT s.*, u.organization_id
+  const subRows = await query<{ id: string; organization_id: string; user_id: string; user_email: string }>(
+    `SELECT s.id, s.user_id, u.organization_id, u.email as user_email
      FROM subscriptions s
      JOIN users u ON s.user_id = u.id
      WHERE s.apple_original_transaction_id = $1`,
@@ -339,12 +402,25 @@ async function handleAppleExpired(transaction: AppleTransactionInfo, subtype?: s
       [DEFAULT_FEATURES_BY_TIER.starter, sub.id]
     );
 
+    // Invalidate user cache since subscription data is included in /auth/me
+    await cacheService.del(CacheKeys.user(sub.user_id));
+    if (sub.user_email) {
+      await cacheService.del(CacheKeys.userByEmail(sub.user_email));
+    }
+
     // Disable staff accounts
     try {
       await staffService.disableAllStaff(sub.organization_id);
     } catch (error) {
       logger.error('Failed to disable staff accounts', { error, organizationId: sub.organization_id });
     }
+
+    // Emit socket event so app UI updates
+    socketService.emitToOrganization(sub.organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+      status: 'canceled',
+      tier: 'starter',
+      platform: 'apple',
+    });
   }
 }
 
@@ -357,6 +433,15 @@ async function handleAppleRenewalStatusChanged(transaction: AppleTransactionInfo
     autoRenewStatus,
     expirationIntent,
   });
+
+  // Get the subscription to find organization_id for socket event
+  const subRows = await query<{ id: string; organization_id: string; status: string; tier: string; user_id: string; user_email: string }>(
+    `SELECT s.id, s.user_id, u.organization_id, s.status, s.tier, u.email as user_email
+     FROM subscriptions s
+     JOIN users u ON s.user_id = u.id
+     WHERE s.apple_original_transaction_id = $1`,
+    [originalTransactionId]
+  );
 
   if (autoRenewStatus === 0) {
     // User disabled auto-renew - subscription will end at current period
@@ -372,6 +457,22 @@ async function handleAppleRenewalStatusChanged(transaction: AppleTransactionInfo
         originalTransactionId,
       ]
     );
+
+    // Emit socket event - subscription is still active but scheduled to cancel
+    if (subRows.length > 0) {
+      // Invalidate user cache since subscription data is included in /auth/me
+      await cacheService.del(CacheKeys.user(subRows[0].user_id));
+      if (subRows[0].user_email) {
+        await cacheService.del(CacheKeys.userByEmail(subRows[0].user_email));
+      }
+
+      socketService.emitToOrganization(subRows[0].organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+        status: subRows[0].status, // Still active/trialing until period ends
+        tier: subRows[0].tier,
+        platform: 'apple',
+        cancelAt: expiresDate ? new Date(expiresDate).toISOString() : null,
+      });
+    }
   } else {
     // User re-enabled auto-renew
     await query(
@@ -382,6 +483,22 @@ async function handleAppleRenewalStatusChanged(transaction: AppleTransactionInfo
        WHERE apple_original_transaction_id = $1`,
       [originalTransactionId]
     );
+
+    // Emit socket event - cancellation reverted
+    if (subRows.length > 0) {
+      // Invalidate user cache since subscription data is included in /auth/me
+      await cacheService.del(CacheKeys.user(subRows[0].user_id));
+      if (subRows[0].user_email) {
+        await cacheService.del(CacheKeys.userByEmail(subRows[0].user_email));
+      }
+
+      socketService.emitToOrganization(subRows[0].organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+        status: subRows[0].status,
+        tier: subRows[0].tier,
+        platform: 'apple',
+        cancelAt: null,
+      });
+    }
   }
 }
 
@@ -397,8 +514,8 @@ async function handleAppleRefund(transaction: AppleTransactionInfo) {
     originalTransactionId,
   });
 
-  const subRows = await query(
-    `SELECT s.*, u.organization_id
+  const subRows = await query<{ id: string; organization_id: string; user_id: string; user_email: string }>(
+    `SELECT s.id, s.user_id, u.organization_id, u.email as user_email
      FROM subscriptions s
      JOIN users u ON s.user_id = u.id
      WHERE s.apple_original_transaction_id = $1`,
@@ -419,12 +536,26 @@ async function handleAppleRefund(transaction: AppleTransactionInfo) {
       [DEFAULT_FEATURES_BY_TIER.starter, sub.id]
     );
 
+    // Invalidate user cache since subscription data is included in /auth/me
+    await cacheService.del(CacheKeys.user(sub.user_id));
+    if (sub.user_email) {
+      await cacheService.del(CacheKeys.userByEmail(sub.user_email));
+    }
+
     // Disable staff accounts
     try {
       await staffService.disableAllStaff(sub.organization_id);
     } catch (error) {
       logger.error('Failed to disable staff accounts', { error, organizationId: sub.organization_id });
     }
+
+    // Emit socket event so app/vendor UI updates
+    socketService.emitToOrganization(sub.organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+      status: 'canceled',
+      tier: 'starter',
+      platform: 'apple',
+      reason: 'refund',
+    });
   }
 }
 

@@ -162,6 +162,8 @@ export class StripeService {
     cancelUrl: string;
     metadata?: Record<string, string>;
     mode?: 'payment' | 'subscription';
+    trialPeriodDays?: number;
+    couponId?: string;
   }) {
     try {
       const session = await stripe.checkout.sessions.create({
@@ -176,8 +178,16 @@ export class StripeService {
         success_url: params.successUrl,
         cancel_url: params.cancelUrl,
         metadata: params.metadata,
-        allow_promotion_codes: true,
         billing_address_collection: 'required',
+        // Add trial period for subscriptions
+        subscription_data: params.mode === 'subscription' && params.trialPeriodDays ? {
+          trial_period_days: params.trialPeriodDays,
+        } : undefined,
+        // Can't use both allow_promotion_codes and discounts - Stripe doesn't allow it
+        // If we have a coupon, use discounts; otherwise allow promo codes
+        ...(params.couponId
+          ? { discounts: [{ coupon: params.couponId }] }
+          : { allow_promotion_codes: true }),
       });
       
       logger.info('Checkout session created', { 

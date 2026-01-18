@@ -35,7 +35,27 @@ import tipsRoutes from './routes/tips';
 import staffRoutes from './routes/staff';
 import splitsRoutes from './routes/splits';
 
-const app = new OpenAPIHono();
+const app = new OpenAPIHono({
+  defaultHook: (result, c) => {
+    if (!result.success) {
+      winstonLogger.error('[OpenAPI Validation Error]', {
+        path: c.req.path,
+        method: c.req.method,
+        errors: result.error.issues,
+        errorFlat: result.error.flatten(),
+      });
+      return c.json(
+        {
+          error: 'VALIDATION_ERROR',
+          message: 'Request validation failed',
+          details: result.error.issues,
+        },
+        400
+      );
+    }
+    return undefined;
+  },
+});
 
 // Register security scheme
 app.openAPIRegistry.registerComponent('securitySchemes', 'bearerAuth', {

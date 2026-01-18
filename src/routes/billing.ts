@@ -909,15 +909,24 @@ app.openapi(createUpgradeSessionRoute, async (c) => {
     const existingSub = existingSubRows[0];
 
     if (existingSub) {
-      const isActive = existingSub.status === 'active' || existingSub.status === 'trialing';
+      // Check if subscription is currently active
+      // "Active" means: status is active/trialing, OR canceled but still within the billing period
+      const now = new Date();
+      const periodEnd = existingSub.current_period_end ? new Date(existingSub.current_period_end) : null;
+      const isStatusActive = existingSub.status === 'active' || existingSub.status === 'trialing';
+      const isCanceledButStillValid = existingSub.status === 'canceled' && periodEnd && periodEnd > now;
+      const isCurrentlyActive = isStatusActive || isCanceledButStillValid;
+
       const isMobilePlatform = existingSub.platform === 'apple' || existingSub.platform === 'google';
 
-      if (isActive && isMobilePlatform && existingSub.tier !== 'starter') {
+      if (isCurrentlyActive && isMobilePlatform && existingSub.tier !== 'starter') {
         const storeName = existingSub.platform === 'apple' ? 'App Store' : 'Google Play';
         logger.info('User tried to create Stripe upgrade but has active mobile subscription', {
           userId: user.id,
           platform: existingSub.platform,
           tier: existingSub.tier,
+          status: existingSub.status,
+          periodEnd: periodEnd?.toISOString(),
         });
         return c.json({
           error: `You have an active subscription through ${storeName}. Please manage your subscription in the ${storeName}.`,
@@ -962,9 +971,27 @@ app.openapi(createUpgradeSessionRoute, async (c) => {
       return c.json({ error: 'Already have an active subscription' }, 400);
     }
 
+    // Check trial eligibility - users who never had a Stripe subscription get:
+    // - 7 day free trial
+    // - $10 off first month (via coupon)
+    const allSubscriptions = await stripe.subscriptions.list({
+      customer: customerId,
+      status: 'all', // Include canceled, past_due, etc.
+      limit: 1,
+    });
+    const hadStripeSubscription = allSubscriptions.data.length > 0;
+    const trialEligible = !hadStripeSubscription;
+
+    logger.info('Trial eligibility for upgrade', {
+      userId: user.id,
+      customerId,
+      hadStripeSubscription,
+      trialEligible,
+    });
+
     const returnUrl = config.email.dashboardUrl || 'https://portal.lumapos.co';
 
-    // Create checkout session
+    // Create checkout session with trial and discount for eligible users
     const session = await stripeService.createCheckoutSession({
       customer: customerId,
       price: config.stripe.proPriceId,
@@ -976,6 +1003,10 @@ app.openapi(createUpgradeSessionRoute, async (c) => {
         email: user.email,
       },
       mode: 'subscription',
+      // Apply 7-day trial for eligible users
+      trialPeriodDays: trialEligible ? 7 : undefined,
+      // Apply $10 off coupon for eligible users
+      couponId: trialEligible ? 'first-month-discount' : undefined,
     });
 
     logger.info('Upgrade checkout session created', {
@@ -1187,15 +1218,13 @@ app.openapi(validateReceiptRoute, async (c) => {
     );
     const existingSub = existingSubRows[0];
 
-    // Check if user has had a PAID Stripe subscription before - they should use Stripe instead
-    // Only block if: platform is stripe, tier is pro/enterprise, and they completed payment (not 'incomplete')
-    const hasPaidStripeSubscription = existingSub &&
-      existingSub.platform === 'stripe' &&
-      (existingSub.tier === 'pro' || existingSub.tier === 'enterprise') &&
-      existingSub.status !== 'incomplete';
+    // Check if user is on the Stripe platform - they are locked to Stripe forever
+    // Once a user signs up via website OR purchases a Stripe subscription, they cannot use IAP
+    // This prevents platform switching and ensures consistent billing management
+    const isStripePlatformUser = existingSub && existingSub.platform === 'stripe';
 
-    if (hasPaidStripeSubscription) {
-      logger.warn('User has existing paid Stripe subscription, cannot use IAP', {
+    if (isStripePlatformUser) {
+      logger.warn('User is on Stripe platform, cannot use IAP', {
         userId: user.id,
         existingTier: existingSub.tier,
         existingPlatform: existingSub.platform,

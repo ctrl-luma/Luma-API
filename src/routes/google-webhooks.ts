@@ -5,6 +5,8 @@ import { query } from '../db';
 import { config } from '../config';
 import { DEFAULT_FEATURES_BY_TIER, PRICING_BY_TIER } from '../db/models/subscription';
 import { staffService } from '../services/staff';
+import { socketService, SocketEvents } from '../services/socket';
+import { cacheService, CacheKeys } from '../services/redis/cache';
 
 const app = new Hono();
 
@@ -30,23 +32,48 @@ let playClient: androidpublisher_v3.Androidpublisher | null = null;
 function getPlayClient(): androidpublisher_v3.Androidpublisher | null {
   if (playClient) return playClient;
 
-  if (!config.googlePlay.credentials) {
+  const credentialsRaw = config.googlePlay.credentials;
+
+  logger.info('[GoogleWebhook] Checking Google Play credentials', {
+    hasCredentials: !!credentialsRaw,
+    credentialsLength: credentialsRaw?.length || 0,
+    credentialsPreview: credentialsRaw ? credentialsRaw.substring(0, 50) + '...' : 'EMPTY',
+    packageName: config.googlePlay.packageName,
+  });
+
+  if (!credentialsRaw) {
     logger.warn('[GoogleWebhook] GOOGLE_PLAY_CREDENTIALS not configured - cannot validate purchases');
     return null;
   }
 
   try {
-    const credentials = JSON.parse(config.googlePlay.credentials);
+    logger.info('[GoogleWebhook] Parsing credentials JSON...');
+    const credentials = JSON.parse(credentialsRaw);
+
+    logger.info('[GoogleWebhook] Credentials parsed successfully', {
+      type: credentials.type,
+      projectId: credentials.project_id,
+      clientEmail: credentials.client_email,
+      hasPrivateKey: !!credentials.private_key,
+      privateKeyLength: credentials.private_key?.length || 0,
+    });
+
+    logger.info('[GoogleWebhook] Creating GoogleAuth...');
     const auth = new google.auth.GoogleAuth({
       credentials,
       scopes: ['https://www.googleapis.com/auth/androidpublisher'],
     });
 
+    logger.info('[GoogleWebhook] Creating androidpublisher client...');
     playClient = google.androidpublisher({ version: 'v3', auth });
-    logger.info('[GoogleWebhook] Google Play API client initialized');
+    logger.info('[GoogleWebhook] Google Play API client initialized successfully');
     return playClient;
-  } catch (error) {
-    logger.error('[GoogleWebhook] Failed to initialize Google Play API client', { error });
+  } catch (error: any) {
+    logger.error('[GoogleWebhook] Failed to initialize Google Play API client', {
+      errorMessage: error?.message || 'Unknown error',
+      errorName: error?.name || 'Unknown',
+      errorStack: error?.stack?.substring(0, 500) || 'No stack',
+    });
     return null;
   }
 }
@@ -415,7 +442,7 @@ async function handleGoogleSubscribed(
 
   // Find subscription by Google purchase token
   const subRows = await query(
-    `SELECT s.*, u.organization_id
+    `SELECT s.*, u.organization_id, u.email as user_email
      FROM subscriptions s
      JOIN users u ON s.user_id = u.id
      WHERE s.google_purchase_token = $1`,
@@ -459,9 +486,22 @@ async function handleGoogleSubscribed(
     ]
   );
 
+  // Invalidate user cache since subscription data is included in /auth/me
+  await cacheService.del(CacheKeys.user(sub.user_id));
+  if (sub.user_email) {
+    await cacheService.del(CacheKeys.userByEmail(sub.user_email));
+  }
+
   logger.info('[GoogleWebhook] Subscription updated to Pro', {
     subscriptionId: sub.id,
     organizationId: sub.organization_id,
+  });
+
+  // Emit socket event for real-time updates
+  socketService.emitToOrganization(sub.organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+    status: 'active',
+    tier: 'pro',
+    platform: 'google',
   });
 
   // Enable staff accounts
@@ -482,6 +522,15 @@ async function handleGoogleRenewed(purchaseToken: string, subscriptionId: string
     subscriptionId,
   });
 
+  // Get subscription info before update
+  const subRows = await query(
+    `SELECT s.user_id, u.organization_id, u.email as user_email
+     FROM subscriptions s
+     JOIN users u ON s.user_id = u.id
+     WHERE s.google_purchase_token = $1`,
+    [purchaseToken]
+  );
+
   const rows = await query(
     `UPDATE subscriptions
      SET status = 'active',
@@ -492,9 +541,24 @@ async function handleGoogleRenewed(purchaseToken: string, subscriptionId: string
   );
 
   if (rows.length > 0) {
+    // Invalidate user cache since subscription data is included in /auth/me
+    if (subRows.length > 0) {
+      await cacheService.del(CacheKeys.user(subRows[0].user_id));
+      if (subRows[0].user_email) {
+        await cacheService.del(CacheKeys.userByEmail(subRows[0].user_email));
+      }
+    }
+
     logger.info('[GoogleWebhook] Subscription renewed', {
       subscriptionId: rows[0].id,
       organizationId: rows[0].organization_id,
+    });
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(rows[0].organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+      status: 'active',
+      tier: 'pro',
+      platform: 'google',
     });
   } else {
     logger.warn('[GoogleWebhook] No subscription found to renew', {
@@ -510,7 +574,7 @@ async function handleGoogleRecovered(purchaseToken: string, subscriptionId: stri
   });
 
   const subRows = await query(
-    `SELECT s.*, u.organization_id
+    `SELECT s.*, u.organization_id, u.email as user_email
      FROM subscriptions s
      JOIN users u ON s.user_id = u.id
      WHERE s.google_purchase_token = $1`,
@@ -530,9 +594,22 @@ async function handleGoogleRecovered(purchaseToken: string, subscriptionId: stri
       [DEFAULT_FEATURES_BY_TIER.pro, sub.id]
     );
 
+    // Invalidate user cache since subscription data is included in /auth/me
+    await cacheService.del(CacheKeys.user(sub.user_id));
+    if (sub.user_email) {
+      await cacheService.del(CacheKeys.userByEmail(sub.user_email));
+    }
+
     logger.info('[GoogleWebhook] Subscription recovered', {
       subscriptionId: sub.id,
       organizationId: sub.organization_id,
+    });
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(sub.organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+      status: 'active',
+      tier: 'pro',
+      platform: 'google',
     });
 
     // Re-enable staff accounts
@@ -567,21 +644,73 @@ async function handleGoogleCanceled(purchaseToken: string, subscriptionId: strin
     subscriptionId,
   });
 
+  // Get subscription info before update
+  const subRows = await query(
+    `SELECT s.user_id, u.organization_id, u.email as user_email
+     FROM subscriptions s
+     JOIN users u ON s.user_id = u.id
+     WHERE s.google_purchase_token = $1`,
+    [purchaseToken]
+  );
+
+  // Get expiration date from Google Play API
+  const client = getPlayClient();
+  let expiryTime: Date | null = null;
+
+  if (client && config.googlePlay.packageName) {
+    try {
+      const response = await client.purchases.subscriptionsv2.get({
+        packageName: config.googlePlay.packageName,
+        token: purchaseToken,
+      });
+
+      const lineItem = response.data.lineItems?.[0];
+      if (lineItem?.expiryTime) {
+        expiryTime = new Date(lineItem.expiryTime);
+        logger.info('[GoogleWebhook] Got expiry time from Google Play API', {
+          expiryTime: expiryTime.toISOString(),
+        });
+      }
+    } catch (error: any) {
+      logger.warn('[GoogleWebhook] Could not get expiry time from Google Play API', {
+        error: error.message,
+      });
+    }
+  }
+
   // User canceled but subscription remains active until period ends
   const rows = await query(
     `UPDATE subscriptions
      SET canceled_at = NOW(),
+         cancel_at = $2,
          updated_at = NOW()
      WHERE google_purchase_token = $1
      RETURNING id, organization_id, current_period_end`,
-    [purchaseToken]
+    [purchaseToken, expiryTime]
   );
 
   if (rows.length > 0) {
+    // Invalidate user cache since subscription data is included in /auth/me
+    if (subRows.length > 0) {
+      await cacheService.del(CacheKeys.user(subRows[0].user_id));
+      if (subRows[0].user_email) {
+        await cacheService.del(CacheKeys.userByEmail(subRows[0].user_email));
+      }
+    }
+
     logger.info('[GoogleWebhook] Subscription marked as canceled', {
       subscriptionId: rows[0].id,
       organizationId: rows[0].organization_id,
-      activeUntil: rows[0].current_period_end,
+      activeUntil: expiryTime?.toISOString() || rows[0].current_period_end,
+    });
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(rows[0].organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+      status: 'active', // Still active until period ends
+      tier: 'pro',
+      platform: 'google',
+      canceledAt: new Date().toISOString(),
+      cancelAt: expiryTime?.toISOString() || null,
     });
   } else {
     logger.warn('[GoogleWebhook] No subscription found to cancel', {
@@ -597,7 +726,7 @@ async function handleGoogleExpired(purchaseToken: string, subscriptionId: string
   });
 
   const subRows = await query(
-    `SELECT s.*, u.organization_id
+    `SELECT s.*, u.organization_id, u.email as user_email
      FROM subscriptions s
      JOIN users u ON s.user_id = u.id
      WHERE s.google_purchase_token = $1`,
@@ -618,9 +747,22 @@ async function handleGoogleExpired(purchaseToken: string, subscriptionId: string
       [DEFAULT_FEATURES_BY_TIER.starter, sub.id]
     );
 
+    // Invalidate user cache since subscription data is included in /auth/me
+    await cacheService.del(CacheKeys.user(sub.user_id));
+    if (sub.user_email) {
+      await cacheService.del(CacheKeys.userByEmail(sub.user_email));
+    }
+
     logger.info('[GoogleWebhook] Subscription expired and downgraded to Starter', {
       subscriptionId: sub.id,
       organizationId: sub.organization_id,
+    });
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(sub.organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+      status: 'canceled',
+      tier: 'starter',
+      platform: 'google',
     });
 
     // Disable staff accounts
@@ -646,6 +788,15 @@ async function handleGoogleOnHold(purchaseToken: string, subscriptionId: string)
     subscriptionId,
   });
 
+  // Get subscription info before update
+  const subRows = await query(
+    `SELECT s.user_id, u.organization_id, u.email as user_email
+     FROM subscriptions s
+     JOIN users u ON s.user_id = u.id
+     WHERE s.google_purchase_token = $1`,
+    [purchaseToken]
+  );
+
   // Account hold due to payment issue
   const rows = await query(
     `UPDATE subscriptions
@@ -657,9 +808,24 @@ async function handleGoogleOnHold(purchaseToken: string, subscriptionId: string)
   );
 
   if (rows.length > 0) {
+    // Invalidate user cache since subscription data is included in /auth/me
+    if (subRows.length > 0) {
+      await cacheService.del(CacheKeys.user(subRows[0].user_id));
+      if (subRows[0].user_email) {
+        await cacheService.del(CacheKeys.userByEmail(subRows[0].user_email));
+      }
+    }
+
     logger.info('[GoogleWebhook] Subscription placed on hold', {
       subscriptionId: rows[0].id,
       organizationId: rows[0].organization_id,
+    });
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(rows[0].organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+      status: 'past_due',
+      tier: 'pro',
+      platform: 'google',
     });
   } else {
     logger.warn('[GoogleWebhook] No subscription found for on-hold', {
@@ -674,6 +840,15 @@ async function handleGoogleGracePeriod(purchaseToken: string, subscriptionId: st
     subscriptionId,
   });
 
+  // Get subscription info before update
+  const subRows = await query(
+    `SELECT s.user_id, u.organization_id, u.email as user_email
+     FROM subscriptions s
+     JOIN users u ON s.user_id = u.id
+     WHERE s.google_purchase_token = $1`,
+    [purchaseToken]
+  );
+
   // Grace period - subscription still active but payment failing
   const rows = await query(
     `UPDATE subscriptions
@@ -685,9 +860,24 @@ async function handleGoogleGracePeriod(purchaseToken: string, subscriptionId: st
   );
 
   if (rows.length > 0) {
+    // Invalidate user cache since subscription data is included in /auth/me
+    if (subRows.length > 0) {
+      await cacheService.del(CacheKeys.user(subRows[0].user_id));
+      if (subRows[0].user_email) {
+        await cacheService.del(CacheKeys.userByEmail(subRows[0].user_email));
+      }
+    }
+
     logger.info('[GoogleWebhook] Subscription in grace period', {
       subscriptionId: rows[0].id,
       organizationId: rows[0].organization_id,
+    });
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(rows[0].organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+      status: 'past_due',
+      tier: 'pro',
+      platform: 'google',
     });
   } else {
     logger.warn('[GoogleWebhook] No subscription found for grace period', {
@@ -703,7 +893,7 @@ async function handleGooglePaused(purchaseToken: string, subscriptionId: string)
   });
 
   const subRows = await query(
-    `SELECT s.*, u.organization_id
+    `SELECT s.*, u.organization_id, u.email as user_email
      FROM subscriptions s
      JOIN users u ON s.user_id = u.id
      WHERE s.google_purchase_token = $1`,
@@ -723,9 +913,22 @@ async function handleGooglePaused(purchaseToken: string, subscriptionId: string)
       [DEFAULT_FEATURES_BY_TIER.starter, sub.id]
     );
 
+    // Invalidate user cache since subscription data is included in /auth/me
+    await cacheService.del(CacheKeys.user(sub.user_id));
+    if (sub.user_email) {
+      await cacheService.del(CacheKeys.userByEmail(sub.user_email));
+    }
+
     logger.info('[GoogleWebhook] Subscription paused and downgraded to Starter', {
       subscriptionId: sub.id,
       organizationId: sub.organization_id,
+    });
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(sub.organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+      status: 'paused',
+      tier: 'starter',
+      platform: 'google',
     });
 
     // Disable staff accounts during pause
@@ -752,7 +955,7 @@ async function handleGoogleRevoked(purchaseToken: string, subscriptionId: string
   });
 
   const subRows = await query(
-    `SELECT s.*, u.organization_id
+    `SELECT s.*, u.organization_id, u.email as user_email
      FROM subscriptions s
      JOIN users u ON s.user_id = u.id
      WHERE s.google_purchase_token = $1`,
@@ -773,9 +976,22 @@ async function handleGoogleRevoked(purchaseToken: string, subscriptionId: string
       [DEFAULT_FEATURES_BY_TIER.starter, sub.id]
     );
 
+    // Invalidate user cache since subscription data is included in /auth/me
+    await cacheService.del(CacheKeys.user(sub.user_id));
+    if (sub.user_email) {
+      await cacheService.del(CacheKeys.userByEmail(sub.user_email));
+    }
+
     logger.info('[GoogleWebhook] Subscription revoked (refunded) and downgraded to Starter', {
       subscriptionId: sub.id,
       organizationId: sub.organization_id,
+    });
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(sub.organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+      status: 'canceled',
+      tier: 'starter',
+      platform: 'google',
     });
 
     // Disable staff accounts

@@ -21,6 +21,7 @@ const envSchema = z.object({
   STRIPE_CONNECT_WEBHOOK_SECRET: z.string().optional(),
   STRIPE_PRO_PRICE_ID: z.string().optional(),
   STRIPE_ENTERPRISE_PRICE_ID: z.string().optional(),
+  STRIPE_TRIAL_COUPON_ID: z.string().optional(), // Coupon for $10 off first month for new subscribers
   
   AWS_REGION: z.string().optional(),
   AWS_ACCESS_KEY_ID: z.string().optional(),
@@ -89,6 +90,7 @@ export const config = {
     connectWebhookSecret: env.STRIPE_CONNECT_WEBHOOK_SECRET,
     proPriceId: env.STRIPE_PRO_PRICE_ID,
     enterprisePriceId: env.STRIPE_ENTERPRISE_PRICE_ID,
+    trialCouponId: env.STRIPE_TRIAL_COUPON_ID, // Coupon for $10 off first month
   },
   aws: {
     region: env.AWS_REGION,

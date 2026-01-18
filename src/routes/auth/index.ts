@@ -12,7 +12,27 @@ import { cacheService, CacheKeys } from '../../services/redis/cache';
 import { imageService } from '../../services/images';
 import { stripe } from '../../services/stripe';
 
-const app = new OpenAPIHono();
+const app = new OpenAPIHono({
+  defaultHook: (result, c) => {
+    if (!result.success) {
+      logger.error('[Auth OpenAPI Validation Error]', {
+        path: c.req.path,
+        method: c.req.method,
+        errors: result.error.issues,
+        errorFlat: result.error.flatten(),
+      });
+      return c.json(
+        {
+          error: 'VALIDATION_ERROR',
+          message: 'Request validation failed',
+          details: result.error.issues,
+        },
+        400
+      );
+    }
+    return undefined;
+  },
+});
 
 // Mount signup routes
 app.route('/', signupRoutes);
@@ -1698,6 +1718,159 @@ app.openapi(deleteAvatarRoute, async (c) => {
     }
 
     return c.json({ error: 'Failed to delete profile picture' }, 500);
+  }
+});
+
+// Link IAP purchase to subscription endpoint
+// This is called after IAP purchase succeeds to store the purchase token
+// so that webhooks can find the subscription
+const LinkIapPurchaseRequestSchema = z.object({
+  platform: z.enum(['ios', 'android']),
+  purchaseToken: z.string().min(1),
+  transactionId: z.string().optional(),
+  productId: z.string().optional(),
+});
+
+const linkIapPurchaseRoute = createRoute({
+  method: 'post',
+  path: '/auth/link-iap-purchase',
+  summary: 'Link IAP purchase token to subscription',
+  description: 'After an IAP purchase succeeds, call this endpoint to link the purchase token to the user subscription so webhooks can find it',
+  tags: ['Authentication'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: LinkIapPurchaseRequestSchema,
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Purchase linked successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            message: z.string(),
+            subscriptionId: z.string(),
+          }),
+        },
+      },
+    },
+    400: {
+      description: 'No subscription found or invalid request',
+    },
+    401: {
+      description: 'Unauthorized',
+    },
+  },
+});
+
+app.openapi(linkIapPurchaseRoute, async (c) => {
+  const authHeader = c.req.header('Authorization');
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    const payload = await authService.verifyToken(token);
+    const body = await c.req.json();
+    const validated = LinkIapPurchaseRequestSchema.parse(body);
+
+    logger.info('[LinkIapPurchase] Linking purchase token to subscription', {
+      userId: payload.userId,
+      platform: validated.platform,
+      productId: validated.productId,
+      purchaseTokenPreview: validated.purchaseToken.substring(0, 20) + '...',
+    });
+
+    // Get the user to find their organization
+    const user = await authService.getUserById(payload.userId);
+    if (!user) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    // Find or create the subscription for this user/organization
+    const existingSub = await query<{ id: string }>(
+      `SELECT id FROM subscriptions WHERE organization_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [user.organization_id]
+    );
+
+    if (existingSub.length === 0) {
+      logger.warn('[LinkIapPurchase] No subscription found', {
+        userId: payload.userId,
+        organizationId: user.organization_id,
+      });
+      return c.json({ error: 'No subscription found for this account' }, 400);
+    }
+
+    const subscriptionId = existingSub[0].id;
+
+    // Update the subscription with the purchase token AND activate the Pro plan
+    // Since we can't validate the receipt without Google Play API credentials,
+    // we trust the purchase and set a default 30-day period (webhooks will update it)
+    const periodEnd = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days from now
+
+    if (validated.platform === 'android') {
+      await query(
+        `UPDATE subscriptions
+         SET google_purchase_token = $1,
+             google_product_id = $2,
+             platform = 'google',
+             tier = 'pro',
+             status = 'active',
+             current_period_end = $3,
+             monthly_price = 2999,
+             transaction_fee_rate = 0.028,
+             updated_at = NOW()
+         WHERE id = $4`,
+        [validated.purchaseToken, validated.productId || null, periodEnd, subscriptionId]
+      );
+    } else {
+      // iOS
+      await query(
+        `UPDATE subscriptions
+         SET apple_original_transaction_id = $1,
+             apple_product_id = $2,
+             platform = 'apple',
+             tier = 'pro',
+             status = 'active',
+             current_period_end = $3,
+             monthly_price = 2999,
+             transaction_fee_rate = 0.028,
+             updated_at = NOW()
+         WHERE id = $4`,
+        [validated.transactionId || validated.purchaseToken, validated.productId || null, periodEnd, subscriptionId]
+      );
+    }
+
+    logger.info('[LinkIapPurchase] Purchase token linked successfully', {
+      userId: payload.userId,
+      subscriptionId,
+      platform: validated.platform,
+    });
+
+    return c.json({
+      message: 'Purchase linked successfully',
+      subscriptionId,
+    });
+  } catch (error: any) {
+    logger.error('[LinkIapPurchase] Error', { error: error.message, stack: error.stack });
+
+    if (error.issues) {
+      return c.json({ error: 'Invalid request data', details: error.issues }, 400);
+    }
+
+    if (error.message === 'Invalid token' || error.message === 'Token expired') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    return c.json({ error: 'Failed to link purchase' }, 500);
   }
 });
 

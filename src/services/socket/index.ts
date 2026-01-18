@@ -124,9 +124,22 @@ export class SocketService {
   }
 
   emitToOrganization(organizationId: string, event: string, data: any) {
-    if (!this.io) return;
-    this.io.to(`org:${organizationId}`).emit(event, data);
-    logger.debug('Emitted to organization', { organizationId, event });
+    if (!this.io) {
+      logger.warn('Socket.IO not initialized, cannot emit to organization', { organizationId, event });
+      return;
+    }
+    const room = `org:${organizationId}`;
+    const socketsInRoom = this.io.sockets.adapter.rooms.get(room);
+    const socketCount = socketsInRoom?.size || 0;
+
+    this.io.to(room).emit(event, data);
+    logger.info('Emitted to organization', {
+      organizationId,
+      event,
+      room,
+      connectedSockets: socketCount,
+      data
+    });
   }
 
   emitToEvent(eventId: string, event: string, data: any) {
@@ -183,6 +196,8 @@ export const SocketEvents = {
   TIP_UPDATED: 'tip:updated',
   // Stripe Connect events
   CONNECT_STATUS_UPDATED: 'connect:status_updated',
+  // Subscription events
+  SUBSCRIPTION_UPDATED: 'subscription:updated',
   // User events
   USER_UPDATED: 'user:updated',
   // Session events

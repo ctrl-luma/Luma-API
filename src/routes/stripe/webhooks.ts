@@ -7,6 +7,7 @@ import { normalizeEmail } from '../../utils/email';
 import { PRICING_BY_TIER, DEFAULT_FEATURES_BY_TIER } from '../../db/models/subscription';
 import { socketService, SocketEvents } from '../../services/socket';
 import { staffService } from '../../services/staff';
+import { cacheService, CacheKeys } from '../../services/redis/cache';
 
 const app = new Hono();
 
@@ -455,8 +456,11 @@ async function handleCheckoutSessionCompleted(session: any) {
     const pricing = PRICING_BY_TIER[tier];
     const features = DEFAULT_FEATURES_BY_TIER[tier];
 
+    let subscriptionId: string;
+
     if (user.subscription_id) {
       // Update existing subscription - always set platform to 'stripe' for Stripe checkouts
+      // Clear cancel_at/canceled_at since this is a new active subscription
       await client.query(
         `UPDATE subscriptions
          SET stripe_subscription_id = $1,
@@ -468,6 +472,8 @@ async function handleCheckoutSessionCompleted(session: any) {
              features = $6,
              current_period_start = NOW(),
              platform = 'stripe',
+             cancel_at = NULL,
+             canceled_at = NULL,
              updated_at = NOW()
          WHERE id = $7`,
         [
@@ -480,14 +486,16 @@ async function handleCheckoutSessionCompleted(session: any) {
           user.subscription_id,
         ]
       );
+      subscriptionId = user.subscription_id;
     } else {
       // Create new subscription
-      await client.query(
+      const insertResult = await client.query(
         `INSERT INTO subscriptions (
           user_id, organization_id, stripe_subscription_id,
           stripe_customer_id, tier, status, monthly_price,
           transaction_fee_rate, features, current_period_start, platform
-        ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, NOW(), 'stripe')`,
+        ) VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8, NOW(), 'stripe')
+        RETURNING id`,
         [
           user.id,
           user.organization_id,
@@ -499,6 +507,7 @@ async function handleCheckoutSessionCompleted(session: any) {
           features,
         ]
       );
+      subscriptionId = insertResult.rows[0].id;
     }
 
     await client.query(
@@ -510,10 +519,31 @@ async function handleCheckoutSessionCompleted(session: any) {
         user.id,
         'subscription.created',
         'subscription',
-        session.subscription,
+        subscriptionId,
         { tier, priceId, sessionId: session.id },
       ]
     );
+
+    // Invalidate user cache since subscription data is included in /auth/me
+    await cacheService.del(CacheKeys.user(user.id));
+    await cacheService.del(CacheKeys.userByEmail(customerEmail));
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(user.organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+      status: 'active',
+      tier,
+      platform: 'stripe',
+    });
+
+    // Enable staff accounts for Pro tier
+    if (tier === 'pro' || tier === 'enterprise') {
+      try {
+        await staffService.enableAllStaff(user.organization_id);
+        logger.info('Staff accounts enabled for new subscription', { organizationId: user.organization_id });
+      } catch (error) {
+        logger.error('Failed to enable staff accounts', { error, organizationId: user.organization_id });
+      }
+    }
   });
 
   logger.info('Checkout session completed', {
@@ -543,11 +573,12 @@ async function handleSubscriptionDeleted(subscription: any) {
 async function updateSubscriptionStatus(subscription: any, status: string) {
   let organizationId: string | null = null;
   let previousStatus: string | null = null;
+  let tier: string | null = null;
 
   await transaction(async (client) => {
     // Find subscription by Stripe ID
     const subResult = await client.query(
-      `SELECT s.*, u.id as user_id, u.organization_id
+      `SELECT s.*, u.id as user_id, u.organization_id, u.email as user_email
        FROM subscriptions s
        JOIN users u ON s.user_id = u.id
        WHERE s.stripe_subscription_id = $1`,
@@ -562,6 +593,16 @@ async function updateSubscriptionStatus(subscription: any, status: string) {
     const sub = subResult.rows[0];
     organizationId = sub.organization_id;
     previousStatus = sub.status;
+    tier = sub.tier;
+
+    // For active status, clear any old cancellation dates (unless Stripe says it's scheduled to cancel)
+    const isActivating = status === 'active' || status === 'trialing';
+
+    // Capture cancel_at and canceled_at from Stripe's subscription object
+    // cancel_at = when the subscription will actually end (expiration date)
+    // canceled_at = when the user clicked cancel
+    const stripeCancelAt = subscription.cancel_at ? new Date(subscription.cancel_at * 1000) : null;
+    const stripeCanceledAt = subscription.canceled_at ? new Date(subscription.canceled_at * 1000) : null;
 
     // Update subscription status
     await client.query(
@@ -569,6 +610,16 @@ async function updateSubscriptionStatus(subscription: any, status: string) {
        SET status = $1,
            current_period_start = $2,
            current_period_end = $3,
+           cancel_at = CASE
+             WHEN $5 IS NOT NULL THEN $5
+             WHEN $7 THEN NULL
+             ELSE cancel_at
+           END,
+           canceled_at = CASE
+             WHEN $6 IS NOT NULL THEN $6
+             WHEN $7 THEN NULL
+             ELSE canceled_at
+           END,
            updated_at = NOW()
        WHERE id = $4`,
       [
@@ -576,6 +627,9 @@ async function updateSubscriptionStatus(subscription: any, status: string) {
         subscription.current_period_start ? new Date(subscription.current_period_start * 1000) : null,
         subscription.current_period_end ? new Date(subscription.current_period_end * 1000) : null,
         sub.id,
+        stripeCancelAt,
+        stripeCanceledAt,
+        isActivating && !stripeCancelAt, // Only clear if activating AND Stripe doesn't have cancel_at set
       ]
     );
 
@@ -588,10 +642,16 @@ async function updateSubscriptionStatus(subscription: any, status: string) {
         sub.user_id,
         `subscription.${status}`,
         'subscription',
-        subscription.id,
+        sub.id, // Use database UUID, not Stripe subscription ID
         { status, previousStatus: sub.status },
       ]
     );
+
+    // Invalidate user cache since subscription data is included in /auth/me
+    await cacheService.del(CacheKeys.user(sub.user_id));
+    if (sub.user_email) {
+      await cacheService.del(CacheKeys.userByEmail(sub.user_email));
+    }
   });
 
   // Handle staff account enable/disable based on subscription status change
@@ -630,6 +690,13 @@ async function updateSubscriptionStatus(subscription: any, status: string) {
         logger.error('Failed to enable staff accounts', { error, organizationId });
       }
     }
+
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(organizationId, SocketEvents.SUBSCRIPTION_UPDATED, {
+      status,
+      tier: tier || 'starter',
+      platform: 'stripe',
+    });
   }
 
   logger.info('Subscription status updated', {
@@ -642,13 +709,43 @@ async function handleInvoicePaymentSucceeded(invoice: any) {
   await transaction(async (client) => {
     // Update subscription payment status if needed
     if (invoice.subscription) {
-      await client.query(
-        `UPDATE subscriptions 
-         SET status = 'active',
-             updated_at = NOW()
-         WHERE stripe_subscription_id = $1 AND status IN ('incomplete', 'past_due', 'pending_payment')`,
+      // Get subscription info for socket event and cache invalidation
+      const subResult = await client.query(
+        `SELECT s.*, u.organization_id, u.email as user_email
+         FROM subscriptions s
+         JOIN users u ON s.user_id = u.id
+         WHERE s.stripe_subscription_id = $1`,
         [invoice.subscription]
       );
+
+      const wasUpdated = await client.query(
+        `UPDATE subscriptions
+         SET status = 'active',
+             cancel_at = NULL,
+             canceled_at = NULL,
+             updated_at = NOW()
+         WHERE stripe_subscription_id = $1 AND status IN ('incomplete', 'past_due', 'pending_payment')
+         RETURNING id`,
+        [invoice.subscription]
+      );
+
+      // Only emit events if we actually updated something
+      if (wasUpdated.rows.length > 0 && subResult.rows.length > 0) {
+        const sub = subResult.rows[0];
+
+        // Invalidate user cache
+        await cacheService.del(CacheKeys.user(sub.user_id));
+        if (sub.user_email) {
+          await cacheService.del(CacheKeys.userByEmail(sub.user_email));
+        }
+
+        // Emit socket event
+        socketService.emitToOrganization(sub.organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+          status: 'active',
+          tier: sub.tier,
+          platform: 'stripe',
+        });
+      }
     }
 
     logger.info('Invoice payment succeeded', {
@@ -662,18 +759,21 @@ async function handleInvoicePaymentSucceeded(invoice: any) {
 async function handleInvoicePaymentFailed(invoice: any) {
   await transaction(async (client) => {
     if (invoice.subscription) {
-      // Find subscription
+      // Find subscription with user info for cache invalidation
       const subResult = await client.query(
-        `SELECT * FROM subscriptions WHERE stripe_subscription_id = $1`,
+        `SELECT s.*, u.organization_id, u.email as user_email
+         FROM subscriptions s
+         JOIN users u ON s.user_id = u.id
+         WHERE s.stripe_subscription_id = $1`,
         [invoice.subscription]
       );
 
       if (subResult.rows.length > 0) {
         const sub = subResult.rows[0];
-        
+
         // Update to past_due status
         await client.query(
-          `UPDATE subscriptions 
+          `UPDATE subscriptions
            SET status = 'past_due',
                updated_at = NOW()
            WHERE id = $1`,
@@ -690,14 +790,27 @@ async function handleInvoicePaymentFailed(invoice: any) {
             sub.user_id,
             'subscription.payment_failed',
             'subscription',
-            invoice.subscription,
-            { 
+            sub.id,
+            {
               invoiceId: invoice.id,
               amountDue: invoice.amount_due / 100,
               attemptCount: invoice.attempt_count,
             },
           ]
         );
+
+        // Invalidate user cache
+        await cacheService.del(CacheKeys.user(sub.user_id));
+        if (sub.user_email) {
+          await cacheService.del(CacheKeys.userByEmail(sub.user_email));
+        }
+
+        // Emit socket event
+        socketService.emitToOrganization(sub.organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+          status: 'past_due',
+          tier: sub.tier,
+          platform: 'stripe',
+        });
       }
     }
   });

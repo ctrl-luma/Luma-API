@@ -49,7 +49,10 @@ const createOrderSchema = z.object({
   tipAmount: z.number().int().optional().default(0),
   totalAmount: z.number().int(), // in cents
   paymentMethod: z.enum(['card', 'cash', 'tap_to_pay']).optional().default('tap_to_pay'),
-  customerEmail: z.string().email().optional(),
+  customerEmail: z.preprocess(
+    (val) => (typeof val === 'string' && val.trim() === '' ? undefined : val),
+    z.string().email().optional()
+  ),
   stripePaymentIntentId: z.string().optional(),
   isQuickCharge: z.boolean().optional().default(false),
   description: z.string().optional(),
@@ -248,11 +251,11 @@ app.openapi(createOrderRoute, async (c) => {
   }
 });
 
-// Update order with PaymentIntent ID
+// Update order with PaymentIntent ID and optionally payment method
 const updateOrderPaymentIntentRoute = createRoute({
   method: 'patch',
   path: '/orders/{id}/payment-intent',
-  summary: 'Link a Stripe PaymentIntent to an order',
+  summary: 'Link a Stripe PaymentIntent to an order and optionally update payment method',
   tags: ['Orders'],
   security: [{ bearerAuth: [] }],
   request: {
@@ -264,6 +267,7 @@ const updateOrderPaymentIntentRoute = createRoute({
         'application/json': {
           schema: z.object({
             stripePaymentIntentId: z.string(),
+            paymentMethod: z.enum(['card', 'cash', 'tap_to_pay']).optional(),
           }),
         },
       },
@@ -293,15 +297,27 @@ app.openapi(updateOrderPaymentIntentRoute, async (c) => {
     logger.info('[ORDER DEBUG] Updating order with payment intent', {
       orderId: id,
       stripePaymentIntentId: body.stripePaymentIntentId,
+      paymentMethod: body.paymentMethod,
       organizationId: payload.organizationId,
     });
 
+    // Build dynamic SET clause based on provided fields
+    const setClauses = ['stripe_payment_intent_id = $1', 'status = \'processing\'', 'updated_at = NOW()'];
+    const params: any[] = [body.stripePaymentIntentId];
+
+    if (body.paymentMethod) {
+      params.push(body.paymentMethod);
+      setClauses.push(`payment_method = $${params.length}`);
+    }
+
+    params.push(id, payload.organizationId);
+
     const rows = await query(
       `UPDATE orders
-       SET stripe_payment_intent_id = $1, status = 'processing', updated_at = NOW()
-       WHERE id = $2 AND organization_id = $3
+       SET ${setClauses.join(', ')}
+       WHERE id = $${params.length - 1} AND organization_id = $${params.length}
        RETURNING *`,
-      [body.stripePaymentIntentId, id, payload.organizationId]
+      params
     );
 
     if (rows.length === 0) {
