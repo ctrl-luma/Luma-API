@@ -1,10 +1,47 @@
 import { createRoute, OpenAPIHono, z } from '@hono/zod-openapi';
+import { google, androidpublisher_v3 } from 'googleapis';
 import { authService } from '../services/auth';
 import { stripeService, stripe } from '../services/stripe';
 import { logger } from '../utils/logger';
 import { config } from '../config';
 import { query } from '../db';
 import type { SubscriptionPlatform } from '../db/models/subscription';
+import { cacheService, CacheKeys } from '../services/redis/cache';
+import { socketService, SocketEvents } from '../services/socket';
+
+// ============================================================================
+// Google Play API Client for IAP validation
+// ============================================================================
+
+let googlePlayClient: androidpublisher_v3.Androidpublisher | null = null;
+
+function getGooglePlayClient(): androidpublisher_v3.Androidpublisher | null {
+  if (googlePlayClient) return googlePlayClient;
+
+  const credentialsRaw = config.googlePlay.credentials;
+
+  if (!credentialsRaw) {
+    logger.warn('[Billing] GOOGLE_PLAY_CREDENTIALS not configured');
+    return null;
+  }
+
+  try {
+    const credentials = JSON.parse(credentialsRaw);
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+    });
+
+    googlePlayClient = google.androidpublisher({ version: 'v3', auth });
+    logger.info('[Billing] Google Play API client initialized');
+    return googlePlayClient;
+  } catch (error: any) {
+    logger.error('[Billing] Failed to initialize Google Play API client', {
+      error: error?.message,
+    });
+    return null;
+  }
+}
 
 const app = new OpenAPIHono();
 
@@ -565,6 +602,10 @@ app.openapi(paymentInfoRoute, async (c) => {
             userId: user.id,
             newStatus: anySubscription.status,
           });
+
+          // Invalidate user cache since subscription data changed
+          await cacheService.del(CacheKeys.user(user.id));
+          await cacheService.del(CacheKeys.userByEmail(user.email));
         } catch (syncError) {
           logger.error('Failed to sync subscription status to DB', { error: syncError });
         }
@@ -744,6 +785,10 @@ app.openapi(subscriptionInfoRoute, async (c) => {
             `UPDATE subscriptions SET status = $1, tier = 'starter', canceled_at = $2, updated_at = NOW() WHERE organization_id = $3`,
             [stripeSub.status, stripeSub.canceled_at ? new Date(stripeSub.canceled_at * 1000) : null, user.organization_id]
           );
+
+          // Invalidate user cache since subscription data changed
+          await cacheService.del(CacheKeys.user(user.id));
+          await cacheService.del(CacheKeys.userByEmail(user.email));
 
           // Update local variable to reflect the change
           dbSubscription = {
@@ -1076,16 +1121,18 @@ async function validateAppleReceipt(_receipt: string, transactionId: string): Pr
 }
 
 // Validate Google Play purchase
-async function validateGooglePurchase(_purchaseToken: string, productId: string): Promise<{
+async function validateGooglePurchase(purchaseToken: string, productId: string): Promise<{
   valid: boolean;
   expiresAt?: Date;
   isTrialPeriod?: boolean;
   autoRenewing?: boolean;
 }> {
+  const packageName = config.googlePlay.packageName;
+
   // Check if Google Play is configured
-  if (!config.googlePlay.packageName || !config.googlePlay.credentials) {
-    logger.warn('Google Play not configured, using test mode validation');
-    // In development/test mode, accept the purchase as valid
+  if (!packageName || !config.googlePlay.credentials) {
+    logger.warn('[Billing] Google Play not configured, using test mode validation');
+    // In development/test mode without credentials, accept the purchase as valid
     return {
       valid: true,
       expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days from now
@@ -1094,16 +1141,64 @@ async function validateGooglePurchase(_purchaseToken: string, productId: string)
     };
   }
 
-  try {
-    // TODO: Implement full Google Play Developer API verification
-    // 1. Create OAuth2 client using service account credentials
-    // 2. Call subscriptions.get to verify the purchase
-    // 3. Parse and return the subscription info
-
-    logger.info('Google Play validation - production mode not yet implemented', { productId });
+  const client = getGooglePlayClient();
+  if (!client) {
+    logger.error('[Billing] Google Play client not available');
     return { valid: false };
-  } catch (error) {
-    logger.error('Google Play validation failed', { error, productId });
+  }
+
+  try {
+    logger.info('[Billing] Validating Google Play purchase', {
+      packageName,
+      productId,
+      purchaseToken: purchaseToken.substring(0, 20) + '...',
+    });
+
+    // Use subscriptionsv2 API for better information
+    const response = await client.purchases.subscriptionsv2.get({
+      packageName,
+      token: purchaseToken,
+    });
+
+    const purchase = response.data;
+
+    logger.info('[Billing] Google Play validation response', {
+      acknowledgementState: purchase.acknowledgementState,
+      subscriptionState: purchase.subscriptionState,
+      testPurchase: purchase.testPurchase,
+      lineItems: purchase.lineItems?.length,
+    });
+
+    // Check subscription state
+    const validStates = [
+      'SUBSCRIPTION_STATE_ACTIVE',
+      'SUBSCRIPTION_STATE_IN_GRACE_PERIOD',
+    ];
+
+    if (!purchase.subscriptionState || !validStates.includes(purchase.subscriptionState)) {
+      logger.warn('[Billing] Google Play subscription not active', {
+        subscriptionState: purchase.subscriptionState,
+      });
+      return { valid: false };
+    }
+
+    // Get expiry and renewal info from line items (new API structure)
+    const lineItem = purchase.lineItems?.[0];
+    const expiryTime = lineItem?.expiryTime;
+    const autoRenewing = lineItem?.autoRenewingPlan !== undefined;
+
+    return {
+      valid: true,
+      expiresAt: expiryTime ? new Date(expiryTime) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+      isTrialPeriod: false,
+      autoRenewing,
+    };
+  } catch (error: any) {
+    logger.error('[Billing] Google Play validation failed', {
+      error: error?.message,
+      code: error?.code,
+      productId,
+    });
     return { valid: false };
   }
 }
@@ -1260,7 +1355,7 @@ app.openapi(validateReceiptRoute, async (c) => {
           validationResult.expiresAt,
           IAP_PRICING.pro.monthly_price,
           IAP_PRICING.pro.transaction_fee_rate,
-          IAP_PRICING.pro.features,
+          JSON.stringify(IAP_PRICING.pro.features),
           platform === 'ios' ? validationResult.originalTransactionId : null,
           platform === 'android' ? receipt : null,
           existingSub.id,
@@ -1272,6 +1367,17 @@ app.openapi(validateReceiptRoute, async (c) => {
         subscriptionId: existingSub.id,
         platform: subscriptionPlatform,
         expiresAt: validationResult.expiresAt,
+      });
+
+      // Invalidate user cache so fresh subscription data is returned
+      await cacheService.del(CacheKeys.user(user.id));
+      await cacheService.del(CacheKeys.userByEmail(user.email));
+
+      // Emit socket event to notify app of subscription update
+      socketService.emitToOrganization(user.organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+        tier: 'pro',
+        status: 'active',
+        platform: subscriptionPlatform,
       });
     } else {
       // Create new subscription
@@ -1288,7 +1394,7 @@ app.openapi(validateReceiptRoute, async (c) => {
           validationResult.expiresAt,
           IAP_PRICING.pro.monthly_price,
           IAP_PRICING.pro.transaction_fee_rate,
-          IAP_PRICING.pro.features,
+          JSON.stringify(IAP_PRICING.pro.features),
           platform === 'ios' ? validationResult.originalTransactionId : null,
           platform === 'android' ? receipt : null,
         ]
@@ -1298,6 +1404,17 @@ app.openapi(validateReceiptRoute, async (c) => {
         userId: user.id,
         platform: subscriptionPlatform,
         expiresAt: validationResult.expiresAt,
+      });
+
+      // Invalidate user cache so fresh subscription data is returned
+      await cacheService.del(CacheKeys.user(user.id));
+      await cacheService.del(CacheKeys.userByEmail(user.email));
+
+      // Emit socket event to notify app of subscription update
+      socketService.emitToOrganization(user.organization_id, SocketEvents.SUBSCRIPTION_UPDATED, {
+        tier: 'pro',
+        status: 'active',
+        platform: subscriptionPlatform,
       });
     }
 

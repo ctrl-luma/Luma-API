@@ -1855,6 +1855,10 @@ app.openapi(linkIapPurchaseRoute, async (c) => {
       platform: validated.platform,
     });
 
+    // Invalidate user cache since subscription data changed
+    await cacheService.del(CacheKeys.user(user.id));
+    await cacheService.del(CacheKeys.userByEmail(user.email));
+
     return c.json({
       message: 'Purchase linked successfully',
       subscriptionId,
