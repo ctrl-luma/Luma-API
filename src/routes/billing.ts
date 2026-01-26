@@ -1,5 +1,6 @@
 import { createRoute, OpenAPIHono, z } from '@hono/zod-openapi';
 import { google, androidpublisher_v3 } from 'googleapis';
+import jwt from 'jsonwebtoken';
 import { authService } from '../services/auth';
 import { stripeService, stripe } from '../services/stripe';
 import { logger } from '../utils/logger';
@@ -42,6 +43,72 @@ function getGooglePlayClient(): androidpublisher_v3.Androidpublisher | null {
     return null;
   }
 }
+
+// ============================================================================
+// Apple App Store Server API Client for IAP validation
+// ============================================================================
+
+// Cache for Apple JWT token (valid for 1 hour, we refresh every 50 minutes)
+let cachedAppleJwt: { token: string; expiresAt: number } | null = null;
+
+function createAppleJwt(): string | null {
+  const { keyId, issuerId, privateKey, bundleId } = config.appleIap;
+
+  if (!keyId || !issuerId || !privateKey || !bundleId) {
+    logger.warn('[Billing] Apple IAP credentials not fully configured');
+    return null;
+  }
+
+  // Check if we have a valid cached JWT
+  const now = Math.floor(Date.now() / 1000);
+  if (cachedAppleJwt && cachedAppleJwt.expiresAt > now + 600) {
+    // Still valid for more than 10 minutes
+    return cachedAppleJwt.token;
+  }
+
+  try {
+    // Decode base64 private key if needed
+    let decodedKey = privateKey;
+    if (!privateKey.includes('-----BEGIN')) {
+      decodedKey = Buffer.from(privateKey, 'base64').toString('utf-8');
+    }
+
+    const payload = {
+      iss: issuerId,
+      iat: now,
+      exp: now + 3600, // 1 hour
+      aud: 'appstoreconnect-v1',
+      bid: bundleId,
+    };
+
+    const token = jwt.sign(payload, decodedKey, {
+      algorithm: 'ES256',
+      header: {
+        alg: 'ES256',
+        kid: keyId,
+        typ: 'JWT',
+      },
+    });
+
+    // Cache the token
+    cachedAppleJwt = {
+      token,
+      expiresAt: now + 3600,
+    };
+
+    logger.info('[Billing] Apple JWT created successfully');
+    return token;
+  } catch (error: any) {
+    logger.error('[Billing] Failed to create Apple JWT', {
+      error: error?.message,
+    });
+    return null;
+  }
+}
+
+// Apple App Store Server API base URLs
+const APPLE_STORE_API_PRODUCTION = 'https://api.storekit.itunes.apple.com';
+const APPLE_STORE_API_SANDBOX = 'https://api.storekit-sandbox.itunes.apple.com';
 
 const app = new OpenAPIHono();
 
@@ -1079,7 +1146,7 @@ const IAP_PRICING = {
   },
 };
 
-// Validate Apple receipt with App Store Server API
+// Validate Apple receipt with App Store Server API v2
 async function validateAppleReceipt(_receipt: string, transactionId: string): Promise<{
   valid: boolean;
   productId?: string;
@@ -1088,12 +1155,9 @@ async function validateAppleReceipt(_receipt: string, transactionId: string): Pr
   autoRenewing?: boolean;
   originalTransactionId?: string;
 }> {
-  // For production, implement App Store Server API v2 verification
-  // https://developer.apple.com/documentation/appstoreserverapi
-
   // Check if Apple IAP is configured
-  if (!config.appleIap.keyId || !config.appleIap.issuerId || !config.appleIap.privateKey) {
-    logger.warn('Apple IAP not configured, using test mode validation');
+  if (!config.appleIap.keyId || !config.appleIap.issuerId || !config.appleIap.privateKey || !config.appleIap.bundleId) {
+    logger.warn('[Billing] Apple IAP not configured, using test mode validation');
     // In development/test mode, accept the receipt as valid
     // This allows testing the flow without full Apple integration
     return {
@@ -1106,16 +1170,112 @@ async function validateAppleReceipt(_receipt: string, transactionId: string): Pr
     };
   }
 
-  try {
-    // TODO: Implement full App Store Server API v2 verification
-    // 1. Create JWT using the private key
-    // 2. Call App Store Server API to verify the transaction
-    // 3. Parse and return the subscription info
-
-    logger.info('Apple receipt validation - production mode not yet implemented', { transactionId });
+  const appleJwt = createAppleJwt();
+  if (!appleJwt) {
+    logger.error('[Billing] Failed to create Apple JWT for validation');
     return { valid: false };
-  } catch (error) {
-    logger.error('Apple receipt validation failed', { error, transactionId });
+  }
+
+  // Try production first, then sandbox if 4040005 error (transaction not found in production)
+  const tryValidation = async (baseUrl: string): Promise<Response> => {
+    const url = `${baseUrl}/inApps/v1/transactions/${transactionId}`;
+    return fetch(url, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${appleJwt}`,
+        'Content-Type': 'application/json',
+      },
+    });
+  };
+
+  try {
+    logger.info('[Billing] Validating Apple transaction', {
+      transactionId,
+      environment: 'production',
+    });
+
+    let response = await tryValidation(APPLE_STORE_API_PRODUCTION);
+
+    // If not found in production, try sandbox
+    if (response.status === 404) {
+      logger.info('[Billing] Transaction not found in production, trying sandbox', { transactionId });
+      response = await tryValidation(APPLE_STORE_API_SANDBOX);
+    }
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      logger.error('[Billing] Apple API error response', {
+        status: response.status,
+        body: errorBody,
+        transactionId,
+      });
+      return { valid: false };
+    }
+
+    const data = await response.json();
+
+    logger.info('[Billing] Apple transaction response', {
+      transactionId,
+      hasSignedTransactionInfo: !!data.signedTransactionInfo,
+    });
+
+    // The response contains a signed JWT with transaction info
+    if (!data.signedTransactionInfo) {
+      logger.error('[Billing] No signed transaction info in response', { transactionId });
+      return { valid: false };
+    }
+
+    // Decode the signed transaction info (it's a JWS)
+    // We trust Apple's signature, so just decode the payload
+    const parts = data.signedTransactionInfo.split('.');
+    if (parts.length !== 3) {
+      logger.error('[Billing] Invalid JWS format', { transactionId });
+      return { valid: false };
+    }
+
+    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf-8'));
+
+    logger.info('[Billing] Apple transaction payload', {
+      transactionId: payload.transactionId,
+      originalTransactionId: payload.originalTransactionId,
+      productId: payload.productId,
+      expiresDate: payload.expiresDate,
+      type: payload.type,
+      inAppOwnershipType: payload.inAppOwnershipType,
+    });
+
+    // Check if this is a valid subscription
+    if (payload.type !== 'Auto-Renewable Subscription') {
+      logger.warn('[Billing] Transaction is not an auto-renewable subscription', {
+        type: payload.type,
+        transactionId,
+      });
+      // Still allow it but log warning
+    }
+
+    // Check expiration
+    const expiresAt = payload.expiresDate ? new Date(payload.expiresDate) : null;
+    if (expiresAt && expiresAt < new Date()) {
+      logger.warn('[Billing] Apple subscription has expired', {
+        expiresAt: expiresAt.toISOString(),
+        transactionId,
+      });
+      return { valid: false };
+    }
+
+    return {
+      valid: true,
+      productId: payload.productId,
+      expiresAt: expiresAt || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+      isTrialPeriod: payload.offerType === 'INTRODUCTORY',
+      autoRenewing: payload.expirationIntent === undefined, // No expiration intent means auto-renewing
+      originalTransactionId: payload.originalTransactionId || transactionId,
+    };
+  } catch (error: any) {
+    logger.error('[Billing] Apple receipt validation failed', {
+      error: error?.message,
+      transactionId,
+    });
     return { valid: false };
   }
 }
