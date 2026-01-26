@@ -160,6 +160,7 @@ export class EmailService {
 
   async sendReceipt(to: string, receiptData: {
     amount: number; // in cents
+    amountRefunded?: number; // in cents - if provided, shows refund info
     orderNumber?: string;
     cardBrand?: string;
     cardLast4?: string;
@@ -168,6 +169,14 @@ export class EmailService {
     merchantName?: string;
   }): Promise<void> {
     const formattedAmount = (receiptData.amount / 100).toFixed(2);
+    const formattedRefundedAmount = receiptData.amountRefunded
+      ? (receiptData.amountRefunded / 100).toFixed(2)
+      : null;
+    const isFullyRefunded = receiptData.amountRefunded === receiptData.amount;
+    const isPartiallyRefunded = receiptData.amountRefunded && receiptData.amountRefunded < receiptData.amount;
+    const netAmount = receiptData.amountRefunded
+      ? ((receiptData.amount - receiptData.amountRefunded) / 100).toFixed(2)
+      : null;
     const formattedDate = receiptData.date.toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'long',
@@ -193,25 +202,45 @@ export class EmailService {
               <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 480px; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
                 <!-- Header -->
                 <tr>
-                  <td style="background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%); padding: 32px 24px; text-align: center;">
-                    <h1 style="margin: 0; color: #ffffff; font-size: 24px; font-weight: 600;">Payment Receipt</h1>
+                  <td style="background: linear-gradient(135deg, ${isFullyRefunded ? '#6b7280 0%, #4b5563 100%' : '#2563eb 0%, #1d4ed8 100%'}); padding: 32px 24px; text-align: center;">
+                    <h1 style="margin: 0; color: #ffffff; font-size: 24px; font-weight: 600;">${isFullyRefunded ? 'Refund Receipt' : 'Payment Receipt'}</h1>
                   </td>
                 </tr>
 
                 <!-- Amount -->
                 <tr>
                   <td style="padding: 32px 24px 16px; text-align: center;">
+                    ${isFullyRefunded ? `
+                    <p style="margin: 0 0 8px; color: #6b7280; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px;">Amount Refunded</p>
+                    <p style="margin: 0; color: #111827; font-size: 48px; font-weight: 700;">$${formattedRefundedAmount}</p>
+                    ` : isPartiallyRefunded ? `
+                    <p style="margin: 0 0 8px; color: #6b7280; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px;">Original Amount</p>
+                    <p style="margin: 0; color: #111827; font-size: 48px; font-weight: 700;">$${formattedAmount}</p>
+                    <p style="margin: 12px 0 0; color: #dc2626; font-size: 18px; font-weight: 600;">Refunded: $${formattedRefundedAmount}</p>
+                    <p style="margin: 4px 0 0; color: #16a34a; font-size: 16px; font-weight: 500;">Net: $${netAmount}</p>
+                    ` : `
                     <p style="margin: 0 0 8px; color: #6b7280; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px;">Amount Paid</p>
                     <p style="margin: 0; color: #111827; font-size: 48px; font-weight: 700;">$${formattedAmount}</p>
+                    `}
                   </td>
                 </tr>
 
-                <!-- Success Badge -->
+                <!-- Status Badge -->
                 <tr>
                   <td style="padding: 0 24px 24px; text-align: center;">
+                    ${isFullyRefunded ? `
+                    <span style="display: inline-block; background-color: #f3f4f6; color: #6b7280; padding: 8px 16px; border-radius: 9999px; font-size: 14px; font-weight: 500;">
+                      ↩ Fully Refunded
+                    </span>
+                    ` : isPartiallyRefunded ? `
+                    <span style="display: inline-block; background-color: #fef3c7; color: #d97706; padding: 8px 16px; border-radius: 9999px; font-size: 14px; font-weight: 500;">
+                      ↩ Partially Refunded
+                    </span>
+                    ` : `
                     <span style="display: inline-block; background-color: #dcfce7; color: #16a34a; padding: 8px 16px; border-radius: 9999px; font-size: 14px; font-weight: 500;">
                       ✓ Payment Successful
                     </span>
+                    `}
                   </td>
                 </tr>
 
@@ -271,15 +300,22 @@ export class EmailService {
       </html>
     `;
 
+    const subjectPrefix = isFullyRefunded ? 'Refund' : isPartiallyRefunded ? 'Updated' : 'Payment';
     const subject = receiptData.orderNumber
-      ? `Receipt for Order #${receiptData.orderNumber}`
-      : `Payment Receipt - $${formattedAmount}`;
+      ? `${subjectPrefix} Receipt for Order #${receiptData.orderNumber}`
+      : `${subjectPrefix} Receipt - $${isFullyRefunded ? formattedRefundedAmount : formattedAmount}`;
+
+    const textRefundInfo = isFullyRefunded
+      ? `Amount Refunded: $${formattedRefundedAmount}`
+      : isPartiallyRefunded
+        ? `Original Amount: $${formattedAmount}\nRefunded: $${formattedRefundedAmount}\nNet: $${netAmount}`
+        : `Amount: $${formattedAmount}`;
 
     await this.sendEmail({
       to,
       subject,
       html,
-      text: `Payment Receipt\n\nAmount: $${formattedAmount}\nDate: ${formattedDate}${receiptData.orderNumber ? `\nOrder: #${receiptData.orderNumber}` : ''}\nPayment Method: ${paymentMethod}${receiptData.receiptUrl ? `\n\nView full receipt: ${receiptData.receiptUrl}` : ''}\n\nThank you for your purchase!`,
+      text: `${isFullyRefunded ? 'Refund' : 'Payment'} Receipt\n\n${textRefundInfo}\nDate: ${formattedDate}${receiptData.orderNumber ? `\nOrder: #${receiptData.orderNumber}` : ''}\nPayment Method: ${paymentMethod}${receiptData.receiptUrl ? `\n\nView full receipt: ${receiptData.receiptUrl}` : ''}\n\n${isFullyRefunded ? 'Your refund has been processed.' : 'Thank you for your purchase!'}`,
     });
   }
 

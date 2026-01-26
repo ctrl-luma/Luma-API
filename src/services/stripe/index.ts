@@ -127,16 +127,21 @@ export class StripeService {
     }
   }
 
-  async createAccountLink(accountId: string, refreshUrl: string, returnUrl: string) {
+  async createAccountLink(
+    accountId: string,
+    refreshUrl: string,
+    returnUrl: string,
+    type: 'account_onboarding' | 'account_update' = 'account_onboarding'
+  ) {
     try {
       const accountLink = await stripe.accountLinks.create({
         account: accountId,
         refresh_url: refreshUrl,
         return_url: returnUrl,
-        type: 'account_onboarding',
+        type,
       });
 
-      logger.info('Account link created', { accountId });
+      logger.info('Account link created', { accountId, type });
 
       return accountLink;
     } catch (error) {

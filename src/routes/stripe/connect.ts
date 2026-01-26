@@ -6,6 +6,7 @@ import { stripe, stripeService } from '../../services/stripe';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
 import { socketService, SocketEvents } from '../../services/socket';
+import { emailService } from '../../services/email';
 import Stripe from 'stripe';
 
 const app = new OpenAPIHono();
@@ -557,7 +558,8 @@ app.openapi(createOnboardingLinkRoute, async (c) => {
     const accountLink = await stripeService.createAccountLink(
       connectedAccount.stripe_account_id,
       `${config.email.dashboardUrl}/connect`,
-      `${config.email.dashboardUrl}/connect`
+      `${config.email.dashboardUrl}/connect`,
+      linkType
     );
 
     // Set flag so next status check will force refresh from Stripe
@@ -1187,15 +1189,67 @@ app.openapi(listTransactionsRoute, async (c) => {
 
     // Filter by catalog_id, customer_email, and amount range if provided
     let filteredCharges = charges.data;
+
+    // Debug logging for customer email filter
+    if (customerEmailFilter) {
+      logger.info('Transaction filter: customer_email search', {
+        searchEmail: customerEmailFilter,
+        totalChargesBefore: charges.data.length,
+        chargesWithReceiptEmail: charges.data.filter(c => c.receipt_email).length,
+        chargesWithBillingEmail: charges.data.filter(c => c.billing_details?.email).length,
+        chargesWithMetadataEmail: charges.data.filter(c => c.metadata?.customerEmail || c.metadata?.customer_email).length,
+        sampleCharges: charges.data.slice(0, 5).map(c => ({
+          id: c.id,
+          receipt_email: c.receipt_email,
+          billing_email: c.billing_details?.email,
+          metadata_email: c.metadata?.customerEmail || c.metadata?.customer_email,
+          created: new Date(c.created * 1000).toISOString(),
+        })),
+      });
+    }
+
     if (catalogIdFilter) {
       filteredCharges = filteredCharges.filter(
         (charge) => charge.metadata?.catalogId === catalogIdFilter
       );
     }
     if (customerEmailFilter) {
-      filteredCharges = filteredCharges.filter(
-        (charge) => charge.receipt_email?.toLowerCase().includes(customerEmailFilter)
+      // Also get charge IDs from orders table for this customer (catches charges without receipt_email)
+      const orderChargeIds = await query<{ stripe_charge_id: string }>(
+        `SELECT stripe_charge_id FROM orders
+         WHERE organization_id = $1
+         AND LOWER(customer_email) LIKE $2
+         AND stripe_charge_id IS NOT NULL`,
+        [payload.organizationId, `%${customerEmailFilter}%`]
       );
+      const chargeIdsFromOrders = new Set(orderChargeIds.map(o => o.stripe_charge_id));
+
+      logger.info('Transaction filter: orders table lookup', {
+        searchEmail: customerEmailFilter,
+        chargeIdsFromOrders: Array.from(chargeIdsFromOrders),
+      });
+
+      // Check receipt_email, billing_details.email, metadata, OR charge ID from orders table
+      filteredCharges = filteredCharges.filter((charge) => {
+        // First check if this charge ID is in our orders table for this customer
+        if (chargeIdsFromOrders.has(charge.id)) {
+          return true;
+        }
+
+        const receiptEmail = charge.receipt_email?.toLowerCase();
+        const billingEmail = charge.billing_details?.email?.toLowerCase();
+        const metadataEmail = (charge.metadata?.customerEmail || charge.metadata?.customer_email)?.toLowerCase();
+
+        return receiptEmail?.includes(customerEmailFilter) ||
+               billingEmail?.includes(customerEmailFilter) ||
+               metadataEmail?.includes(customerEmailFilter);
+      });
+
+      logger.info('Transaction filter: after customer_email filter', {
+        searchEmail: customerEmailFilter,
+        matchingCharges: filteredCharges.length,
+        matchingIds: filteredCharges.map(c => c.id),
+      });
     }
     if (amountMin !== undefined) {
       filteredCharges = filteredCharges.filter((charge) => charge.amount >= amountMin);
@@ -1730,6 +1784,173 @@ app.openapi(refundTransactionRoute, async (c) => {
       return c.json({ error: error.message || 'Invalid refund request' }, 400);
     }
     return c.json({ error: 'Failed to create refund' }, 500);
+  }
+});
+
+// ============================================
+// POST /stripe/connect/transactions/:transactionId/send-receipt - Send receipt email
+// ============================================
+const sendReceiptRoute = createRoute({
+  method: 'post',
+  path: '/stripe/connect/transactions/{transactionId}/send-receipt',
+  summary: 'Send receipt email for a transaction',
+  description: 'Sends a receipt email to the specified email address for a completed transaction',
+  tags: ['Stripe Connect'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    params: z.object({
+      transactionId: z.string(),
+    }),
+    body: {
+      content: {
+        'application/json': {
+          schema: z.object({
+            email: z.string().email(),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Receipt sent successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            success: z.boolean(),
+            message: z.string(),
+          }),
+        },
+      },
+    },
+    400: { description: 'Invalid request or transaction not completed' },
+    401: { description: 'Unauthorized' },
+    404: { description: 'Transaction not found' },
+  },
+});
+
+app.openapi(sendReceiptRoute, async (c) => {
+  try {
+    const { transactionId } = c.req.param();
+    const { email } = await c.req.json();
+
+    // Verify auth and get payload
+    const authHeader = c.req.header('Authorization');
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    const token = authHeader.replace('Bearer ', '');
+
+    const { authService } = await import('../../services/auth');
+    const payload = await authService.verifyToken(token);
+
+    // Get connected account
+    const rows = await query<StripeConnectedAccount>(
+      'SELECT * FROM stripe_connected_accounts WHERE organization_id = $1',
+      [payload.organizationId]
+    );
+
+    if (rows.length === 0) {
+      return c.json({ error: 'No connected account found' }, 404);
+    }
+
+    const connectedAccount = rows[0];
+
+    // Retrieve the charge from Stripe
+    const charge = await stripe.charges.retrieve(
+      transactionId,
+      { expand: ['payment_intent'] },
+      { stripeAccount: connectedAccount.stripe_account_id }
+    );
+
+    // Allow receipts for succeeded charges (refunded charges still have status 'succeeded')
+    if (charge.status !== 'succeeded') {
+      return c.json({ error: 'Transaction must be completed before sending receipt' }, 400);
+    }
+
+    const receiptUrl = charge.receipt_url || null;
+
+    // Extract card details from the charge
+    const paymentMethodDetails = charge.payment_method_details;
+    let cardBrand: string | undefined;
+    let cardLast4: string | undefined;
+
+    if (paymentMethodDetails?.type === 'card_present' && paymentMethodDetails.card_present) {
+      cardBrand = paymentMethodDetails.card_present.brand || undefined;
+      cardLast4 = paymentMethodDetails.card_present.last4 || undefined;
+    } else if (paymentMethodDetails?.type === 'card' && paymentMethodDetails.card) {
+      cardBrand = paymentMethodDetails.card.brand || undefined;
+      cardLast4 = paymentMethodDetails.card.last4 || undefined;
+    }
+
+    // Get order number from metadata or payment intent
+    let orderNumber: string | undefined;
+    if (charge.metadata?.orderNumber) {
+      orderNumber = charge.metadata.orderNumber;
+    } else if (charge.payment_intent && typeof charge.payment_intent === 'object') {
+      orderNumber = charge.payment_intent.metadata?.orderNumber;
+    }
+
+    // Get organization name for merchant name
+    const orgRows = await query<{ name: string }>(
+      'SELECT name FROM organizations WHERE id = $1',
+      [payload.organizationId]
+    );
+    const merchantName = orgRows[0]?.name || undefined;
+
+    // Send receipt via our email service
+    logger.info('Sending receipt email', {
+      transactionId,
+      email,
+      amount: charge.amount,
+      orderNumber,
+      cardBrand,
+      cardLast4,
+      merchantName,
+      hasReceiptUrl: !!receiptUrl,
+    });
+
+    await emailService.sendReceipt(email, {
+      amount: charge.amount,
+      amountRefunded: charge.amount_refunded || undefined,
+      orderNumber,
+      cardBrand,
+      cardLast4,
+      date: new Date(charge.created * 1000),
+      receiptUrl: receiptUrl || undefined,
+      merchantName,
+    });
+
+    logger.info('Receipt email sent successfully from vendor portal', {
+      transactionId,
+      email,
+      organizationId: payload.organizationId,
+      amount: charge.amount,
+      amountRefunded: charge.amount_refunded || 0,
+      chargeStatus: charge.status,
+    });
+
+    return c.json({
+      success: true,
+      message: `Receipt sent to ${email}`,
+    });
+  } catch (error: any) {
+    // Get transactionId safely - it might not be in scope if error occurred early
+    const txnId = c.req.param('transactionId');
+    logger.error('Error sending receipt', {
+      error: error?.message || error,
+      stack: error?.stack,
+      name: error?.name,
+      type: error?.type,
+      transactionId: txnId,
+    });
+    if (error instanceof Error && error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    if (error.type === 'StripeInvalidRequestError') {
+      return c.json({ error: error.message || 'Transaction not found' }, 404);
+    }
+    return c.json({ error: error?.message || 'Failed to send receipt' }, 500);
   }
 });
 
