@@ -94,6 +94,17 @@ export class SocketService {
         logger.debug('Socket left event', { socketId: socket.id, eventId });
       });
 
+      // Device room support - allows emitting to specific devices
+      socket.on('join:device', (deviceId: string) => {
+        socket.join(`device:${deviceId}`);
+        logger.debug('Socket joined device room', { socketId: socket.id, deviceId });
+      });
+
+      socket.on('leave:device', (deviceId: string) => {
+        socket.leave(`device:${deviceId}`);
+        logger.debug('Socket left device room', { socketId: socket.id, deviceId });
+      });
+
       socket.on('order:update', async (data: any) => {
         await this.handleOrderUpdate(socket, data);
       });
@@ -154,6 +165,25 @@ export class SocketService {
     logger.debug('Emitted to user', { userId, event });
   }
 
+  emitToDevice(deviceId: string, event: string, data: any) {
+    if (!this.io) {
+      logger.warn('Socket.IO not initialized, cannot emit to device', { deviceId, event });
+      return;
+    }
+    const room = `device:${deviceId}`;
+    const socketsInRoom = this.io.sockets.adapter.rooms.get(room);
+    const socketCount = socketsInRoom?.size || 0;
+
+    this.io.to(room).emit(event, data);
+    logger.info('Emitted to device', {
+      deviceId,
+      event,
+      room,
+      connectedSockets: socketCount,
+      data
+    });
+  }
+
   broadcast(event: string, data: any) {
     if (!this.io) return;
     this.io.emit(event, data);
@@ -190,6 +220,7 @@ export const SocketEvents = {
   ORDER_COMPLETED: 'order:completed',
   ORDER_FAILED: 'order:failed',
   ORDER_REFUNDED: 'order:refunded',
+  ORDER_DELETED: 'order:deleted',
   // Payment events
   PAYMENT_RECEIVED: 'payment:received',
   REVENUE_UPDATE: 'revenue:update',

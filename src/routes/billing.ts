@@ -1212,7 +1212,7 @@ async function validateAppleReceipt(_receipt: string, transactionId: string): Pr
       return { valid: false };
     }
 
-    const data = await response.json();
+    const data = await response.json() as { signedTransactionInfo?: string };
 
     logger.info('[Billing] Apple transaction response', {
       transactionId,

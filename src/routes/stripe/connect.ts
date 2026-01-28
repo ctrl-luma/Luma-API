@@ -1086,6 +1086,7 @@ const listTransactionsRoute = createRoute({
       ending_before: z.string().optional(),
       catalog_id: z.string().uuid().optional(),
       customer_email: z.string().optional(), // Allow partial email for "contains" search
+      device_id: z.string().optional(), // Filter by device that processed the order
       date_from: z.string().transform(Number).optional(), // Unix timestamp
       date_to: z.string().transform(Number).optional(), // Unix timestamp
       amount_min: z.string().transform(Number).optional(), // In cents
@@ -1159,6 +1160,7 @@ app.openapi(listTransactionsRoute, async (c) => {
     const queryParams = c.req.query();
     const catalogIdFilter = queryParams.catalog_id;
     const customerEmailFilter = queryParams.customer_email?.toLowerCase();
+    const deviceIdFilter = queryParams.device_id;
     const dateFrom = queryParams.date_from ? parseInt(queryParams.date_from) : undefined;
     const dateTo = queryParams.date_to ? parseInt(queryParams.date_to) : undefined;
     const amountMin = queryParams.amount_min ? parseInt(queryParams.amount_min) : undefined;
@@ -1168,7 +1170,7 @@ app.openapi(listTransactionsRoute, async (c) => {
     const requestedLimit = queryParams.limit ? parseInt(queryParams.limit) : 25;
 
     // If filtering, fetch more to compensate for filtered results
-    const hasFilter = catalogIdFilter || customerEmailFilter || amountMin !== undefined || amountMax !== undefined;
+    const hasFilter = catalogIdFilter || customerEmailFilter || deviceIdFilter || amountMin !== undefined || amountMax !== undefined;
     const fetchLimit = hasFilter ? Math.min(requestedLimit * 3, 100) : requestedLimit;
 
     // Build created date range filter for Stripe API
@@ -1212,6 +1214,19 @@ app.openapi(listTransactionsRoute, async (c) => {
       filteredCharges = filteredCharges.filter(
         (charge) => charge.metadata?.catalogId === catalogIdFilter
       );
+    }
+    if (deviceIdFilter) {
+      // Get charge IDs from orders table for this device
+      const deviceOrderCharges = await query<{ stripe_charge_id: string }>(
+        `SELECT stripe_charge_id FROM orders
+         WHERE organization_id = $1
+         AND device_id = $2
+         AND stripe_charge_id IS NOT NULL`,
+        [payload.organizationId, deviceIdFilter]
+      );
+      const chargeIdsFromDevice = new Set(deviceOrderCharges.map(o => o.stripe_charge_id));
+
+      filteredCharges = filteredCharges.filter((charge) => chargeIdsFromDevice.has(charge.id));
     }
     if (customerEmailFilter) {
       // Also get charge IDs from orders table for this customer (catches charges without receipt_email)

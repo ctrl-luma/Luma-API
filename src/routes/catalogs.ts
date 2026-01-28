@@ -25,6 +25,7 @@ const catalogSchema = z.object({
   taxRate: z.number(),
   layoutType: layoutTypeSchema,
   productCount: z.number(),
+  isLocked: z.boolean().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
 });
@@ -171,6 +172,37 @@ app.openapi(listCatalogsRoute, async (c) => {
       );
     }
 
+    // Determine which catalogs are locked based on subscription tier
+    const subscriptionResult = await query<{ tier: string; status: string }>(
+      `SELECT tier, status FROM subscriptions
+       WHERE organization_id = $1 AND status IN ('active', 'trialing')
+       LIMIT 1`,
+      [payload.organizationId]
+    );
+
+    let lockedCatalogIds: Set<string> = new Set();
+    logger.info('Catalog list - subscription check', {
+      organizationId: payload.organizationId,
+      subscription: subscriptionResult[0] || 'none',
+      catalogCount: rows.length,
+    });
+
+    if (subscriptionResult.length > 0) {
+      const { tier } = subscriptionResult[0];
+      if ((tier === 'starter' || tier === 'free') && rows.length > 1) {
+        // For free/starter tier, all except the oldest catalog are locked
+        // rows are sorted by created_at DESC, so the last one is the oldest (unlocked)
+        const unlockedId = rows[rows.length - 1].id;
+        lockedCatalogIds = new Set(rows.filter(r => r.id !== unlockedId).map(r => r.id));
+        logger.info('Catalog locking applied', {
+          tier,
+          unlockedId,
+          lockedIds: Array.from(lockedCatalogIds),
+          catalogOrder: rows.map(r => ({ id: r.id, name: r.name, createdAt: r.created_at })),
+        });
+      }
+    }
+
     return c.json(rows.map(row => ({
       id: row.id,
       name: row.name,
@@ -185,6 +217,7 @@ app.openapi(listCatalogsRoute, async (c) => {
       taxRate: parseFloat((row as any).tax_rate) || 0,
       layoutType: (row as any).layout_type || 'grid',
       productCount: row.product_count || 0,
+      isLocked: lockedCatalogIds.has(row.id),
       createdAt: row.created_at.toISOString(),
       updatedAt: row.updated_at.toISOString(),
     })));
@@ -310,6 +343,31 @@ app.openapi(createCatalogRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
+
+    // Check subscription tier - free/starter can only have 1 catalog
+    const subscriptionResult = await query<{ tier: string; status: string }>(
+      `SELECT tier, status FROM subscriptions
+       WHERE organization_id = $1 AND status IN ('active', 'trialing')
+       LIMIT 1`,
+      [payload.organizationId]
+    );
+
+    if (subscriptionResult.length > 0) {
+      const { tier } = subscriptionResult[0];
+      if (tier === 'starter' || tier === 'free') {
+        // Check if they already have a catalog
+        const catalogCount = await query<{ count: string }>(
+          `SELECT COUNT(*) as count FROM catalogs WHERE organization_id = $1`,
+          [payload.organizationId]
+        );
+        if (parseInt(catalogCount[0].count) >= 1) {
+          return c.json({
+            error: 'Free tier accounts can only have one catalog. Upgrade to Pro to create additional catalogs.',
+            code: 'CATALOG_LIMIT_REACHED'
+          }, 403);
+        }
+      }
+    }
 
     const rows = await query<Catalog>(
       `INSERT INTO catalogs (organization_id, name, description, location, date, is_active, show_tip_screen, prompt_for_email, tip_percentages, allow_custom_tip, tax_rate, layout_type)
@@ -556,13 +614,9 @@ app.openapi(deleteCatalogRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
 
-    // Check if catalog is locked based on subscription tier
-    const accessCheck = await checkCatalogAccess(id, payload.organizationId);
-    if (!accessCheck.allowed) {
-      return c.json({
-        error: accessCheck.reason,
-        code: 'CATALOG_LOCKED'
-      }, 403);
+    // Only owners can delete catalogs
+    if (payload.role !== 'owner') {
+      return c.json({ error: 'Only owners can delete catalogs' }, 403);
     }
 
     const result = await query(
