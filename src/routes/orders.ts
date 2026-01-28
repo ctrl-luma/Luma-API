@@ -21,7 +21,7 @@ const orderSchema = z.object({
   id: z.string().uuid(),
   orderNumber: z.string(),
   status: z.enum(['pending', 'processing', 'completed', 'failed', 'refunded', 'held']),
-  paymentMethod: z.enum(['card', 'cash', 'tap_to_pay']).nullable(),
+  paymentMethod: z.enum(['card', 'cash', 'tap_to_pay', 'split']).nullable(),
   subtotal: z.number(),
   taxAmount: z.number(),
   tipAmount: z.number(),
@@ -57,7 +57,7 @@ const createOrderSchema = z.object({
   taxAmount: z.number().int().optional().default(0),
   tipAmount: z.number().int().optional().default(0),
   totalAmount: z.number().int(), // in cents
-  paymentMethod: z.enum(['card', 'cash', 'tap_to_pay']).optional().default('tap_to_pay'),
+  paymentMethod: z.enum(['card', 'cash', 'tap_to_pay', 'split']).optional().default('tap_to_pay'),
   customerEmail: z.preprocess(
     (val) => (typeof val === 'string' && val.trim() === '' ? undefined : val),
     z.string().email().optional()
@@ -720,6 +720,17 @@ const holdOrderRoute = createRoute({
         'application/json': {
           schema: z.object({
             holdName: z.string().max(100).optional(),
+            // Optional fields to update when re-holding a resumed order
+            tipAmount: z.number().int().optional(),
+            taxAmount: z.number().int().optional(),
+            subtotal: z.number().int().optional(),
+            totalAmount: z.number().int().optional(),
+            paymentMethod: z.enum(['card', 'cash', 'tap_to_pay', 'split']).optional(),
+            customerEmail: z.preprocess(
+              (val) => (typeof val === 'string' && val.trim() === '' ? undefined : val),
+              z.string().email().optional()
+            ),
+            notes: z.string().max(1000).optional().nullable(),
           }),
         },
       },
@@ -745,7 +756,7 @@ app.openapi(holdOrderRoute, async (c) => {
 
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
-    const body = await c.req.json();
+    const body = await c.req.json() as any;
 
     // Only pending orders can be held
     const existingOrder = await query(
@@ -762,23 +773,61 @@ app.openapi(holdOrderRoute, async (c) => {
       return c.json({ error: `Cannot hold order with status: ${currentStatus}` }, 400);
     }
 
-    logger.info('Attempting to hold order', {
+    logger.info('[HOLD DEBUG] Hold order request body', {
       orderId: id,
-      holdName: body.holdName,
-      userId: payload.userId,
       currentStatus,
+      bodyKeys: Object.keys(body),
+      paymentMethod: body.paymentMethod,
+      body: JSON.stringify(body),
     });
+
+    // Build dynamic SET clause for optional field updates
+    const setClauses = [
+      'status = \'held\'',
+      'held_at = NOW()',
+      'held_by = $1',
+      'hold_name = $2',
+      'updated_at = NOW()',
+    ];
+    const params: any[] = [payload.userId, body.holdName || null];
+
+    if (body.tipAmount !== undefined) {
+      params.push(body.tipAmount / 100);
+      setClauses.push(`tip_amount = $${params.length}`);
+    }
+    if (body.taxAmount !== undefined) {
+      params.push(body.taxAmount / 100);
+      setClauses.push(`tax_amount = $${params.length}`);
+    }
+    if (body.subtotal !== undefined) {
+      params.push(body.subtotal / 100);
+      setClauses.push(`subtotal = $${params.length}`);
+    }
+    if (body.totalAmount !== undefined) {
+      params.push(body.totalAmount / 100);
+      setClauses.push(`total_amount = $${params.length}`);
+    }
+    if (body.paymentMethod) {
+      params.push(body.paymentMethod);
+      setClauses.push(`payment_method = $${params.length}`);
+    }
+    if (body.customerEmail !== undefined) {
+      params.push(body.customerEmail?.toLowerCase().trim() || null);
+      setClauses.push(`customer_email = $${params.length}`);
+    }
+    if (body.notes !== undefined) {
+      params.push(body.notes || null);
+      setClauses.push(`notes = $${params.length}`);
+    }
+
+    params.push(id, payload.organizationId);
 
     const rows = await query(
       `UPDATE orders
-       SET status = 'held',
-           held_at = NOW(),
-           held_by = $1,
-           hold_name = $2,
-           updated_at = NOW()
-       WHERE id = $3 AND organization_id = $4
+       SET ${setClauses.join(', ')}
+       WHERE id = $${params.length - 1} AND organization_id = $${params.length}
        RETURNING *`,
-      [payload.userId, body.holdName || null, id, payload.organizationId]
+      params
     );
 
     if (rows.length === 0) {
@@ -813,6 +862,12 @@ app.openapi(holdOrderRoute, async (c) => {
       holdName: order.hold_name,
       deviceId: order.device_id,
     };
+    logger.info('[SOCKET DEBUG] Emitting ORDER_UPDATED for held order', {
+      event: SocketEvents.ORDER_UPDATED,
+      organizationId: payload.organizationId,
+      deviceId: order.device_id,
+      data: holdEventData,
+    });
     socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_UPDATED, holdEventData);
     if (order.device_id) {
       socketService.emitToDevice(order.device_id, SocketEvents.ORDER_UPDATED, holdEventData);
@@ -981,6 +1036,12 @@ app.openapi(resumeOrderRoute, async (c) => {
       status: 'pending',
       deviceId: order.device_id,
     };
+    logger.info('[SOCKET DEBUG] Emitting ORDER_UPDATED for resumed order', {
+      event: SocketEvents.ORDER_UPDATED,
+      organizationId: payload.organizationId,
+      deviceId: order.device_id,
+      data: resumeEventData,
+    });
     socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_UPDATED, resumeEventData);
     if (order.device_id) {
       socketService.emitToDevice(order.device_id, SocketEvents.ORDER_UPDATED, resumeEventData);
@@ -1515,6 +1576,12 @@ app.openapi(cancelOrderRoute, async (c) => {
       organizationId: payload.organizationId,
       deviceId: order.device_id,
     };
+    logger.info('[SOCKET DEBUG] Emitting ORDER_DELETED for cancelled order', {
+      event: SocketEvents.ORDER_DELETED,
+      organizationId: payload.organizationId,
+      deviceId: order.device_id,
+      data: deleteEventData,
+    });
     socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_DELETED, deleteEventData);
     if (order.device_id) {
       socketService.emitToDevice(order.device_id, SocketEvents.ORDER_DELETED, deleteEventData);

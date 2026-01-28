@@ -552,8 +552,8 @@ app.openapi(createOnboardingLinkRoute, async (c) => {
 
     const connectedAccount = rows[0];
 
-    // Create onboarding link (can be for onboarding or updating info)
-    const linkType = connectedAccount.onboarding_state === 'active' ? 'account_update' : 'account_onboarding';
+    // Always use account_onboarding - account_update is not supported for all account types
+    const linkType = 'account_onboarding' as const;
 
     const accountLink = await stripeService.createAccountLink(
       connectedAccount.stripe_account_id,
