@@ -27,6 +27,7 @@ const createProductSchema = z.object({
 const updateProductSchema = z.object({
   name: z.string().min(1).max(100).optional(),
   description: z.string().max(500).nullable().optional(),
+  removeImage: z.boolean().optional(),
 });
 
 // Helper to verify token and get user info
@@ -318,6 +319,10 @@ app.openapi(updateProductRoute, async (c) => {
       updates.push(`description = $${paramCount}`);
       values.push(body.description);
       paramCount++;
+    }
+    if (body.removeImage) {
+      updates.push(`image_id = NULL`);
+      updates.push(`image_url = NULL`);
     }
 
     if (updates.length === 0) {
