@@ -320,7 +320,15 @@ app.openapi(updateProductRoute, async (c) => {
       values.push(body.description);
       paramCount++;
     }
+    // If removing image, fetch the old image ID first for cleanup
+    let oldImageId: string | null = null;
     if (body.removeImage) {
+      const existingRows = await query<Product>(
+        `SELECT image_id FROM products WHERE id = $1 AND organization_id = $2`,
+        [productId, payload.organizationId]
+      );
+      oldImageId = existingRows[0]?.image_id || null;
+
       updates.push(`image_id = NULL`);
       updates.push(`image_url = NULL`);
     }
@@ -339,6 +347,13 @@ app.openapi(updateProductRoute, async (c) => {
        RETURNING *`,
       values
     );
+
+    // Clean up old image file after successful DB update
+    if (oldImageId && rows[0]) {
+      imageService.delete(oldImageId).catch((err: any) => {
+        logger.warn('Failed to delete old product image', { oldImageId, error: err.message });
+      });
+    }
 
     if (!rows[0]) {
       return c.json({ error: 'Product not found' }, 404);
@@ -401,28 +416,55 @@ const updateProductImageRoute = createRoute({
 
 app.openapi(updateProductImageRoute, async (c) => {
   const { productId } = c.req.param();
+  logger.info('[ImageUpload] POST /products/:productId/image hit', { productId });
 
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+    logger.info('[ImageUpload] Auth verified', { productId, orgId: payload.organizationId });
 
     if (!imageService.isConfigured()) {
+      logger.error('[ImageUpload] Image service not configured');
       return c.json({ error: 'Image uploads not configured' }, 500);
     }
 
     const formData = await c.req.formData();
     const file = formData.get('image');
+    logger.info('[ImageUpload] FormData parsed', {
+      productId,
+      hasFile: !!file,
+      fileType: file && typeof file === 'object' ? (file as any).type : typeof file,
+      fileSize: file && typeof file === 'object' && 'size' in file ? (file as any).size : 'unknown',
+    });
 
     // Use duck typing - File is not available in Node.js
     const isFileLike = file && typeof file === 'object' && 'arrayBuffer' in file && 'type' in file;
     if (!isFileLike) {
+      logger.error('[ImageUpload] File validation failed - not a valid file', {
+        productId,
+        fileValue: file === null ? 'null' : file === undefined ? 'undefined' : typeof file,
+        isObject: typeof file === 'object',
+        hasArrayBuffer: file && typeof file === 'object' ? 'arrayBuffer' in file : false,
+        hasType: file && typeof file === 'object' ? 'type' in file : false,
+      });
       return c.json({ error: 'No image file provided' }, 400);
     }
 
     const uploadedFile = file as Blob;
+    logger.info('[ImageUpload] File validated', { productId, type: uploadedFile.type, size: uploadedFile.size });
+
+    // Get the existing image ID so we can clean it up after upload
+    const existingRows = await query<Product>(
+      `SELECT image_id FROM products WHERE id = $1 AND organization_id = $2`,
+      [productId, payload.organizationId]
+    );
+    const oldImageId = existingRows[0]?.image_id || null;
+    logger.info('[ImageUpload] Old image check', { productId, oldImageId, productFound: !!existingRows[0] });
 
     // Upload new image
     const buffer = await uploadedFile.arrayBuffer();
+    logger.info('[ImageUpload] Buffer created', { productId, bufferSize: buffer.byteLength });
     const result = await imageService.upload(buffer, uploadedFile.type, { imageType: 'product' });
+    logger.info('[ImageUpload] Image uploaded to storage', { productId, newImageId: result.id, newUrl: result.url });
 
     // Update product with new image
     const rows = await query<Product>(
@@ -432,13 +474,23 @@ app.openapi(updateProductImageRoute, async (c) => {
        RETURNING *`,
       [result.id, result.url, productId, payload.organizationId]
     );
+    logger.info('[ImageUpload] DB updated', { productId, rowsReturned: rows.length, newImageId: result.id });
+
+    // Clean up old image file if it existed and is different from the new one
+    if (oldImageId && oldImageId !== result.id) {
+      logger.info('[ImageUpload] Deleting old image', { oldImageId, newImageId: result.id });
+      imageService.delete(oldImageId).catch((err: any) => {
+        logger.warn('Failed to delete old product image', { oldImageId, error: err.message });
+      });
+    }
 
     if (!rows[0]) {
+      logger.error('[ImageUpload] Product not found after update', { productId });
       return c.json({ error: 'Product not found' }, 404);
     }
 
     const row = rows[0];
-    logger.info('Product image updated', { productId: row.id, imageId: result.id });
+    logger.info('[ImageUpload] SUCCESS', { productId: row.id, imageId: result.id, imageUrl: result.url });
 
     return c.json({
       id: row.id,
