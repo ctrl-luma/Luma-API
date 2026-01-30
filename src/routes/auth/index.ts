@@ -703,6 +703,15 @@ app.openapi(getCurrentUserRoute, async (c) => {
         : dbUser.created_at.toISOString(),
       // Include subscription info so frontend has it immediately
       subscription,
+      tapToPayDeviceIds: await (async () => {
+        const orgResult = await query<{ tap_to_pay_device_ids: string[] | null }>(
+          'SELECT tap_to_pay_device_ids FROM organizations WHERE id = $1',
+          [dbUser.organization_id]
+        );
+        return orgResult.length > 0 && Array.isArray(orgResult[0].tap_to_pay_device_ids)
+          ? orgResult[0].tap_to_pay_device_ids
+          : [];
+      })(),
     });
   } catch (error: any) {
     logger.error('Get current user error', {
@@ -1875,6 +1884,111 @@ app.openapi(linkIapPurchaseRoute, async (c) => {
     }
 
     return c.json({ error: 'Failed to link purchase' }, 500);
+  }
+});
+
+// Register Tap to Pay device endpoint
+const TapToPayDeviceRequestSchema = z.object({
+  deviceId: z.string().min(1),
+});
+
+const registerTapToPayDeviceRoute = createRoute({
+  method: 'post',
+  path: '/auth/tap-to-pay-device',
+  summary: 'Register a device where Tap to Pay has been enabled',
+  tags: ['Authentication'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: TapToPayDeviceRequestSchema,
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Device registered',
+      content: {
+        'application/json': {
+          schema: z.object({
+            tapToPayDeviceIds: z.array(z.string()),
+          }),
+        },
+      },
+    },
+    401: {
+      description: 'Unauthorized',
+    },
+  },
+});
+
+app.openapi(registerTapToPayDeviceRoute, async (c) => {
+  const authHeader = c.req.header('Authorization');
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    const payload = await authService.verifyToken(token);
+    const body = await c.req.json();
+    const validated = TapToPayDeviceRequestSchema.parse(body);
+
+    // Get current user to find their organization
+    const dbUser = await authService.getUserById(payload.userId);
+    if (!dbUser) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    // Get organization's current device IDs
+    const orgRows = await query<{ tap_to_pay_device_ids: string[] | null }>(
+      'SELECT tap_to_pay_device_ids FROM organizations WHERE id = $1',
+      [dbUser.organization_id]
+    );
+
+    if (orgRows.length === 0) {
+      return c.json({ error: 'Organization not found' }, 404);
+    }
+
+    // Append device ID if not already present
+    const currentIds: string[] = Array.isArray(orgRows[0].tap_to_pay_device_ids)
+      ? orgRows[0].tap_to_pay_device_ids
+      : [];
+
+    if (!currentIds.includes(validated.deviceId)) {
+      currentIds.push(validated.deviceId);
+    }
+
+    // Update organization record
+    await query(
+      `UPDATE organizations SET tap_to_pay_device_ids = $1, updated_at = NOW() WHERE id = $2`,
+      [JSON.stringify(currentIds), dbUser.organization_id]
+    );
+
+    logger.info('Tap to Pay device registered', {
+      userId: payload.userId,
+      organizationId: dbUser.organization_id,
+      deviceId: validated.deviceId,
+      totalDevices: currentIds.length,
+    });
+
+    return c.json({ tapToPayDeviceIds: currentIds });
+  } catch (error: any) {
+    logger.error('Register Tap to Pay device error', { error });
+
+    if (error.issues) {
+      return c.json({ error: 'Invalid request data', details: error.issues }, 400);
+    }
+
+    if (error.message === 'Invalid token' || error.message === 'Token expired') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    return c.json({ error: 'Failed to register device' }, 500);
   }
 });
 

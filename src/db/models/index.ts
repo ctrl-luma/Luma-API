@@ -4,6 +4,7 @@ export interface Organization {
   stripe_account_id: string | null;
   stripe_onboarding_completed: boolean;
   settings: Record<string, any>;
+  tap_to_pay_device_ids: string[] | null;
   created_at: Date;
   updated_at: Date;
 }
