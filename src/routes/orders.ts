@@ -1144,7 +1144,7 @@ app.openapi(completeCashPaymentRoute, async (c) => {
     }
 
     const order = existingOrder[0] as any;
-    const totalAmountCents = parseFloat(order.total_amount) * 100;
+    const totalAmountCents = Math.round(parseFloat(order.total_amount) * 100);
 
     // Check that cash is sufficient
     if (body.cashTendered < totalAmountCents) {
@@ -1184,7 +1184,7 @@ app.openapi(completeCashPaymentRoute, async (c) => {
       [
         id,
         totalAmountCents,
-        parseFloat(order.tip_amount) * 100,
+        Math.round(parseFloat(order.tip_amount) * 100),
         body.cashTendered,
         changeAmount,
         payload.userId,
@@ -1320,7 +1320,7 @@ app.openapi(addPaymentRoute, async (c) => {
     }
 
     const order = existingOrder[0] as any;
-    const totalAmountCents = parseFloat(order.total_amount) * 100;
+    const totalAmountCents = Math.round(parseFloat(order.total_amount) * 100);
 
     // Only pending or held orders can receive payments
     if (!['pending', 'held', 'processing'].includes(order.status)) {
@@ -1481,7 +1481,7 @@ app.openapi(getOrderPaymentsRoute, async (c) => {
       return c.json({ error: 'Order not found' }, 404);
     }
 
-    const orderTotal = parseFloat((orderResult[0] as any).total_amount) * 100;
+    const orderTotal = Math.round(parseFloat((orderResult[0] as any).total_amount) * 100);
 
     // Get payments
     const paymentRows = await query(

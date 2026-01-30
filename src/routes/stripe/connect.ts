@@ -1146,7 +1146,7 @@ app.openapi(listTransactionsRoute, async (c) => {
     const { authService } = await import('../../services/auth');
     const payload = await authService.verifyToken(token);
 
-    // Get connected account
+    // Get connected account (needed for Stripe charge lookups)
     const rows = await query<StripeConnectedAccount>(
       'SELECT * FROM stripe_connected_accounts WHERE organization_id = $1',
       [payload.organizationId]
@@ -1158,227 +1158,224 @@ app.openapi(listTransactionsRoute, async (c) => {
 
     const connectedAccount = rows[0];
     const queryParams = c.req.query();
-    const catalogIdFilter = queryParams.catalog_id;
-    const customerEmailFilter = queryParams.customer_email?.toLowerCase();
-    const deviceIdFilter = queryParams.device_id;
-    const dateFrom = queryParams.date_from ? parseInt(queryParams.date_from) : undefined;
-    const dateTo = queryParams.date_to ? parseInt(queryParams.date_to) : undefined;
-    const amountMin = queryParams.amount_min ? parseInt(queryParams.amount_min) : undefined;
-    const amountMax = queryParams.amount_max ? parseInt(queryParams.amount_max) : undefined;
+    const catalogIdFilter = queryParams.catalog_id || null;
+    const customerEmailFilter = queryParams.customer_email?.toLowerCase() || null;
+    const deviceIdFilter = queryParams.device_id || null;
+    const dateFrom = queryParams.date_from ? parseInt(queryParams.date_from) : null;
+    const dateTo = queryParams.date_to ? parseInt(queryParams.date_to) : null;
+    const amountMin = queryParams.amount_min ? parseInt(queryParams.amount_min) : null;
+    const amountMax = queryParams.amount_max ? parseInt(queryParams.amount_max) : null;
     const sortBy = queryParams.sort_by || 'date';
     const sortOrder = queryParams.sort_order || 'desc';
     const requestedLimit = queryParams.limit ? parseInt(queryParams.limit) : 25;
+    const startingAfter = queryParams.starting_after || null;
 
-    // If filtering, fetch more to compensate for filtered results
-    const hasFilter = catalogIdFilter || customerEmailFilter || deviceIdFilter || amountMin !== undefined || amountMax !== undefined;
-    const fetchLimit = hasFilter ? Math.min(requestedLimit * 3, 100) : requestedLimit;
-
-    // Build created date range filter for Stripe API
-    const createdFilter: { gte?: number; lte?: number } = {};
-    if (dateFrom) createdFilter.gte = dateFrom;
-    if (dateTo) createdFilter.lte = dateTo;
-
-    // Get charges from Stripe
-    const charges = await stripeService.listConnectedAccountCharges(
-      connectedAccount.stripe_account_id,
-      {
-        limit: fetchLimit,
-        starting_after: queryParams.starting_after,
-        ending_before: queryParams.ending_before,
-        created: Object.keys(createdFilter).length > 0 ? createdFilter : undefined,
-      }
-    );
-
-    // Filter by catalog_id, customer_email, and amount range if provided
-    let filteredCharges = charges.data;
-
-    // Debug logging for customer email filter
-    if (customerEmailFilter) {
-      logger.info('Transaction filter: customer_email search', {
-        searchEmail: customerEmailFilter,
-        totalChargesBefore: charges.data.length,
-        chargesWithReceiptEmail: charges.data.filter(c => c.receipt_email).length,
-        chargesWithBillingEmail: charges.data.filter(c => c.billing_details?.email).length,
-        chargesWithMetadataEmail: charges.data.filter(c => c.metadata?.customerEmail || c.metadata?.customer_email).length,
-        sampleCharges: charges.data.slice(0, 5).map(c => ({
-          id: c.id,
-          receipt_email: c.receipt_email,
-          billing_email: c.billing_details?.email,
-          metadata_email: c.metadata?.customerEmail || c.metadata?.customer_email,
-          created: new Date(c.created * 1000).toISOString(),
-        })),
-      });
-    }
+    // DB-first: Query orders table with all filters applied at the DB level
+    // This includes ALL payment types: tap_to_pay, cash, split, card
+    const conditions: string[] = ['o.organization_id = $1', "o.status IN ('completed', 'refunded')"];
+    const params: any[] = [payload.organizationId];
+    let paramIndex = 2;
 
     if (catalogIdFilter) {
-      filteredCharges = filteredCharges.filter(
-        (charge) => charge.metadata?.catalogId === catalogIdFilter
-      );
+      conditions.push(`o.catalog_id = $${paramIndex}`);
+      params.push(catalogIdFilter);
+      paramIndex++;
     }
     if (deviceIdFilter) {
-      // Get charge IDs from orders table for this device
-      const deviceOrderCharges = await query<{ stripe_charge_id: string }>(
-        `SELECT stripe_charge_id FROM orders
-         WHERE organization_id = $1
-         AND device_id = $2
-         AND stripe_charge_id IS NOT NULL`,
-        [payload.organizationId, deviceIdFilter]
-      );
-      const chargeIdsFromDevice = new Set(deviceOrderCharges.map(o => o.stripe_charge_id));
-
-      filteredCharges = filteredCharges.filter((charge) => chargeIdsFromDevice.has(charge.id));
+      conditions.push(`o.device_id = $${paramIndex}`);
+      params.push(deviceIdFilter);
+      paramIndex++;
     }
     if (customerEmailFilter) {
-      // Also get charge IDs from orders table for this customer (catches charges without receipt_email)
-      const orderChargeIds = await query<{ stripe_charge_id: string }>(
-        `SELECT stripe_charge_id FROM orders
-         WHERE organization_id = $1
-         AND LOWER(customer_email) LIKE $2
-         AND stripe_charge_id IS NOT NULL`,
-        [payload.organizationId, `%${customerEmailFilter}%`]
+      conditions.push(`LOWER(o.customer_email) LIKE $${paramIndex}`);
+      params.push(`%${customerEmailFilter}%`);
+      paramIndex++;
+    }
+    if (dateFrom) {
+      conditions.push(`o.created_at >= to_timestamp($${paramIndex})`);
+      params.push(dateFrom);
+      paramIndex++;
+    }
+    if (dateTo) {
+      conditions.push(`o.created_at <= to_timestamp($${paramIndex})`);
+      params.push(dateTo);
+      paramIndex++;
+    }
+    if (amountMin !== null) {
+      conditions.push(`o.total_amount >= $${paramIndex}`);
+      params.push(amountMin);
+      paramIndex++;
+    }
+    if (amountMax !== null) {
+      conditions.push(`o.total_amount <= $${paramIndex}`);
+      params.push(amountMax);
+      paramIndex++;
+    }
+
+    // Cursor pagination: fetch orders created before the cursor order
+    if (startingAfter) {
+      // Look up the created_at of the cursor order
+      const cursorRows = await query<{ created_at: Date }>(
+        'SELECT created_at FROM orders WHERE id = $1',
+        [startingAfter]
       );
-      const chargeIdsFromOrders = new Set(orderChargeIds.map(o => o.stripe_charge_id));
-
-      logger.info('Transaction filter: orders table lookup', {
-        searchEmail: customerEmailFilter,
-        chargeIdsFromOrders: Array.from(chargeIdsFromOrders),
-      });
-
-      // Check receipt_email, billing_details.email, metadata, OR charge ID from orders table
-      filteredCharges = filteredCharges.filter((charge) => {
-        // First check if this charge ID is in our orders table for this customer
-        if (chargeIdsFromOrders.has(charge.id)) {
-          return true;
-        }
-
-        const receiptEmail = charge.receipt_email?.toLowerCase();
-        const billingEmail = charge.billing_details?.email?.toLowerCase();
-        const metadataEmail = (charge.metadata?.customerEmail || charge.metadata?.customer_email)?.toLowerCase();
-
-        return receiptEmail?.includes(customerEmailFilter) ||
-               billingEmail?.includes(customerEmailFilter) ||
-               metadataEmail?.includes(customerEmailFilter);
-      });
-
-      logger.info('Transaction filter: after customer_email filter', {
-        searchEmail: customerEmailFilter,
-        matchingCharges: filteredCharges.length,
-        matchingIds: filteredCharges.map(c => c.id),
-      });
-    }
-    if (amountMin !== undefined) {
-      filteredCharges = filteredCharges.filter((charge) => charge.amount >= amountMin);
-    }
-    if (amountMax !== undefined) {
-      filteredCharges = filteredCharges.filter((charge) => charge.amount <= amountMax);
-    }
-
-    // Sort the results
-    filteredCharges.sort((a, b) => {
-      let comparison = 0;
-      switch (sortBy) {
-        case 'date':
-          comparison = a.created - b.created;
-          break;
-        case 'amount':
-          comparison = a.amount - b.amount;
-          break;
-        case 'email':
-          const emailA = (a.receipt_email || '').toLowerCase();
-          const emailB = (b.receipt_email || '').toLowerCase();
-          comparison = emailA.localeCompare(emailB);
-          break;
+      if (cursorRows.length > 0) {
+        conditions.push(`(o.created_at < $${paramIndex} OR (o.created_at = $${paramIndex} AND o.id < $${paramIndex + 1}))`);
+        params.push(cursorRows[0].created_at, startingAfter);
+        paramIndex += 2;
       }
-      return sortOrder === 'asc' ? comparison : -comparison;
-    });
+    }
 
-    // Limit to requested amount
-    const limitedCharges = filteredCharges.slice(0, requestedLimit);
-    const hasMoreFiltered = hasFilter
-      ? filteredCharges.length > requestedLimit || charges.has_more
-      : charges.has_more;
+    // Build sort clause
+    let orderClause = 'o.created_at DESC, o.id DESC';
+    if (sortBy === 'amount') {
+      orderClause = sortOrder === 'asc' ? 'o.total_amount ASC, o.id DESC' : 'o.total_amount DESC, o.id DESC';
+    } else if (sortBy === 'email') {
+      orderClause = sortOrder === 'asc' ? 'o.customer_email ASC NULLS LAST, o.id DESC' : 'o.customer_email DESC NULLS LAST, o.id DESC';
+    } else if (sortOrder === 'asc') {
+      orderClause = 'o.created_at ASC, o.id ASC';
+    }
 
-    // Format the response
-    const formattedTransactions = limitedCharges.map((charge) => {
+    // Fetch one extra to check hasMore
+    params.push(requestedLimit + 1);
+
+    const orderRows = await query<{
+      id: string;
+      order_number: string;
+      status: string;
+      payment_method: string | null;
+      subtotal: string;
+      tax_amount: string;
+      tip_amount: string;
+      total_amount: string;
+      stripe_charge_id: string | null;
+      stripe_payment_intent_id: string | null;
+      customer_email: string | null;
+      device_id: string | null;
+      catalog_id: string | null;
+      metadata: any;
+      created_at: Date;
+    }>(
+      `SELECT o.id, o.order_number, o.status, o.payment_method,
+              o.subtotal, o.tax_amount, o.tip_amount, o.total_amount,
+              o.stripe_charge_id, o.stripe_payment_intent_id,
+              o.customer_email, o.device_id, o.catalog_id,
+              o.metadata, o.created_at
+       FROM orders o
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY ${orderClause}
+       LIMIT $${paramIndex}`,
+      params
+    );
+
+    const hasMore = orderRows.length > requestedLimit;
+    const orders = orderRows.slice(0, requestedLimit);
+
+    // Batch-fetch Stripe charge details for orders that have stripe_charge_id
+    const chargeIds = orders
+      .map(o => o.stripe_charge_id)
+      .filter((id): id is string => id !== null);
+
+    const chargeMap = new Map<string, Stripe.Charge>();
+    if (chargeIds.length > 0) {
+      try {
+        const chargePromises = chargeIds.map(id =>
+          stripeService.retrieveConnectedAccountCharge(
+            connectedAccount.stripe_account_id,
+            id
+          ).catch(err => {
+            logger.warn('Failed to fetch Stripe charge', { chargeId: id, error: err.message });
+            return null;
+          })
+        );
+        const charges = await Promise.all(chargePromises);
+        charges.forEach((charge) => {
+          if (charge) chargeMap.set(charge.id, charge);
+        });
+      } catch (err) {
+        logger.warn('Failed to batch-fetch Stripe charges', { error: err });
+      }
+    }
+
+    // Format response: merge DB order data with Stripe charge details
+    const formattedTransactions = orders.map((order) => {
+      const charge = order.stripe_charge_id ? chargeMap.get(order.stripe_charge_id) : null;
+      const totalAmount = Math.round(parseFloat(order.total_amount) * 100);
+
       // Determine status
-      let status: 'succeeded' | 'pending' | 'failed' | 'refunded' | 'partially_refunded' = 'pending';
-      if (charge.status === 'succeeded') {
+      let status: 'succeeded' | 'pending' | 'failed' | 'refunded' | 'partially_refunded' = 'succeeded';
+      if (order.status === 'refunded') {
+        status = 'refunded';
+      } else if (charge) {
         if (charge.refunded) {
           status = 'refunded';
         } else if (charge.amount_refunded > 0) {
           status = 'partially_refunded';
-        } else {
-          status = 'succeeded';
         }
-      } else if (charge.status === 'failed') {
-        status = 'failed';
       }
 
-      // Get payment method details
-      let paymentMethod = null;
-      if (charge.payment_method_details) {
+      // Payment method: from Stripe charge or from order payment_method
+      let paymentMethod: { type: string; brand: string | null; last4: string | null } | null = null;
+      if (charge?.payment_method_details) {
         const pm = charge.payment_method_details;
         if (pm.card) {
-          paymentMethod = {
-            type: 'card',
-            brand: pm.card.brand,
-            last4: pm.card.last4,
-          };
+          paymentMethod = { type: 'card', brand: pm.card.brand, last4: pm.card.last4 };
+        } else if (pm.card_present) {
+          paymentMethod = { type: 'card_present', brand: pm.card_present.brand, last4: pm.card_present.last4 };
         } else if (pm.type) {
-          paymentMethod = {
-            type: pm.type,
-            brand: null,
-            last4: null,
-          };
+          paymentMethod = { type: pm.type, brand: null, last4: null };
         }
+      } else if (order.payment_method) {
+        // No Stripe charge — use order payment method (cash, split, etc.)
+        paymentMethod = { type: order.payment_method, brand: null, last4: null };
       }
 
-      // Calculate fees (all in cents)
-      // Platform fee from application_fee_amount or metadata
-      const platformFee = (charge as any).application_fee_amount ||
-        (charge.metadata?.platform_fee_cents ? parseInt(charge.metadata.platform_fee_cents) : 0);
-
-      // Stripe fee: 2.7% + 15¢ for Tap to Pay (card_present)
-      // Standard card: 2.9% + 30¢
-      const isCardPresent = charge.payment_method_details?.type === 'card_present';
-      const stripeFeePercent = isCardPresent ? 0.027 : 0.029;
-      const stripeFeeFixed = isCardPresent ? 15 : 30;
-      const stripeFee = Math.round(charge.amount * stripeFeePercent) + stripeFeeFixed;
-
-      // Combine fees for vendor display
-      const processingFee = stripeFee + platformFee;
-      const netAmount = charge.amount - processingFee - charge.amount_refunded;
+      // Calculate fees (only for Stripe charges)
+      let fees: { processingFee: number; netAmount: number } | undefined;
+      if (charge) {
+        const platformFee = (charge as any).application_fee_amount ||
+          (charge.metadata?.platform_fee_cents ? parseInt(charge.metadata.platform_fee_cents) : 0);
+        const isCardPresent = charge.payment_method_details?.type === 'card_present';
+        const stripeFeePercent = isCardPresent ? 0.027 : 0.029;
+        const stripeFeeFixed = isCardPresent ? 15 : 30;
+        const stripeFee = Math.round(charge.amount * stripeFeePercent) + stripeFeeFixed;
+        const processingFee = stripeFee + platformFee;
+        fees = {
+          processingFee,
+          netAmount: charge.amount - processingFee - charge.amount_refunded,
+        };
+      } else {
+        // Cash/split: no processing fees
+        fees = { processingFee: 0, netAmount: totalAmount };
+      }
 
       return {
-        id: charge.id,
-        amount: charge.amount, // Keep in cents for consistency with app
-        amountRefunded: charge.amount_refunded, // Keep in cents
-        currency: charge.currency,
+        id: order.id,
+        amount: totalAmount,
+        amountRefunded: charge?.amount_refunded || 0,
+        currency: charge?.currency || 'usd',
         status,
-        description: charge.description,
-        customerEmail: charge.billing_details?.email || charge.receipt_email || null,
-        customerName: charge.billing_details?.name || null,
+        description: charge?.description || null,
+        customerEmail: order.customer_email || charge?.billing_details?.email || charge?.receipt_email || null,
+        customerName: charge?.billing_details?.name || null,
         paymentMethod,
-        receiptUrl: charge.receipt_url,
-        created: charge.created,
-        metadata: charge.metadata,
-        fees: {
-          processingFee,
-          netAmount,
-        },
+        receiptUrl: charge?.receipt_url || null,
+        created: Math.floor(new Date(order.created_at).getTime() / 1000),
+        metadata: charge?.metadata || (typeof order.metadata === 'object' ? order.metadata : undefined),
+        fees,
       };
     });
 
-    logger.info('Retrieved connected account transactions', {
-      accountId: connectedAccount.stripe_account_id,
+    logger.info('Retrieved transactions (DB-first)', {
       organizationId: payload.organizationId,
       count: formattedTransactions.length,
-      catalogIdFilter: catalogIdFilter || null,
+      hasMore,
+      filters: { catalogIdFilter, deviceIdFilter, customerEmailFilter },
     });
 
     return c.json({
       data: formattedTransactions,
-      hasMore: hasMoreFiltered,
+      hasMore,
     });
   } catch (error) {
     logger.error('Error listing transactions', { error });
@@ -1477,56 +1474,122 @@ app.openapi(getTransactionRoute, async (c) => {
     const { authService } = await import('../../services/auth');
     const payload = await authService.verifyToken(token);
 
-    // Get connected account
-    const rows = await query<StripeConnectedAccount>(
+    // Get connected account (needed for Stripe lookups)
+    const accountRows = await query<StripeConnectedAccount>(
       'SELECT * FROM stripe_connected_accounts WHERE organization_id = $1',
       [payload.organizationId]
     );
 
-    if (rows.length === 0) {
+    if (accountRows.length === 0) {
       return c.json({ error: 'No connected account found' }, 404);
     }
 
-    const connectedAccount = rows[0];
+    const connectedAccount = accountRows[0];
 
-    // Get charge from Stripe
-    const charge = await stripeService.retrieveConnectedAccountCharge(
-      connectedAccount.stripe_account_id,
-      transactionId
+    // Look up order by ID (transaction IDs are now order IDs)
+    const orderRows = await query<{
+      id: string;
+      order_number: string;
+      status: string;
+      payment_method: string | null;
+      subtotal: string;
+      tax_amount: string;
+      tip_amount: string;
+      total_amount: string;
+      stripe_charge_id: string | null;
+      stripe_payment_intent_id: string | null;
+      customer_email: string | null;
+      metadata: any;
+      created_at: Date;
+    }>(
+      'SELECT id, order_number, status, payment_method, subtotal, tax_amount, tip_amount, total_amount, stripe_charge_id, stripe_payment_intent_id, customer_email, metadata, created_at FROM orders WHERE id = $1 AND organization_id = $2',
+      [transactionId, payload.organizationId]
     );
 
+    if (orderRows.length === 0) {
+      return c.json({ error: 'Transaction not found' }, 404);
+    }
+
+    const order = orderRows[0];
+    const totalAmount = Math.round(parseFloat(order.total_amount) * 100);
+    const orderMetadata = typeof order.metadata === 'string' ? JSON.parse(order.metadata) : (order.metadata || {});
+
+    // Fetch Stripe charge — from order directly, or from order_payments for split payments
+    let charge: Stripe.Charge | null = null;
+    let stripeChargeId = order.stripe_charge_id;
+
+    if (!stripeChargeId && order.payment_method === 'split') {
+      // For split payments, find the first card payment with a stripe charge
+      const cardPayments = await query<{ stripe_payment_intent_id: string | null }>(
+        `SELECT stripe_payment_intent_id FROM order_payments
+         WHERE order_id = $1 AND payment_method IN ('card', 'tap_to_pay') AND stripe_payment_intent_id IS NOT NULL
+         ORDER BY created_at ASC LIMIT 1`,
+        [order.id]
+      );
+      if (cardPayments.length > 0 && cardPayments[0].stripe_payment_intent_id) {
+        // Retrieve the payment intent to get the charge ID
+        try {
+          const pi = await stripe.paymentIntents.retrieve(
+            cardPayments[0].stripe_payment_intent_id,
+            { stripeAccount: connectedAccount.stripe_account_id }
+          );
+          if (pi.latest_charge && typeof pi.latest_charge === 'string') {
+            stripeChargeId = pi.latest_charge;
+          } else if (pi.latest_charge && typeof pi.latest_charge === 'object') {
+            stripeChargeId = (pi.latest_charge as any).id;
+          }
+        } catch (err: any) {
+          logger.warn('Failed to fetch payment intent for split payment', { error: err.message });
+        }
+      }
+    }
+
+    if (stripeChargeId) {
+      try {
+        charge = await stripeService.retrieveConnectedAccountCharge(
+          connectedAccount.stripe_account_id,
+          stripeChargeId
+        );
+      } catch (err: any) {
+        logger.warn('Failed to fetch Stripe charge for transaction detail', {
+          chargeId: stripeChargeId,
+          error: err.message,
+        });
+      }
+    }
+
     // Determine status
-    let status: string = charge.status;
-    if (charge.status === 'succeeded') {
+    let status: string = 'succeeded';
+    if (order.status === 'refunded') {
+      status = 'refunded';
+    } else if (charge) {
       if (charge.refunded) {
         status = 'refunded';
       } else if (charge.amount_refunded > 0) {
         status = 'partially_refunded';
+      } else {
+        status = charge.status;
       }
     }
 
-    // Get payment method details
-    let paymentMethod = null;
-    if (charge.payment_method_details) {
+    // Payment method
+    let paymentMethod: { type: string; brand: string | null; last4: string | null } | null = null;
+    if (charge?.payment_method_details) {
       const pm = charge.payment_method_details;
       if (pm.card) {
-        paymentMethod = {
-          type: 'card',
-          brand: pm.card.brand,
-          last4: pm.card.last4,
-        };
+        paymentMethod = { type: 'card', brand: pm.card.brand, last4: pm.card.last4 };
+      } else if (pm.card_present) {
+        paymentMethod = { type: 'card_present', brand: pm.card_present.brand, last4: pm.card_present.last4 };
       } else if (pm.type) {
-        paymentMethod = {
-          type: pm.type,
-          brand: null,
-          last4: null,
-        };
+        paymentMethod = { type: pm.type, brand: null, last4: null };
       }
+    } else if (order.payment_method) {
+      paymentMethod = { type: order.payment_method, brand: null, last4: null };
     }
 
-    // Get billing address
+    // Billing address
     let billingAddress = null;
-    if (charge.billing_details?.address) {
+    if (charge?.billing_details?.address) {
       const addr = charge.billing_details.address;
       billingAddress = {
         line1: addr.line1,
@@ -1538,107 +1601,98 @@ app.openapi(getTransactionRoute, async (c) => {
       };
     }
 
-    // Format refunds
-    const refunds = (charge.refunds?.data || []).map((refund) => ({
-      id: refund.id,
-      amount: refund.amount, // Keep in cents
-      status: refund.status || 'unknown',
-      reason: refund.reason,
-      created: refund.created,
-    }));
+    // Refunds from Stripe
+    const refunds = charge
+      ? (charge.refunds?.data || []).map((refund) => ({
+          id: refund.id,
+          amount: refund.amount,
+          status: refund.status || 'unknown',
+          reason: refund.reason,
+          created: refund.created,
+        }))
+      : [];
 
-    // Calculate fees (all in cents)
-    const platformFee = (charge as any).application_fee_amount ||
-      (charge.metadata?.platform_fee_cents ? parseInt(charge.metadata.platform_fee_cents) : 0);
+    // Fees
+    let processingFee = 0;
+    let netAmount = totalAmount;
+    if (charge) {
+      const platformFee = (charge as any).application_fee_amount ||
+        (charge.metadata?.platform_fee_cents ? parseInt(charge.metadata.platform_fee_cents) : 0);
+      const isCardPresent = charge.payment_method_details?.type === 'card_present';
+      const stripeFeePercent = isCardPresent ? 0.027 : 0.029;
+      const stripeFeeFixed = isCardPresent ? 15 : 30;
+      const stripeFee = Math.round(charge.amount * stripeFeePercent) + stripeFeeFixed;
+      processingFee = stripeFee + platformFee;
+      netAmount = charge.amount - processingFee - charge.amount_refunded;
+    }
 
-    // Stripe fee: 2.7% + 15¢ for Tap to Pay (card_present), 2.9% + 30¢ for online
-    const isCardPresent = charge.payment_method_details?.type === 'card_present';
-    const stripeFeePercent = isCardPresent ? 0.027 : 0.029;
-    const stripeFeeFixed = isCardPresent ? 15 : 30;
-    const stripeFee = Math.round(charge.amount * stripeFeePercent) + stripeFeeFixed;
+    // Order items
+    const itemRows = await query<{
+      id: string;
+      product_id: string | null;
+      name: string;
+      quantity: number;
+      unit_price: string;
+    }>(
+      'SELECT id, product_id, name, quantity, unit_price FROM order_items WHERE order_id = $1',
+      [order.id]
+    );
 
-    // Combine fees for vendor display
-    const processingFee = stripeFee + platformFee;
-    const netAmount = charge.amount - processingFee - charge.amount_refunded;
+    const orderItems = itemRows.length > 0
+      ? itemRows.map((item) => ({
+          id: item.id,
+          productId: item.product_id,
+          name: item.name,
+          quantity: item.quantity,
+          unitPrice: Math.round(parseFloat(item.unit_price) * 100),
+        }))
+      : undefined;
 
-    // Look up order and order items if we have a payment intent
-    let orderItems: Array<{ id: string; productId: string | null; name: string; quantity: number; unitPrice: number }> | undefined;
-    let isQuickCharge: boolean | undefined;
-    let tipAmount: number | undefined;
-    let taxAmount: number | undefined;
-
-    if (charge.payment_intent) {
-      const paymentIntentId = typeof charge.payment_intent === 'string'
-        ? charge.payment_intent
-        : charge.payment_intent.id;
-
-      const orderRows = await query<{ id: string; metadata: any; tip_amount: string; tax_amount: string }>(
-        'SELECT id, metadata, tip_amount, tax_amount FROM orders WHERE stripe_payment_intent_id = $1 AND organization_id = $2',
-        [paymentIntentId, payload.organizationId]
+    // Cash payment details
+    let cashTendered: number | null = null;
+    let cashChange: number | null = null;
+    if (order.payment_method === 'cash') {
+      const paymentRows = await query<{ cash_tendered: string | null; cash_change: string | null }>(
+        'SELECT cash_tendered, cash_change FROM order_payments WHERE order_id = $1 AND payment_method = $2 LIMIT 1',
+        [order.id, 'cash']
       );
-
-      if (orderRows.length > 0) {
-        const order = orderRows[0];
-        const orderMetadata = typeof order.metadata === 'string' ? JSON.parse(order.metadata) : order.metadata;
-        isQuickCharge = orderMetadata?.isQuickCharge || false;
-        tipAmount = Math.round(parseFloat(order.tip_amount || '0') * 100); // Convert to cents
-        taxAmount = Math.round(parseFloat(order.tax_amount || '0') * 100); // Convert to cents
-
-        // Get order items
-        const itemRows = await query<{
-          id: string;
-          product_id: string | null;
-          name: string;
-          quantity: number;
-          unit_price: string;
-        }>(
-          'SELECT id, product_id, name, quantity, unit_price FROM order_items WHERE order_id = $1',
-          [order.id]
-        );
-
-        if (itemRows.length > 0) {
-          orderItems = itemRows.map((item) => ({
-            id: item.id,
-            productId: item.product_id,
-            name: item.name,
-            quantity: item.quantity,
-            unitPrice: Math.round(parseFloat(item.unit_price) * 100), // Convert to cents
-          }));
-        }
+      if (paymentRows.length > 0) {
+        cashTendered = paymentRows[0].cash_tendered ? parseInt(paymentRows[0].cash_tendered) : null;
+        cashChange = paymentRows[0].cash_change ? parseInt(paymentRows[0].cash_change) : null;
       }
     }
 
+    const isQuickCharge = orderMetadata?.isQuickCharge || false;
+    const tipAmount = Math.round(parseFloat(order.tip_amount || '0') * 100);
+    const taxAmount = Math.round(parseFloat(order.tax_amount || '0') * 100);
+
     return c.json({
-      id: charge.id,
-      amount: charge.amount, // Keep in cents for consistency with app
-      amountRefunded: charge.amount_refunded, // Keep in cents
-      currency: charge.currency,
+      id: order.id,
+      amount: totalAmount,
+      amountRefunded: charge?.amount_refunded || 0,
+      currency: charge?.currency || 'usd',
       status,
-      description: charge.description,
-      customerEmail: charge.billing_details?.email || charge.receipt_email || null,
-      customerName: charge.billing_details?.name || null,
+      description: charge?.description || null,
+      customerEmail: order.customer_email || charge?.billing_details?.email || charge?.receipt_email || null,
+      customerName: charge?.billing_details?.name || null,
       billingAddress,
       paymentMethod,
-      receiptUrl: charge.receipt_url,
-      created: charge.created,
-      metadata: charge.metadata,
+      receiptUrl: charge?.receipt_url || null,
+      created: Math.floor(new Date(order.created_at).getTime() / 1000),
+      metadata: charge?.metadata || orderMetadata,
       refunds,
-      fees: {
-        processingFee,
-        netAmount,
-      },
+      fees: { processingFee, netAmount },
       orderItems,
       isQuickCharge,
       tipAmount,
       taxAmount,
+      cashTendered,
+      cashChange,
     });
   } catch (error: any) {
     logger.error('Error getting transaction', { error, transactionId });
     if (error instanceof Error && error.message === 'Invalid token') {
       return c.json({ error: 'Unauthorized' }, 401);
-    }
-    if (error.type === 'StripeInvalidRequestError') {
-      return c.json({ error: 'Transaction not found' }, 404);
     }
     return c.json({ error: 'Failed to get transaction' }, 500);
   }
@@ -1722,11 +1776,58 @@ app.openapi(refundTransactionRoute, async (c) => {
     const connectedAccount = rows[0];
     const body = await c.req.json();
 
-    // Create refund
+    // transactionId is now an order ID — look up the order
+    const orderLookup = await query<{ id: string; order_number: string; stripe_charge_id: string | null; payment_method: string | null; total_amount: string }>(
+      'SELECT id, order_number, stripe_charge_id, payment_method, total_amount FROM orders WHERE id = $1 AND organization_id = $2',
+      [transactionId, payload.organizationId]
+    );
+
+    if (orderLookup.length === 0) {
+      return c.json({ error: 'Transaction not found' }, 404);
+    }
+
+    const order = orderLookup[0];
+
+    // Cash payments: refund via DB only (no Stripe charge to refund)
+    if (!order.stripe_charge_id) {
+      const orderTotalCents = Math.round(parseFloat(order.total_amount) * 100);
+      const refundAmount = body.amount || orderTotalCents;
+      const isFullRefund = refundAmount >= orderTotalCents;
+      const newStatus = isFullRefund ? 'refunded' : 'partially_refunded';
+
+      await query(
+        `UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2`,
+        [newStatus, order.id]
+      );
+
+      socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_REFUNDED, {
+        orderId: order.id,
+        orderNumber: order.order_number,
+        refundAmount: refundAmount / 100,
+        isFullRefund,
+        timestamp: new Date().toISOString(),
+      });
+
+      logger.info('Created cash refund', {
+        orderId: order.id,
+        amount: refundAmount,
+        organizationId: payload.organizationId,
+      });
+
+      return c.json({
+        id: `cash_refund_${order.id}`,
+        amount: refundAmount,
+        status: 'succeeded',
+        reason: body.reason || null,
+        created: Math.floor(Date.now() / 1000),
+      });
+    }
+
+    // Stripe refund using the order's charge ID
     const refund = await stripeService.createConnectedAccountRefund(
       connectedAccount.stripe_account_id,
       {
-        charge: transactionId,
+        charge: order.stripe_charge_id,
         amount: body.amount,
         reason: body.reason,
         metadata: {
@@ -1740,52 +1841,38 @@ app.openapi(refundTransactionRoute, async (c) => {
     // Retrieve the charge to check if it's fully refunded
     const charge = await stripeService.retrieveConnectedAccountCharge(
       connectedAccount.stripe_account_id,
-      transactionId
+      order.stripe_charge_id
     );
 
     const isFullRefund = charge.refunded === true;
     const newStatus = isFullRefund ? 'refunded' : 'partially_refunded';
 
     // Update order status in database
-    const orderResult = await query<{ id: string; order_number: string }>(
-      `UPDATE orders
-       SET status = $1,
-           updated_at = NOW()
-       WHERE stripe_charge_id = $2
-       RETURNING id, order_number`,
-      [newStatus, transactionId]
+    await query(
+      `UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2`,
+      [newStatus, order.id]
     );
 
-    if (orderResult.length > 0) {
-      const order = orderResult[0];
-
-      // Emit socket event for real-time updates
-      socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_REFUNDED, {
-        orderId: order.id,
-        orderNumber: order.order_number,
-        refundAmount: refund.amount / 100,
-        isFullRefund,
-        timestamp: new Date().toISOString(),
-      });
-
-      logger.info('Order status updated after refund', {
-        orderId: order.id,
-        orderNumber: order.order_number,
-        newStatus,
-        isFullRefund,
-      });
-    }
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_REFUNDED, {
+      orderId: order.id,
+      orderNumber: order.order_number,
+      refundAmount: refund.amount / 100,
+      isFullRefund,
+      timestamp: new Date().toISOString(),
+    });
 
     logger.info('Created refund', {
       refundId: refund.id,
-      chargeId: transactionId,
+      orderId: order.id,
+      chargeId: order.stripe_charge_id,
       amount: refund.amount,
       organizationId: payload.organizationId,
     });
 
     return c.json({
       id: refund.id,
-      amount: refund.amount, // Keep in cents
+      amount: refund.amount,
       status: refund.status || 'succeeded',
       reason: refund.reason,
       created: refund.created,
@@ -1871,40 +1958,26 @@ app.openapi(sendReceiptRoute, async (c) => {
 
     const connectedAccount = rows[0];
 
-    // Retrieve the charge from Stripe
-    const charge = await stripe.charges.retrieve(
-      transactionId,
-      { expand: ['payment_intent'] },
-      { stripeAccount: connectedAccount.stripe_account_id }
+    // transactionId is now an order ID — look up the order
+    const orderRows = await query<{
+      id: string;
+      order_number: string;
+      status: string;
+      payment_method: string | null;
+      total_amount: string;
+      stripe_charge_id: string | null;
+      customer_email: string | null;
+      created_at: Date;
+    }>(
+      'SELECT id, order_number, status, payment_method, total_amount, stripe_charge_id, customer_email, created_at FROM orders WHERE id = $1 AND organization_id = $2',
+      [transactionId, payload.organizationId]
     );
 
-    // Allow receipts for succeeded charges (refunded charges still have status 'succeeded')
-    if (charge.status !== 'succeeded') {
-      return c.json({ error: 'Transaction must be completed before sending receipt' }, 400);
+    if (orderRows.length === 0) {
+      return c.json({ error: 'Transaction not found' }, 404);
     }
 
-    const receiptUrl = charge.receipt_url || null;
-
-    // Extract card details from the charge
-    const paymentMethodDetails = charge.payment_method_details;
-    let cardBrand: string | undefined;
-    let cardLast4: string | undefined;
-
-    if (paymentMethodDetails?.type === 'card_present' && paymentMethodDetails.card_present) {
-      cardBrand = paymentMethodDetails.card_present.brand || undefined;
-      cardLast4 = paymentMethodDetails.card_present.last4 || undefined;
-    } else if (paymentMethodDetails?.type === 'card' && paymentMethodDetails.card) {
-      cardBrand = paymentMethodDetails.card.brand || undefined;
-      cardLast4 = paymentMethodDetails.card.last4 || undefined;
-    }
-
-    // Get order number from metadata or payment intent
-    let orderNumber: string | undefined;
-    if (charge.metadata?.orderNumber) {
-      orderNumber = charge.metadata.orderNumber;
-    } else if (charge.payment_intent && typeof charge.payment_intent === 'object') {
-      orderNumber = charge.payment_intent.metadata?.orderNumber;
-    }
+    const order = orderRows[0];
 
     // Get organization name for merchant name
     const orgRows = await query<{ name: string }>(
@@ -1913,36 +1986,68 @@ app.openapi(sendReceiptRoute, async (c) => {
     );
     const merchantName = orgRows[0]?.name || undefined;
 
+    let receiptUrl: string | null = null;
+    let cardBrand: string | undefined;
+    let cardLast4: string | undefined;
+    let amount = Math.round(parseFloat(order.total_amount) * 100);
+    let amountRefunded = 0;
+
+    // If this order has a Stripe charge, get details from Stripe
+    if (order.stripe_charge_id) {
+      const charge = await stripe.charges.retrieve(
+        order.stripe_charge_id,
+        { expand: ['payment_intent'] },
+        { stripeAccount: connectedAccount.stripe_account_id }
+      );
+
+      if (charge.status !== 'succeeded') {
+        return c.json({ error: 'Transaction must be completed before sending receipt' }, 400);
+      }
+
+      receiptUrl = charge.receipt_url || null;
+      amountRefunded = charge.amount_refunded || 0;
+
+      const paymentMethodDetails = charge.payment_method_details;
+      if (paymentMethodDetails?.type === 'card_present' && paymentMethodDetails.card_present) {
+        cardBrand = paymentMethodDetails.card_present.brand || undefined;
+        cardLast4 = paymentMethodDetails.card_present.last4 || undefined;
+      } else if (paymentMethodDetails?.type === 'card' && paymentMethodDetails.card) {
+        cardBrand = paymentMethodDetails.card.brand || undefined;
+        cardLast4 = paymentMethodDetails.card.last4 || undefined;
+      }
+    }
+
     // Send receipt via our email service
     logger.info('Sending receipt email', {
       transactionId,
       email,
-      amount: charge.amount,
-      orderNumber,
+      amount,
+      orderNumber: order.order_number,
       cardBrand,
       cardLast4,
       merchantName,
+      paymentMethod: order.payment_method,
       hasReceiptUrl: !!receiptUrl,
     });
 
     await emailService.sendReceipt(email, {
-      amount: charge.amount,
-      amountRefunded: charge.amount_refunded || undefined,
-      orderNumber,
+      amount,
+      amountRefunded: amountRefunded || undefined,
+      orderNumber: order.order_number,
       cardBrand,
       cardLast4,
-      date: new Date(charge.created * 1000),
+      date: new Date(order.created_at),
       receiptUrl: receiptUrl || undefined,
       merchantName,
     });
 
-    logger.info('Receipt email sent successfully from vendor portal', {
+    logger.info('Receipt email sent successfully', {
       transactionId,
       email,
       organizationId: payload.organizationId,
-      amount: charge.amount,
-      amountRefunded: charge.amount_refunded || 0,
-      chargeStatus: charge.status,
+      amount,
+      amountRefunded,
+      paymentMethod: order.payment_method,
     });
 
     return c.json({
