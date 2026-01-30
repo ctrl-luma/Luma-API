@@ -1648,19 +1648,47 @@ app.openapi(getTransactionRoute, async (c) => {
         }))
       : undefined;
 
-    // Cash payment details
+    // Fetch all order payments (for split breakdown and cash details)
+    const allPaymentRows = await query<{
+      id: string;
+      payment_method: string;
+      amount: string;
+      tip_amount: string;
+      status: string;
+      cash_tendered: string | null;
+      cash_change: string | null;
+      stripe_payment_intent_id: string | null;
+      created_at: Date;
+    }>(
+      'SELECT id, payment_method, amount, tip_amount, status, cash_tendered, cash_change, stripe_payment_intent_id, created_at FROM order_payments WHERE order_id = $1 ORDER BY created_at ASC',
+      [order.id]
+    );
+
+    // Cash payment details (for standalone cash orders)
     let cashTendered: number | null = null;
     let cashChange: number | null = null;
     if (order.payment_method === 'cash') {
-      const paymentRows = await query<{ cash_tendered: string | null; cash_change: string | null }>(
-        'SELECT cash_tendered, cash_change FROM order_payments WHERE order_id = $1 AND payment_method = $2 LIMIT 1',
-        [order.id, 'cash']
-      );
-      if (paymentRows.length > 0) {
-        cashTendered = paymentRows[0].cash_tendered ? parseInt(paymentRows[0].cash_tendered) : null;
-        cashChange = paymentRows[0].cash_change ? parseInt(paymentRows[0].cash_change) : null;
+      const cashRow = allPaymentRows.find(p => p.payment_method === 'cash');
+      if (cashRow) {
+        cashTendered = cashRow.cash_tendered ? parseInt(cashRow.cash_tendered) : null;
+        cashChange = cashRow.cash_change ? parseInt(cashRow.cash_change) : null;
       }
     }
+
+    // Payment breakdown (for split payments or any order with multiple payments)
+    const orderPayments = allPaymentRows.length > 0
+      ? allPaymentRows.map(p => ({
+          id: p.id,
+          paymentMethod: p.payment_method,
+          amount: parseInt(p.amount),
+          tipAmount: parseInt(p.tip_amount),
+          status: p.status,
+          cashTendered: p.cash_tendered ? parseInt(p.cash_tendered) : null,
+          cashChange: p.cash_change ? parseInt(p.cash_change) : null,
+          stripePaymentIntentId: p.stripe_payment_intent_id,
+          created: Math.floor(new Date(p.created_at).getTime() / 1000),
+        }))
+      : undefined;
 
     const isQuickCharge = orderMetadata?.isQuickCharge || false;
     const tipAmount = Math.round(parseFloat(order.tip_amount || '0') * 100);
@@ -1688,6 +1716,7 @@ app.openapi(getTransactionRoute, async (c) => {
       taxAmount,
       cashTendered,
       cashChange,
+      orderPayments,
     });
   } catch (error: any) {
     logger.error('Error getting transaction', { error, transactionId });
