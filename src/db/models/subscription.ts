@@ -49,7 +49,7 @@ export interface SubscriptionFeatures {
 
 export const DEFAULT_FEATURES_BY_TIER: Record<string, SubscriptionFeatures> = {
   starter: {
-    max_devices: 2,
+    max_devices: 1,
     max_events_per_month: 10,
     max_staff_accounts: 3,
     analytics_enabled: false,
