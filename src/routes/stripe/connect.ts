@@ -1277,6 +1277,21 @@ app.openapi(listTransactionsRoute, async (c) => {
       .filter((id): id is string => id !== null);
 
     const chargeMap = new Map<string, Stripe.Charge>();
+    // Also map order ID → charge for orders where charge comes from order_payments
+    const orderChargeMap = new Map<string, Stripe.Charge>();
+
+    logger.info('[FEES DEBUG] Order summary', {
+      totalOrders: orders.length,
+      ordersWithChargeId: chargeIds.length,
+      orderBreakdown: orders.map(o => ({
+        id: o.id,
+        paymentMethod: o.payment_method,
+        stripeChargeId: o.stripe_charge_id,
+        stripePaymentIntentId: o.stripe_payment_intent_id,
+        totalAmount: o.total_amount,
+      })),
+    });
+
     if (chargeIds.length > 0) {
       try {
         const chargePromises = chargeIds.map(id =>
@@ -1284,22 +1299,115 @@ app.openapi(listTransactionsRoute, async (c) => {
             connectedAccount.stripe_account_id,
             id
           ).catch(err => {
-            logger.warn('Failed to fetch Stripe charge', { chargeId: id, error: err.message });
+            logger.warn('[FEES DEBUG] Failed to fetch Stripe charge', { chargeId: id, error: err.message });
             return null;
           })
         );
         const charges = await Promise.all(chargePromises);
         charges.forEach((charge) => {
-          if (charge) chargeMap.set(charge.id, charge);
+          if (charge) {
+            chargeMap.set(charge.id, charge);
+            logger.info('[FEES DEBUG] Charge fetched from order.stripe_charge_id', {
+              chargeId: charge.id,
+              amount: charge.amount,
+              applicationFeeAmount: (charge as any).application_fee_amount,
+              metadata: charge.metadata,
+              paymentMethodType: charge.payment_method_details?.type,
+            });
+          }
         });
       } catch (err) {
-        logger.warn('Failed to batch-fetch Stripe charges', { error: err });
+        logger.warn('[FEES DEBUG] Failed to batch-fetch Stripe charges', { error: err });
       }
     }
 
+    // For split/card orders without stripe_charge_id on the order, look up from order_payments
+    const ordersNeedingPaymentLookup = orders.filter(
+      o => !o.stripe_charge_id && (o.payment_method === 'split' || o.payment_method === 'card')
+    );
+    logger.info('[FEES DEBUG] Orders needing order_payments lookup', {
+      count: ordersNeedingPaymentLookup.length,
+      orderIds: ordersNeedingPaymentLookup.map(o => o.id),
+    });
+
+    if (ordersNeedingPaymentLookup.length > 0) {
+      try {
+        const orderIds = ordersNeedingPaymentLookup.map(o => o.id);
+        const paymentRows = await query<{
+          order_id: string;
+          stripe_payment_intent_id: string;
+        }>(
+          `SELECT order_id, stripe_payment_intent_id FROM order_payments
+           WHERE order_id = ANY($1) AND stripe_payment_intent_id IS NOT NULL
+           AND payment_method IN ('card', 'tap_to_pay')`,
+          [orderIds]
+        );
+
+        logger.info('[FEES DEBUG] order_payments rows found', {
+          count: paymentRows.length,
+          rows: paymentRows,
+        });
+
+        // Get unique payment intent IDs and fetch charges from them
+        const piPromises = paymentRows.map(async (row) => {
+          try {
+            const pi = await stripe.paymentIntents.retrieve(
+              row.stripe_payment_intent_id,
+              { stripeAccount: connectedAccount.stripe_account_id }
+            );
+            logger.info('[FEES DEBUG] PaymentIntent retrieved from order_payment', {
+              orderId: row.order_id,
+              piId: pi.id,
+              piStatus: pi.status,
+              latestCharge: pi.latest_charge,
+              metadata: pi.metadata,
+            });
+            if (pi.latest_charge) {
+              const chargeId = typeof pi.latest_charge === 'string' ? pi.latest_charge : pi.latest_charge.id;
+              const charge = await stripeService.retrieveConnectedAccountCharge(
+                connectedAccount.stripe_account_id,
+                chargeId
+              );
+              if (charge) {
+                orderChargeMap.set(row.order_id, charge);
+                logger.info('[FEES DEBUG] Charge fetched from order_payment PI', {
+                  orderId: row.order_id,
+                  chargeId: charge.id,
+                  chargeAmount: charge.amount,
+                  applicationFeeAmount: (charge as any).application_fee_amount,
+                  metadata: charge.metadata,
+                  paymentMethodType: charge.payment_method_details?.type,
+                });
+              }
+            } else {
+              logger.warn('[FEES DEBUG] PaymentIntent has no latest_charge', {
+                orderId: row.order_id,
+                piId: pi.id,
+                piStatus: pi.status,
+              });
+            }
+          } catch (err: any) {
+            logger.warn('[FEES DEBUG] Failed to fetch charge from order_payment', { orderId: row.order_id, piId: row.stripe_payment_intent_id, error: err.message });
+          }
+        });
+        await Promise.all(piPromises);
+      } catch (err) {
+        logger.warn('[FEES DEBUG] Failed to lookup order_payments charges', { error: err });
+      }
+    }
+
+    logger.info('[FEES DEBUG] Charge maps populated', {
+      chargeMapSize: chargeMap.size,
+      orderChargeMapSize: orderChargeMap.size,
+      chargeMapKeys: [...chargeMap.keys()],
+      orderChargeMapKeys: [...orderChargeMap.keys()],
+    });
+
     // Format response: merge DB order data with Stripe charge details
     const formattedTransactions = orders.map((order) => {
-      const charge = order.stripe_charge_id ? chargeMap.get(order.stripe_charge_id) : null;
+      const charge = order.stripe_charge_id
+        ? chargeMap.get(order.stripe_charge_id) || null
+        : orderChargeMap.get(order.id) || null;
       const totalAmount = Math.round(parseFloat(order.total_amount) * 100);
 
       // Determine status
@@ -1333,18 +1441,42 @@ app.openapi(listTransactionsRoute, async (c) => {
       // Calculate fees (only for Stripe charges)
       let fees: { processingFee: number; netAmount: number } | undefined;
       if (charge) {
-        const platformFee = (charge as any).application_fee_amount ||
-          (charge.metadata?.platform_fee_cents ? parseInt(charge.metadata.platform_fee_cents) : 0);
+        const appFeeAmount = (charge as any).application_fee_amount;
+        const metadataFee = charge.metadata?.platform_fee_cents ? parseInt(charge.metadata.platform_fee_cents) : 0;
+        const platformFee = appFeeAmount || metadataFee;
         const isCardPresent = charge.payment_method_details?.type === 'card_present';
         const stripeFeePercent = isCardPresent ? 0.027 : 0.029;
         const stripeFeeFixed = isCardPresent ? 15 : 30;
         const stripeFee = Math.round(charge.amount * stripeFeePercent) + stripeFeeFixed;
         const processingFee = stripeFee + platformFee;
+
+        logger.info('[FEES DEBUG] Fee calculation for order', {
+          orderId: order.id,
+          chargeId: charge.id,
+          chargeAmount: charge.amount,
+          applicationFeeAmount: appFeeAmount,
+          metadataPlatformFeeCents: charge.metadata?.platform_fee_cents,
+          resolvedPlatformFee: platformFee,
+          isCardPresent,
+          stripeFeePercent,
+          stripeFeeFixed,
+          stripeFee,
+          totalProcessingFee: processingFee,
+          amountRefunded: charge.amount_refunded,
+          netAmount: charge.amount - processingFee - charge.amount_refunded,
+        });
+
         fees = {
           processingFee,
           netAmount: charge.amount - processingFee - charge.amount_refunded,
         };
       } else {
+        logger.info('[FEES DEBUG] No charge found for order — fees set to 0', {
+          orderId: order.id,
+          paymentMethod: order.payment_method,
+          stripeChargeId: order.stripe_charge_id,
+          inOrderChargeMap: orderChargeMap.has(order.id),
+        });
         // Cash/split: no processing fees
         fees = { processingFee: 0, netAmount: totalAmount };
       }
@@ -1518,8 +1650,8 @@ app.openapi(getTransactionRoute, async (c) => {
     let charge: Stripe.Charge | null = null;
     let stripeChargeId = order.stripe_charge_id;
 
-    if (!stripeChargeId && order.payment_method === 'split') {
-      // For split payments, find the first card payment with a stripe charge
+    if (!stripeChargeId && (order.payment_method === 'split' || order.payment_method === 'card' || order.payment_method === 'tap_to_pay')) {
+      // For split/card/tap payments without a direct charge, find from order_payments
       const cardPayments = await query<{ stripe_payment_intent_id: string | null }>(
         `SELECT stripe_payment_intent_id FROM order_payments
          WHERE order_id = $1 AND payment_method IN ('card', 'tap_to_pay') AND stripe_payment_intent_id IS NOT NULL
@@ -2126,6 +2258,7 @@ const dashboardRoute = createRoute({
             yesterday: z.object({
               sales: z.number(),
               orders: z.number(),
+              averageOrderValue: z.number(),
               customers: z.number(),
             }),
             balance: z.object({
@@ -2135,6 +2268,7 @@ const dashboardRoute = createRoute({
             }),
             recentTransactions: z.array(z.object({
               id: z.string(),
+              orderNumber: z.string().nullable(),
               amount: z.number(),
               currency: z.string(),
               status: z.string(),
@@ -2180,68 +2314,71 @@ app.openapi(dashboardRoute, async (c) => {
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const yesterdayStart = new Date(todayStart.getTime() - 24 * 60 * 60 * 1000);
 
-    const todayStartTimestamp = Math.floor(todayStart.getTime() / 1000);
-    const yesterdayStartTimestamp = Math.floor(yesterdayStart.getTime() / 1000);
-
-    // Fetch today's charges
-    const todayCharges = await stripeService.listConnectedAccountCharges(
-      connectedAccount.stripe_account_id,
-      {
-        limit: 100,
-        created: {
-          gte: todayStartTimestamp,
-        },
-      }
+    // Query today's orders from DB (all payment types)
+    const todayRows = await query<{
+      total_amount: string;
+      customer_email: string | null;
+      status: string;
+    }>(
+      `SELECT total_amount, customer_email, status FROM orders
+       WHERE organization_id = $1 AND status IN ('completed', 'refunded')
+       AND created_at >= $2`,
+      [payload.organizationId, todayStart.toISOString()]
     );
 
-    // Fetch yesterday's charges
-    const yesterdayCharges = await stripeService.listConnectedAccountCharges(
-      connectedAccount.stripe_account_id,
-      {
-        limit: 100,
-        created: {
-          gte: yesterdayStartTimestamp,
-          lte: todayStartTimestamp - 1,
-        },
-      }
+    // Query yesterday's orders from DB
+    const yesterdayRows = await query<{
+      total_amount: string;
+      customer_email: string | null;
+      status: string;
+    }>(
+      `SELECT total_amount, customer_email, status FROM orders
+       WHERE organization_id = $1 AND status IN ('completed', 'refunded')
+       AND created_at >= $2 AND created_at < $3`,
+      [payload.organizationId, yesterdayStart.toISOString(), todayStart.toISOString()]
     );
 
-    // Fetch balance
+    // Query recent orders (last 5)
+    const recentRows = await query<{
+      id: string;
+      order_number: string | null;
+      total_amount: string;
+      status: string;
+      payment_method: string | null;
+      customer_email: string | null;
+      created_at: Date;
+    }>(
+      `SELECT id, order_number, total_amount, status, payment_method, customer_email, created_at FROM orders
+       WHERE organization_id = $1 AND status IN ('completed', 'refunded')
+       ORDER BY created_at DESC LIMIT 5`,
+      [payload.organizationId]
+    );
+
+    // Fetch balance from Stripe (must come from Stripe)
     const balance = await stripeService.getConnectedAccountBalance(
       connectedAccount.stripe_account_id
     );
 
-    // Fetch recent transactions (last 5)
-    const recentCharges = await stripeService.listConnectedAccountCharges(
-      connectedAccount.stripe_account_id,
-      { limit: 5 }
-    );
-
-    // Calculate today's metrics (only succeeded charges)
-    const todaySucceeded = todayCharges.data.filter(c => c.status === 'succeeded');
-    const todaySales = todaySucceeded.reduce((sum, c) => sum + (c.amount - (c.amount_refunded || 0)), 0) / 100;
-    const todayOrders = todaySucceeded.length;
+    // Calculate today's metrics
+    const todaySalesCents = todayRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
+    const todaySales = todaySalesCents / 100;
+    const todayOrders = todayRows.length;
     const todayAvgOrder = todayOrders > 0 ? todaySales / todayOrders : 0;
-    // Count unique customers (by email)
     const todayCustomerEmails = new Set(
-      todaySucceeded
-        .map(c => c.billing_details?.email || c.receipt_email)
-        .filter((email): email is string => !!email)
+      todayRows.map(o => o.customer_email).filter((e): e is string => !!e)
     );
     const todayCustomers = todayCustomerEmails.size;
 
-    // Calculate yesterday's metrics (only succeeded charges)
-    const yesterdaySucceeded = yesterdayCharges.data.filter(c => c.status === 'succeeded');
-    const yesterdaySales = yesterdaySucceeded.reduce((sum, c) => sum + (c.amount - (c.amount_refunded || 0)), 0) / 100;
-    const yesterdayOrders = yesterdaySucceeded.length;
+    // Calculate yesterday's metrics
+    const yesterdaySalesCents = yesterdayRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
+    const yesterdaySales = yesterdaySalesCents / 100;
+    const yesterdayOrders = yesterdayRows.length;
     const yesterdayCustomerEmails = new Set(
-      yesterdaySucceeded
-        .map(c => c.billing_details?.email || c.receipt_email)
-        .filter((email): email is string => !!email)
+      yesterdayRows.map(o => o.customer_email).filter((e): e is string => !!e)
     );
     const yesterdayCustomers = yesterdayCustomerEmails.size;
 
-    // Get balance amounts (default to USD) - handle empty arrays
+    // Get balance amounts (default to USD)
     const availableBalance = balance.available?.length > 0
       ? (balance.available.find(b => b.currency === 'usd') || balance.available[0])
       : null;
@@ -2250,14 +2387,15 @@ app.openapi(dashboardRoute, async (c) => {
       : null;
 
     // Format recent transactions
-    const recentTransactions = recentCharges.data.map(charge => ({
-      id: charge.id,
-      amount: charge.amount / 100,
-      currency: charge.currency,
-      status: charge.status,
-      customerName: charge.billing_details?.name || null,
-      customerEmail: charge.billing_details?.email || charge.receipt_email || null,
-      created: charge.created,
+    const recentTransactions = recentRows.map(order => ({
+      id: order.id,
+      orderNumber: order.order_number || null,
+      amount: Math.round(parseFloat(order.total_amount) * 100) / 100,
+      currency: 'usd',
+      status: order.status === 'completed' ? 'succeeded' : order.status,
+      customerName: null,
+      customerEmail: order.customer_email || null,
+      created: Math.floor(new Date(order.created_at).getTime() / 1000),
     }));
 
     return c.json({
@@ -2270,6 +2408,7 @@ app.openapi(dashboardRoute, async (c) => {
       yesterday: {
         sales: yesterdaySales,
         orders: yesterdayOrders,
+        averageOrderValue: yesterdayOrders > 0 ? Math.round((yesterdaySales / yesterdayOrders) * 100) / 100 : 0,
         customers: yesterdayCustomers,
       },
       balance: {
@@ -2324,6 +2463,10 @@ const analyticsRoute = createRoute({
               label: z.string(),
               revenue: z.number(),
             })),
+            transactionData: z.array(z.object({
+              label: z.string(),
+              count: z.number(),
+            })),
             paymentMethods: z.array(z.object({
               method: z.string(),
               percentage: z.number(),
@@ -2367,6 +2510,53 @@ const analyticsRoute = createRoute({
               revenue: z.number(),
               percentage: z.number(),
             }),
+            dayOfWeekHeatmap: z.array(z.object({
+              day: z.number(),
+              hour: z.number(),
+              orderCount: z.number(),
+              revenue: z.number(),
+            })),
+            avgOrderData: z.array(z.object({
+              label: z.string(),
+              value: z.number(),
+            })),
+            refunds: z.object({
+              count: z.number(),
+              amount: z.number(),
+              rate: z.number(),
+            }),
+            customerMetrics: z.object({
+              newCustomers: z.number(),
+              returningCustomers: z.number(),
+              repeatRate: z.number(),
+            }),
+            revenueVelocity: z.array(z.object({
+              label: z.string(),
+              cumulative: z.number(),
+            })),
+            tipStats: z.object({
+              totalTips: z.number(),
+              avgTip: z.number(),
+              tippedOrders: z.number(),
+              tipRate: z.number(),
+            }),
+            staffBreakdown: z.array(z.object({
+              userId: z.string(),
+              name: z.string(),
+              avatarUrl: z.string().nullable(),
+              orderCount: z.number(),
+              revenue: z.number(),
+              avgOrder: z.number(),
+              percentage: z.number(),
+            })),
+            deviceBreakdown: z.array(z.object({
+              deviceId: z.string(),
+              orderCount: z.number(),
+              revenue: z.number(),
+              avgOrder: z.number(),
+              percentage: z.number(),
+              lastUsed: z.string().nullable(),
+            })),
           }),
         },
       },
@@ -2484,13 +2674,15 @@ app.openapi(analyticsRoute, async (c) => {
 
     // Calculate revenue data by time period using database aggregation
     let revenueData: Array<{ label: string; revenue: number }> = [];
+    let transactionData: Array<{ label: string; count: number }> = [];
 
     if (range === 'today') {
       // Group by hour
-      const hourlyQuery = await query<{ hour: string; revenue: string }>(
+      const hourlyQuery = await query<{ hour: string; revenue: string; order_count: string }>(
         `SELECT
           EXTRACT(HOUR FROM created_at)::text as hour,
-          COALESCE(SUM(total_amount), 0)::text as revenue
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as order_count
         FROM orders
         WHERE organization_id = $1
           AND status = 'completed'
@@ -2501,8 +2693,10 @@ app.openapi(analyticsRoute, async (c) => {
       );
 
       const hourlyMap: Record<number, number> = {};
+      const hourlyCountMap: Record<number, number> = {};
       hourlyQuery.forEach(row => {
         hourlyMap[parseInt(row.hour)] = parseFloat(row.revenue);
+        hourlyCountMap[parseInt(row.hour)] = parseInt(row.order_count);
       });
 
       // Determine hour range - default 9 AM to 9 PM, but expand if transactions exist outside
@@ -2521,14 +2715,17 @@ app.openapi(analyticsRoute, async (c) => {
       for (let h = minHour; h <= maxHour; h++) {
         const hour12 = h === 0 ? 12 : (h > 12 ? h - 12 : h);
         const ampm = h >= 12 ? 'PM' : 'AM';
-        revenueData.push({ label: `${hour12}${ampm}`, revenue: Math.round((hourlyMap[h] || 0) * 100) / 100 });
+        const label = `${hour12}${ampm}`;
+        revenueData.push({ label, revenue: Math.round((hourlyMap[h] || 0) * 100) / 100 });
+        transactionData.push({ label, count: hourlyCountMap[h] || 0 });
       }
     } else if (range === 'week') {
       // Group by date for current week
-      const dailyQuery = await query<{ day_date: string; revenue: string }>(
+      const dailyQuery = await query<{ day_date: string; revenue: string; order_count: string }>(
         `SELECT
           DATE(created_at)::text as day_date,
-          COALESCE(SUM(total_amount), 0)::text as revenue
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as order_count
         FROM orders
         WHERE organization_id = $1
           AND status = 'completed'
@@ -2538,10 +2735,12 @@ app.openapi(analyticsRoute, async (c) => {
         [payload.organizationId, currentStart.toISOString()]
       );
 
-      // Map dates to revenue
+      // Map dates to revenue and counts
       const dailyMap: Record<string, number> = {};
+      const dailyCountMap: Record<string, number> = {};
       dailyQuery.forEach(row => {
         dailyMap[row.day_date] = parseFloat(row.revenue);
+        dailyCountMap[row.day_date] = parseInt(row.order_count);
       });
 
       // Generate each day of the current week (Mon-Sun)
@@ -2553,13 +2752,18 @@ app.openapi(analyticsRoute, async (c) => {
           label: dayNames[i],
           revenue: Math.round((dailyMap[dateStr] || 0) * 100) / 100
         });
+        transactionData.push({
+          label: dayNames[i],
+          count: dailyCountMap[dateStr] || 0
+        });
       }
     } else if (range === 'month') {
       // Group by day for the selected month
-      const dailyQuery = await query<{ day_date: string; revenue: string }>(
+      const dailyQuery = await query<{ day_date: string; revenue: string; order_count: string }>(
         `SELECT
           DATE(created_at)::text as day_date,
-          COALESCE(SUM(total_amount), 0)::text as revenue
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as order_count
         FROM orders
         WHERE organization_id = $1
           AND status = 'completed'
@@ -2570,10 +2774,12 @@ app.openapi(analyticsRoute, async (c) => {
         [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
       );
 
-      // Map dates to revenue
+      // Map dates to revenue and counts
       const dailyMap: Record<string, number> = {};
+      const dailyCountMap: Record<string, number> = {};
       dailyQuery.forEach(row => {
         dailyMap[row.day_date] = parseFloat(row.revenue);
+        dailyCountMap[row.day_date] = parseInt(row.order_count);
       });
 
       // Get number of days in the month
@@ -2583,17 +2789,23 @@ app.openapi(analyticsRoute, async (c) => {
       for (let i = 0; i < daysInMonth; i++) {
         const date = new Date(currentStart.getFullYear(), currentStart.getMonth(), i + 1);
         const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD format
+        const label = (i + 1).toString();
         revenueData.push({
-          label: (i + 1).toString(), // Day number
+          label,
           revenue: Math.round((dailyMap[dateStr] || 0) * 100) / 100
+        });
+        transactionData.push({
+          label,
+          count: dailyCountMap[dateStr] || 0
         });
       }
     } else {
       // 'all' - Group by year
-      const yearlyQuery = await query<{ year: string; revenue: string }>(
+      const yearlyQuery = await query<{ year: string; revenue: string; order_count: string }>(
         `SELECT
           EXTRACT(YEAR FROM created_at)::text as year,
-          COALESCE(SUM(total_amount), 0)::text as revenue
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as order_count
         FROM orders
         WHERE organization_id = $1
           AND status = 'completed'
@@ -2604,14 +2816,17 @@ app.openapi(analyticsRoute, async (c) => {
       );
 
       const yearlyMap: Record<string, number> = {};
+      const yearlyCountMap: Record<string, number> = {};
       yearlyQuery.forEach(row => {
         yearlyMap[row.year] = parseFloat(row.revenue);
+        yearlyCountMap[row.year] = parseInt(row.order_count);
       });
 
       // Show last 2 years
       for (let i = 1; i >= 0; i--) {
         const year = now.getFullYear() - i;
         revenueData.push({ label: year.toString(), revenue: Math.round((yearlyMap[year.toString()] || 0) * 100) / 100 });
+        transactionData.push({ label: year.toString(), count: yearlyCountMap[year.toString()] || 0 });
       }
     }
 
@@ -2624,10 +2839,11 @@ app.openapi(analyticsRoute, async (c) => {
       : [payload.organizationId, currentStart.toISOString()];
 
     // Query payment method breakdown from database
-    const paymentMethodQuery = await query<{ method: string | null; count: string }>(
+    const paymentMethodQuery = await query<{ method: string | null; count: string; revenue: string }>(
       `SELECT
         payment_method::text as method,
-        COUNT(*)::text as count
+        COUNT(*)::text as count,
+        COALESCE(SUM(total_amount), 0)::text as revenue
       FROM orders
       WHERE organization_id = $1
         AND status = 'completed'
@@ -2643,11 +2859,13 @@ app.openapi(analyticsRoute, async (c) => {
       if (p.method === 'tap_to_pay') displayMethod = 'Tap to Pay';
       else if (p.method === 'card') displayMethod = 'Card';
       else if (p.method === 'cash') displayMethod = 'Cash';
+      else if (p.method === 'split') displayMethod = 'Split Payment';
       else if (p.method) displayMethod = p.method.charAt(0).toUpperCase() + p.method.slice(1).replace(/_/g, ' ');
 
       return {
         method: displayMethod,
         count: parseInt(p.count || '0'),
+        revenue: Math.round(parseFloat(p.revenue || '0') * 100) / 100,
         percentage: totalPaymentMethods > 0 ? Math.round((parseInt(p.count || '0') / totalPaymentMethods) * 100) : 0,
       };
     }).slice(0, 5);
@@ -2671,9 +2889,23 @@ app.openapi(analyticsRoute, async (c) => {
       hourCountMap[parseInt(row.hour)] = parseInt(row.count);
     });
 
+    // Dynamically determine hour range from actual data, with ±1 hour padding
+    const hoursWithData = Object.keys(hourCountMap).map(Number);
+    let minHour = 9;
+    let maxHour = 21;
+    if (hoursWithData.length > 0) {
+      minHour = Math.max(0, Math.min(...hoursWithData) - 1);
+      maxHour = Math.min(23, Math.max(...hoursWithData) + 1);
+      // Ensure at least a reasonable range
+      if (maxHour - minHour < 4) {
+        minHour = Math.max(0, minHour - 2);
+        maxHour = Math.min(23, maxHour + 2);
+      }
+    }
+
     const totalHourTransactions = peakHoursQuery.reduce((sum, p) => sum + parseInt(p.count || '0'), 0);
     const peakHours: Array<{ hour: string; count: number; percentage: number }> = [];
-    for (let h = 9; h <= 21; h++) {
+    for (let h = minHour; h <= maxHour; h++) {
       const hour12 = h > 12 ? h - 12 : (h === 0 ? 12 : h);
       const ampm = h >= 12 ? 'PM' : 'AM';
       const count = hourCountMap[h] || 0;
@@ -2830,6 +3062,198 @@ app.openapi(analyticsRoute, async (c) => {
       ? Math.round((quickChargeOrders / currentTransactions) * 100)
       : 0;
 
+    // Query day-of-week × hour heatmap
+    const heatmapQuery = await query<{
+      day_of_week: string;
+      hour: string;
+      order_count: string;
+      revenue: string;
+    }>(
+      `SELECT
+        EXTRACT(DOW FROM created_at)::text as day_of_week,
+        EXTRACT(HOUR FROM created_at)::text as hour,
+        COUNT(*)::text as order_count,
+        COALESCE(SUM(total_amount), 0)::text as revenue
+      FROM orders
+      WHERE organization_id = $1
+        AND status = 'completed'
+        ${dateCondition}
+      GROUP BY EXTRACT(DOW FROM created_at), EXTRACT(HOUR FROM created_at)
+      ORDER BY EXTRACT(DOW FROM created_at), EXTRACT(HOUR FROM created_at)`,
+      dateParams
+    );
+
+    const dayOfWeekHeatmap = heatmapQuery.map(row => ({
+      day: parseInt(row.day_of_week),
+      hour: parseInt(row.hour),
+      orderCount: parseInt(row.order_count),
+      revenue: Math.round(parseFloat(row.revenue) * 100) / 100,
+    }));
+
+    // Compute average order value from revenue and transaction data (same time buckets)
+    const avgOrderDataFinal = revenueData.map((rd, i) => {
+      const count = transactionData[i]?.count || 0;
+      return {
+        label: rd.label,
+        value: count > 0 ? Math.round((rd.revenue / count) * 100) / 100 : 0,
+      };
+    });
+
+    // Query refund stats
+    const refundQuery = await query<{ refund_count: string; refund_amount: string }>(
+      `SELECT
+        COUNT(*)::text as refund_count,
+        COALESCE(SUM(total_amount), 0)::text as refund_amount
+      FROM orders
+      WHERE organization_id = $1
+        AND status = 'refunded'
+        ${dateCondition}`,
+      dateParams
+    );
+
+    const refundCount = parseInt(refundQuery[0]?.refund_count || '0');
+    const refundAmount = Math.round(parseFloat(refundQuery[0]?.refund_amount || '0') * 100) / 100;
+    const totalOrdersForRate = currentTransactions + refundCount;
+    const refundRate = totalOrdersForRate > 0 ? Math.round((refundCount / totalOrdersForRate) * 1000) / 10 : 0;
+
+    // Query customer metrics (new vs returning)
+    const customerQuery = await query<{ new_customers: string; returning_customers: string }>(
+      `WITH first_orders AS (
+        SELECT customer_id, MIN(created_at) as first_order_at
+        FROM orders
+        WHERE organization_id = $1 AND status = 'completed' AND customer_id IS NOT NULL
+        GROUP BY customer_id
+      )
+      SELECT
+        COUNT(CASE WHEN fo.first_order_at >= $2 ${offset !== 0 ? 'AND fo.first_order_at <= $3' : ''} THEN 1 END)::text as new_customers,
+        COUNT(CASE WHEN fo.first_order_at < $2 THEN 1 END)::text as returning_customers
+      FROM (
+        SELECT DISTINCT customer_id FROM orders
+        WHERE organization_id = $1 AND status = 'completed'
+          ${dateCondition}
+          AND customer_id IS NOT NULL
+      ) pc
+      JOIN first_orders fo ON pc.customer_id = fo.customer_id`,
+      dateParams
+    );
+
+    const newCustomers = parseInt(customerQuery[0]?.new_customers || '0');
+    const returningCustomers = parseInt(customerQuery[0]?.returning_customers || '0');
+    const totalCustomers = newCustomers + returningCustomers;
+    const repeatRate = totalCustomers > 0 ? Math.round((returningCustomers / totalCustomers) * 1000) / 10 : 0;
+
+    // Compute revenue velocity (cumulative) from revenueData
+    let cumulativeSum = 0;
+    const revenueVelocity = revenueData.map(rd => {
+      cumulativeSum += rd.revenue;
+      return { label: rd.label, cumulative: Math.round(cumulativeSum * 100) / 100 };
+    });
+
+    // Query tip stats
+    const tipQuery = await query<{
+      total_tips: string;
+      avg_tip: string;
+      tipped_orders: string;
+    }>(
+      `SELECT
+        COALESCE(SUM(tip_amount), 0)::text as total_tips,
+        CASE WHEN COUNT(*) > 0
+          THEN (COALESCE(SUM(tip_amount), 0) / COUNT(*))::text
+          ELSE '0'
+        END as avg_tip,
+        COUNT(CASE WHEN tip_amount > 0 THEN 1 END)::text as tipped_orders
+      FROM orders
+      WHERE organization_id = $1
+        AND status = 'completed'
+        ${dateCondition}`,
+      dateParams
+    );
+
+    const totalTips = Math.round(parseFloat(tipQuery[0]?.total_tips || '0') * 100) / 100;
+    const avgTip = Math.round(parseFloat(tipQuery[0]?.avg_tip || '0') * 100) / 100;
+    const tippedOrders = parseInt(tipQuery[0]?.tipped_orders || '0');
+    const tipRate = currentTransactions > 0 ? Math.round((tippedOrders / currentTransactions) * 1000) / 10 : 0;
+
+    // Query staff (user) breakdown
+    const staffQuery = await query<{
+      user_id: string;
+      first_name: string | null;
+      last_name: string | null;
+      avatar_image_id: string | null;
+      order_count: string;
+      revenue: string;
+    }>(
+      `SELECT
+        o.user_id,
+        u.first_name,
+        u.last_name,
+        u.avatar_image_id,
+        COUNT(*)::text as order_count,
+        COALESCE(SUM(o.total_amount), 0)::text as revenue
+      FROM orders o
+      LEFT JOIN users u ON o.user_id = u.id
+      WHERE o.organization_id = $1
+        AND o.status = 'completed'
+        AND o.user_id IS NOT NULL
+        AND o.created_at >= $2${offset !== 0 ? ' AND o.created_at <= $3' : ''}
+      GROUP BY o.user_id, u.first_name, u.last_name, u.avatar_image_id
+      ORDER BY SUM(o.total_amount) DESC`,
+      dateParams
+    );
+
+    const totalStaffOrders = staffQuery.reduce((sum, s) => sum + parseInt(s.order_count || '0'), 0);
+    const staffBreakdown = staffQuery.map(s => {
+      const orderCount = parseInt(s.order_count || '0');
+      const revenue = Math.round(parseFloat(s.revenue || '0') * 100) / 100;
+      return {
+        userId: s.user_id,
+        name: [s.first_name, s.last_name].filter(Boolean).join(' ') || 'Unknown',
+        avatarUrl: s.avatar_image_id && config.images.fileServerUrl
+          ? `${config.images.fileServerUrl}/images/${s.avatar_image_id}`
+          : null,
+        orderCount,
+        revenue,
+        avgOrder: orderCount > 0 ? Math.round((revenue / orderCount) * 100) / 100 : 0,
+        percentage: totalStaffOrders > 0 ? Math.round((orderCount / totalStaffOrders) * 100) : 0,
+      };
+    });
+
+    // Query device breakdown
+    const deviceQuery = await query<{
+      device_id: string;
+      order_count: string;
+      revenue: string;
+      last_used: string | null;
+    }>(
+      `SELECT
+        o.device_id,
+        COUNT(*)::text as order_count,
+        COALESCE(SUM(o.total_amount), 0)::text as revenue,
+        MAX(o.created_at)::text as last_used
+      FROM orders o
+      WHERE o.organization_id = $1
+        AND o.status = 'completed'
+        AND o.device_id IS NOT NULL
+        ${dateCondition}
+      GROUP BY o.device_id
+      ORDER BY SUM(o.total_amount) DESC`,
+      dateParams
+    );
+
+    const totalDeviceOrders = deviceQuery.reduce((sum, d) => sum + parseInt(d.order_count || '0'), 0);
+    const deviceBreakdown = deviceQuery.map(d => {
+      const orderCount = parseInt(d.order_count || '0');
+      const revenue = Math.round(parseFloat(d.revenue || '0') * 100) / 100;
+      return {
+        deviceId: d.device_id,
+        orderCount,
+        revenue,
+        avgOrder: orderCount > 0 ? Math.round((revenue / orderCount) * 100) / 100 : 0,
+        percentage: totalDeviceOrders > 0 ? Math.round((orderCount / totalDeviceOrders) * 100) : 0,
+        lastUsed: d.last_used,
+      };
+    });
+
     return c.json({
       metrics: {
         revenue: Math.round(currentRevenue * 100) / 100,
@@ -2839,6 +3263,7 @@ app.openapi(analyticsRoute, async (c) => {
         previousTransactions,
       },
       revenueData,
+      transactionData,
       paymentMethods,
       peakHours,
       topProducts,
@@ -2849,6 +3274,27 @@ app.openapi(analyticsRoute, async (c) => {
         revenue: Math.round(quickChargeRevenue * 100) / 100,
         percentage: quickChargePercentage,
       },
+      dayOfWeekHeatmap,
+      avgOrderData: avgOrderDataFinal,
+      refunds: {
+        count: refundCount,
+        amount: refundAmount,
+        rate: refundRate,
+      },
+      customerMetrics: {
+        newCustomers,
+        returningCustomers,
+        repeatRate,
+      },
+      revenueVelocity,
+      tipStats: {
+        totalTips,
+        avgTip,
+        tippedOrders,
+        tipRate,
+      },
+      staffBreakdown,
+      deviceBreakdown,
     });
   } catch (error: any) {
     logger.error('Error fetching analytics', {

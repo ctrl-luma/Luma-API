@@ -1371,9 +1371,18 @@ app.openapi(addPaymentRoute, async (c) => {
     // If fully paid, complete the order
     let orderStatus = order.status;
     if (remainingBalance <= 0) {
-      await query(
-        `UPDATE orders SET status = 'completed', payment_method = 'card', updated_at = NOW() WHERE id = $1`,
+      // Determine payment method: 'split' if multiple payments, otherwise the single payment's method
+      const allPayments = await query(
+        `SELECT payment_method FROM order_payments WHERE order_id = $1 AND status = 'completed'`,
         [id]
+      );
+      // Include current payment (not yet counted in allPayments since it was just inserted)
+      const totalPaymentCount = allPayments.length;
+      const finalPaymentMethod = totalPaymentCount > 1 ? 'split' : body.paymentMethod;
+
+      await query(
+        `UPDATE orders SET status = 'completed', payment_method = $2, updated_at = NOW() WHERE id = $1`,
+        [id, finalPaymentMethod]
       );
       orderStatus = 'completed';
 

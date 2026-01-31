@@ -26,10 +26,52 @@ export interface DailyTipReport {
   orderCount: number;
 }
 
+export interface DailyStaffTip {
+  userId: string;
+  firstName: string | null;
+  lastName: string | null;
+  avatarUrl: string | null;
+  totalTips: number;
+}
+
+export interface DailyTipReportWithStaff extends DailyTipReport {
+  byStaff: DailyStaffTip[];
+}
+
+export interface TipDistributionBucket {
+  range: string;
+  count: number;
+}
+
+export interface HourlyTipBreakdown {
+  hour: number;
+  totalTips: number;
+  tipCount: number;
+  avgTip: number;
+}
+
+export interface TipTrendPoint {
+  date: string;
+  tipPercent: number;
+}
+
+export interface TopTippedOrder {
+  orderNumber: string;
+  tipAmount: number;
+  subtotal: number;
+  totalAmount: number;
+  customerEmail: string | null;
+  createdAt: string;
+}
+
 export interface TipReport {
   summary: TipReportSummary;
   byStaff: StaffTipReport[];
-  daily: DailyTipReport[];
+  daily: DailyTipReportWithStaff[];
+  tipDistribution: TipDistributionBucket[];
+  hourlyBreakdown: HourlyTipBreakdown[];
+  tipTrend: TipTrendPoint[];
+  topTippedOrders: TopTippedOrder[];
 }
 
 export interface TipPoolWithCreator extends TipPool {
@@ -78,10 +120,10 @@ class TipsService {
     );
 
     const summary = summaryResult[0];
-    const totalTips = parseInt(summary.total_tips) || 0;
+    const totalTips = Math.round(parseFloat(summary.total_tips) * 100) / 100;
     const orderCount = parseInt(summary.order_count) || 0;
-    const avgTipAmount = Math.round(parseFloat(summary.avg_tip) || 0);
-    const totalSubtotal = parseInt(summary.total_subtotal) || 0;
+    const avgTipAmount = Math.round((parseFloat(summary.avg_tip) || 0) * 100) / 100;
+    const totalSubtotal = parseFloat(summary.total_subtotal) || 0;
     const avgTipPercent = totalSubtotal > 0
       ? Math.round((totalTips / totalSubtotal) * 100 * 100) / 100
       : 0;
@@ -116,7 +158,7 @@ class TipsService {
 
     const byStaff: StaffTipReport[] = staffResult.map(row => {
       const tipCount = parseInt(row.tip_count) || 0;
-      const totalTips = parseInt(row.total_tips) || 0;
+      const staffTotalTips = Math.round((parseFloat(row.total_tips) || 0) * 100) / 100;
       return {
         userId: row.user_id,
         firstName: row.first_name,
@@ -125,8 +167,8 @@ class TipsService {
           ? `${config.images.fileServerUrl}/images/${row.avatar_image_id}`
           : null,
         tipCount,
-        totalTips,
-        avgTip: tipCount > 0 ? Math.round(totalTips / tipCount) : 0,
+        totalTips: staffTotalTips,
+        avgTip: tipCount > 0 ? Math.round((staffTotalTips / tipCount) * 100) / 100 : 0,
       };
     });
 
@@ -150,10 +192,177 @@ class TipsService {
       [organizationId, startDate, endDate]
     );
 
-    const daily: DailyTipReport[] = dailyResult.map(row => ({
+    // Get daily breakdown by staff
+    const dailyStaffResult = await query<{
+      date: Date;
+      user_id: string;
+      first_name: string | null;
+      last_name: string | null;
+      avatar_image_id: string | null;
+      total_tips: string;
+    }>(
+      `SELECT
+        DATE(o.created_at) as date,
+        o.user_id,
+        u.first_name,
+        u.last_name,
+        u.avatar_image_id,
+        COALESCE(SUM(o.tip_amount), 0) as total_tips
+      FROM orders o
+      LEFT JOIN users u ON o.user_id = u.id
+      WHERE o.organization_id = $1
+        AND o.status = 'completed'
+        AND o.created_at >= $2::date
+        AND o.created_at < ($3::date + interval '1 day')
+        AND o.tip_amount > 0
+        AND o.user_id IS NOT NULL
+      GROUP BY DATE(o.created_at), o.user_id, u.first_name, u.last_name, u.avatar_image_id
+      ORDER BY date, total_tips DESC`,
+      [organizationId, startDate, endDate]
+    );
+
+    // Group daily staff tips by date
+    const dailyStaffMap = new Map<string, DailyStaffTip[]>();
+    for (const row of dailyStaffResult) {
+      const dateStr = row.date.toISOString().split('T')[0];
+      if (!dailyStaffMap.has(dateStr)) {
+        dailyStaffMap.set(dateStr, []);
+      }
+      dailyStaffMap.get(dateStr)!.push({
+        userId: row.user_id,
+        firstName: row.first_name,
+        lastName: row.last_name,
+        avatarUrl: row.avatar_image_id && config.images.fileServerUrl
+          ? `${config.images.fileServerUrl}/images/${row.avatar_image_id}`
+          : null,
+        totalTips: Math.round((parseFloat(row.total_tips) || 0) * 100) / 100,
+      });
+    }
+
+    const daily: DailyTipReportWithStaff[] = dailyResult.map(row => {
+      const dateStr = row.date.toISOString().split('T')[0];
+      return {
+        date: dateStr,
+        totalTips: Math.round((parseFloat(row.total_tips) || 0) * 100) / 100,
+        orderCount: parseInt(row.order_count) || 0,
+        byStaff: dailyStaffMap.get(dateStr) || [],
+      };
+    });
+
+    // Get tip % distribution buckets
+    const distributionResult = await query<{
+      range: string;
+      count: string;
+    }>(
+      `SELECT
+        CASE
+          WHEN subtotal = 0 THEN 'No Subtotal'
+          WHEN (tip_amount / subtotal * 100) < 10 THEN 'Under 10%'
+          WHEN (tip_amount / subtotal * 100) < 15 THEN '10-14%'
+          WHEN (tip_amount / subtotal * 100) < 20 THEN '15-19%'
+          WHEN (tip_amount / subtotal * 100) < 25 THEN '20-24%'
+          ELSE '25%+'
+        END as range,
+        COUNT(*) as count
+      FROM orders
+      WHERE organization_id = $1
+        AND status = 'completed'
+        AND tip_amount > 0
+        AND created_at >= $2::date
+        AND created_at < ($3::date + interval '1 day')
+      GROUP BY range`,
+      [organizationId, startDate, endDate]
+    );
+
+    const tipDistribution: TipDistributionBucket[] = distributionResult.map(row => ({
+      range: row.range,
+      count: parseInt(row.count) || 0,
+    }));
+
+    // Get hourly breakdown
+    const hourlyResult = await query<{
+      hour: string;
+      total_tips: string;
+      tip_count: string;
+      avg_tip: string;
+    }>(
+      `SELECT
+        EXTRACT(HOUR FROM created_at) as hour,
+        COALESCE(SUM(tip_amount), 0) as total_tips,
+        COUNT(*) FILTER (WHERE tip_amount > 0) as tip_count,
+        COALESCE(AVG(tip_amount) FILTER (WHERE tip_amount > 0), 0) as avg_tip
+      FROM orders
+      WHERE organization_id = $1
+        AND status = 'completed'
+        AND created_at >= $2::date
+        AND created_at < ($3::date + interval '1 day')
+      GROUP BY hour
+      ORDER BY hour`,
+      [organizationId, startDate, endDate]
+    );
+
+    const hourlyBreakdown: HourlyTipBreakdown[] = hourlyResult.map(row => ({
+      hour: parseInt(row.hour) || 0,
+      totalTips: Math.round((parseFloat(row.total_tips) || 0) * 100) / 100,
+      tipCount: parseInt(row.tip_count) || 0,
+      avgTip: Math.round((parseFloat(row.avg_tip) || 0) * 100) / 100,
+    }));
+
+    // Get daily tip % trend
+    const trendResult = await query<{
+      date: Date;
+      tip_percent: string;
+    }>(
+      `SELECT
+        DATE(created_at) as date,
+        CASE WHEN SUM(subtotal) > 0
+          THEN ROUND(SUM(tip_amount) / SUM(subtotal) * 100, 1)
+          ELSE 0
+        END as tip_percent
+      FROM orders
+      WHERE organization_id = $1
+        AND status = 'completed'
+        AND created_at >= $2::date
+        AND created_at < ($3::date + interval '1 day')
+      GROUP BY DATE(created_at)
+      ORDER BY date`,
+      [organizationId, startDate, endDate]
+    );
+
+    const tipTrend: TipTrendPoint[] = trendResult.map(row => ({
       date: row.date.toISOString().split('T')[0],
-      totalTips: parseInt(row.total_tips) || 0,
-      orderCount: parseInt(row.order_count) || 0,
+      tipPercent: parseFloat(row.tip_percent) || 0,
+    }));
+
+    // Get top 5 tipped orders
+    const topTippedResult = await query<{
+      order_number: string;
+      tip_amount: string;
+      subtotal: string;
+      total_amount: string;
+      customer_email: string | null;
+      created_at: Date;
+    }>(
+      `SELECT
+        order_number, tip_amount, subtotal, total_amount, customer_email, created_at
+      FROM orders
+      WHERE organization_id = $1
+        AND status = 'completed'
+        AND tip_amount > 0
+        AND created_at >= $2::date
+        AND created_at < ($3::date + interval '1 day')
+      ORDER BY tip_amount DESC
+      LIMIT 5`,
+      [organizationId, startDate, endDate]
+    );
+
+    const topTippedOrders: TopTippedOrder[] = topTippedResult.map(row => ({
+      orderNumber: row.order_number,
+      tipAmount: Math.round((parseFloat(row.tip_amount) || 0) * 100) / 100,
+      subtotal: Math.round((parseFloat(row.subtotal) || 0) * 100) / 100,
+      totalAmount: Math.round((parseFloat(row.total_amount) || 0) * 100) / 100,
+      customerEmail: row.customer_email,
+      createdAt: row.created_at.toISOString(),
     }));
 
     return {
@@ -165,6 +374,10 @@ class TipsService {
       },
       byStaff,
       daily,
+      tipDistribution,
+      hourlyBreakdown,
+      tipTrend,
+      topTippedOrders,
     };
   }
 
@@ -485,7 +698,7 @@ class TipsService {
         [organizationId, pool.start_date, pool.end_date]
       );
 
-      const totalTips = parseInt(tipsResult.rows[0].total_tips) || 0;
+      const totalTips = parseFloat(tipsResult.rows[0].total_tips) || 0;
 
       // Get members with their individual tips earned
       const membersResult = await client.query(
@@ -526,7 +739,7 @@ class TipsService {
       for (let i = 0; i < members.length; i++) {
         const member = members[i];
         const hours = parseFloat(member.hours_worked) || 0;
-        const tipsEarned = parseInt(member.tips_earned) || 0;
+        const tipsEarned = parseFloat(member.tips_earned) || 0;
 
         let poolShare: number;
         if (i === members.length - 1) {
@@ -648,7 +861,7 @@ class TipsService {
       avatarUrl: row.avatar_image_id
         ? `${config.images.fileServerUrl}/images/${row.avatar_image_id}`
         : null,
-      totalTips: parseInt(row.total_tips) || 0,
+      totalTips: parseFloat(row.total_tips) || 0,
     }));
   }
 }

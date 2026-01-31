@@ -502,9 +502,18 @@ app.openapi(uploadStaffAvatarRoute, async (c) => {
       }, 400);
     }
 
-    // Upload the image (will replace if existingAvatarId is provided)
+    // Delete old avatar if it exists
+    const oldAvatarId = staff.avatarImageId;
+    if (oldAvatarId) {
+      try {
+        await imageService.delete(oldAvatarId);
+      } catch (e) {
+        logger.warn('Failed to delete old staff avatar', { staffId: id, oldAvatarId });
+      }
+    }
+
+    // Upload as a new image (new ID = new URL, avoids browser cache)
     const uploadResult = await imageService.upload(buffer, contentType, {
-      existingId: staff.avatarImageId || undefined,
       imageType: 'avatar',
     });
 
@@ -516,6 +525,9 @@ app.openapi(uploadStaffAvatarRoute, async (c) => {
 
     // Invalidate cache
     await cacheService.del(CacheKeys.user(id));
+    if (staff.email) {
+      await cacheService.del(CacheKeys.userByEmail(staff.email));
+    }
 
     logger.info('Staff avatar uploaded', {
       staffId: id,

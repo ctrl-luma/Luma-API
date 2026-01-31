@@ -1575,8 +1575,16 @@ app.openapi(uploadAvatarRoute, async (c) => {
       return c.json({ error: 'User not found' }, 404);
     }
 
-    // If user has existing avatar, replace it (same ID for overwrite)
+    // Delete old avatar if it exists
     const existingAvatarId = currentUser.avatar_image_id;
+    if (existingAvatarId) {
+      try {
+        await imageService.delete(existingAvatarId);
+      } catch (e) {
+        logger.warn('Failed to delete old avatar', { userId: payload.userId, existingAvatarId });
+      }
+    }
+
     logger.info('Avatar upload: starting image upload', {
       userId: payload.userId,
       existingAvatarId,
@@ -1584,9 +1592,8 @@ app.openapi(uploadAvatarRoute, async (c) => {
       bufferSize: buffer.byteLength,
     });
 
-    // Upload the image (will replace if existingAvatarId is provided)
+    // Upload as a new image (new ID = new URL, avoids browser cache)
     const uploadResult = await imageService.upload(buffer, contentType, {
-      existingId: existingAvatarId || undefined,
       imageType: 'avatar',
     });
     logger.info('Avatar upload: image uploaded successfully', { uploadResult });

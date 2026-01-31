@@ -24,16 +24,55 @@ const staffTipReportSchema = z.object({
   avgTip: z.number(),
 });
 
+const dailyStaffTipSchema = z.object({
+  userId: z.string().uuid(),
+  firstName: z.string().nullable(),
+  lastName: z.string().nullable(),
+  avatarUrl: z.string().nullable(),
+  totalTips: z.number(),
+});
+
 const dailyTipReportSchema = z.object({
   date: z.string(),
   totalTips: z.number(),
   orderCount: z.number(),
+  byStaff: z.array(dailyStaffTipSchema),
+});
+
+const tipDistributionBucketSchema = z.object({
+  range: z.string(),
+  count: z.number(),
+});
+
+const hourlyTipBreakdownSchema = z.object({
+  hour: z.number(),
+  totalTips: z.number(),
+  tipCount: z.number(),
+  avgTip: z.number(),
+});
+
+const tipTrendPointSchema = z.object({
+  date: z.string(),
+  tipPercent: z.number(),
+});
+
+const topTippedOrderSchema = z.object({
+  orderNumber: z.string(),
+  tipAmount: z.number(),
+  subtotal: z.number(),
+  totalAmount: z.number(),
+  customerEmail: z.string().nullable(),
+  createdAt: z.string(),
 });
 
 const tipReportSchema = z.object({
   summary: tipReportSummarySchema,
   byStaff: z.array(staffTipReportSchema),
   daily: z.array(dailyTipReportSchema),
+  tipDistribution: z.array(tipDistributionBucketSchema),
+  hourlyBreakdown: z.array(hourlyTipBreakdownSchema),
+  tipTrend: z.array(tipTrendPointSchema),
+  topTippedOrders: z.array(topTippedOrderSchema),
 });
 
 const tipPoolMemberSchema = z.object({

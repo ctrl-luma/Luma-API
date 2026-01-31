@@ -258,7 +258,7 @@ image_id, image_url
 **catalog_products** - Per-catalog pricing
 ```sql
 id, catalog_id FK, product_id FK, category_id FK,
-price INTEGER,                     -- In cents
+price DECIMAL(10,2),               -- In dollars (NOT cents)
 sort_order, is_active,
 UNIQUE(catalog_id, product_id)
 ```
@@ -267,7 +267,7 @@ UNIQUE(catalog_id, product_id)
 ```sql
 id, organization_id FK, catalog_id FK, customer_id FK, user_id FK,
 order_number, status, payment_method,
-subtotal, tax_amount, tip_amount, total_amount INTEGER,  -- All cents
+subtotal, tax_amount, tip_amount, total_amount DECIMAL(10,2),  -- All in dollars
 stripe_payment_intent_id, stripe_charge_id,
 customer_email, notes, metadata JSONB
 ```
@@ -301,7 +301,10 @@ external_account_last4, external_account_bank_name
 
 - Products are **org-level** (no price); pricing is **per-catalog** via `catalog_products`
 - Categories are **catalog-specific** (not reusable org-wide)
-- All monetary values stored as **integers (cents)**
+- **Two monetary formats exist:**
+  - `orders` table (`subtotal`, `tip_amount`, `total_amount`, `tax_amount`): **`DECIMAL(10,2)` in dollars** — use `parseFloat()`, do NOT divide by 100
+  - `order_payments` table (`amount`, `tip_amount`): **`INTEGER` in cents** — use `parseInt()`, divide by 100 to display
+  - Stripe API responses: **Integer cents** — divide by 100 to display
 - Customers auto-created on first purchase
 
 ---

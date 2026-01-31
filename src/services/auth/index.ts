@@ -335,8 +335,24 @@ export class AuthService {
       try {
         await cognitoService.setUserPassword(user.email, newPassword, true);
       } catch (error: any) {
-        logger.error('Failed to set user password in Cognito', error);
-        throw error;
+        if (error.name === 'UserNotFoundException') {
+          // User exists in DB but not in Cognito (e.g. seeded account) — create them
+          logger.info('Cognito user not found during password reset, creating user', { userId, email: user.email });
+          const cognitoUser = await cognitoService.createUser({
+            email: user.email,
+            temporaryPassword: newPassword,
+            messageAction: 'SUPPRESS',
+          });
+          await cognitoService.setUserPassword(user.email, newPassword, true);
+          // Link the Cognito user to the DB record
+          await query(
+            `UPDATE users SET cognito_user_id = $1 WHERE id = $2`,
+            [cognitoUser.username, userId]
+          );
+        } else {
+          logger.error('Failed to set user password in Cognito', error);
+          throw error;
+        }
       }
     }
 
