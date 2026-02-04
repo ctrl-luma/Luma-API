@@ -22,7 +22,7 @@ export interface JobData {
     amount: number;
   };
   [QueueName.EMAIL_NOTIFICATIONS]: {
-    type: 'order_confirmation' | 'receipt' | 'payout_confirmation' | 'welcome';
+    type: 'order_confirmation' | 'receipt' | 'payout_confirmation' | 'welcome' | 'ticket_confirmation' | 'ticket_reminder' | 'ticket_refund';
     to: string;
     data: Record<string, any>;
   };

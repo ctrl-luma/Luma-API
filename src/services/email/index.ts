@@ -1,15 +1,9 @@
-import { SESClient, SendEmailCommand, SendTemplatedEmailCommand } from '@aws-sdk/client-ses';
+import { Resend } from 'resend';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
 
-// Initialize SES client
-const sesClient = new SESClient({
-  region: config.aws.region || 'us-east-1',
-  credentials: config.aws.accessKeyId && config.aws.secretAccessKey ? {
-    accessKeyId: config.aws.accessKeyId,
-    secretAccessKey: config.aws.secretAccessKey,
-  } : undefined, // Use IAM role if no credentials provided
-});
+// Initialize Resend client
+const resend = config.email.resendApiKey ? new Resend(config.email.resendApiKey) : null;
 
 export interface EmailOptions {
   to: string | string[];
@@ -32,63 +26,48 @@ export class EmailService {
   private defaultFrom: string;
 
   constructor() {
-    this.defaultFrom = config.email.defaultFrom!;
-    logger.info('EmailService initialized', { 
+    this.defaultFrom = config.email.defaultFrom || 'Luma <no-reply@lumapos.co>';
+    logger.info('EmailService initialized', {
       defaultFrom: this.defaultFrom,
-      hasDefaultFrom: !!config.email.defaultFrom,
-      configValue: config.email.defaultFrom 
+      hasResendKey: !!config.email.resendApiKey,
     });
   }
 
   async sendEmail(options: EmailOptions): Promise<void> {
     const { to, subject, html, text, from = this.defaultFrom, replyTo } = options;
-    
+
     const toAddresses = Array.isArray(to) ? to : [to];
 
     logger.info('Sending email', {
       to: toAddresses,
       from,
-      defaultFrom: this.defaultFrom,
       subject,
       hasHtml: !!html,
       hasText: !!text,
       replyTo,
-      awsRegion: config.aws.region || 'us-east-1'
     });
 
+    if (!resend) {
+      logger.warn('Resend not configured, skipping email', { to: toAddresses, subject });
+      return;
+    }
+
     try {
-      const command = new SendEmailCommand({
-        Source: from,
-        Destination: {
-          ToAddresses: toAddresses,
-        },
-        Message: {
-          Subject: {
-            Data: subject,
-            Charset: 'UTF-8',
-          },
-          Body: {
-            ...(html && {
-              Html: {
-                Data: html,
-                Charset: 'UTF-8',
-              },
-            }),
-            ...(text && {
-              Text: {
-                Data: text,
-                Charset: 'UTF-8',
-              },
-            }),
-          },
-        },
-        ...(replyTo && { ReplyToAddresses: [replyTo] }),
+      const { data, error } = await resend.emails.send({
+        from,
+        to: toAddresses,
+        subject,
+        html: html || '',
+        text: text || '',
+        ...(replyTo && { replyTo }),
       });
 
-      const response = await sesClient.send(command);
-      
+      if (error) {
+        throw error;
+      }
+
       logger.info('Email sent successfully', {
-        messageId: response.MessageId,
+        messageId: data?.id,
         to: toAddresses,
         subject,
       });
@@ -103,36 +82,11 @@ export class EmailService {
   }
 
   async sendTemplatedEmail(options: TemplatedEmailOptions): Promise<void> {
-    const { to, template, templateData, from = this.defaultFrom, replyTo } = options;
-    
-    const toAddresses = Array.isArray(to) ? to : [to];
-
-    try {
-      const command = new SendTemplatedEmailCommand({
-        Source: from,
-        Destination: {
-          ToAddresses: toAddresses,
-        },
-        Template: template,
-        TemplateData: JSON.stringify(templateData),
-        ...(replyTo && { ReplyToAddresses: [replyTo] }),
-      });
-
-      const response = await sesClient.send(command);
-      
-      logger.info('Templated email sent successfully', {
-        messageId: response.MessageId,
-        to: toAddresses,
-        template,
-      });
-    } catch (error) {
-      logger.error('Failed to send templated email', {
-        error,
-        to: toAddresses,
-        template,
-      });
-      throw error;
-    }
+    // Resend doesn't have built-in templates, so this is a no-op
+    // All our emails use the html templates from template-sender.ts
+    logger.warn('sendTemplatedEmail called but Resend does not support server templates', {
+      template: options.template,
+    });
   }
 
   // Helper methods for specific email types
@@ -338,7 +292,7 @@ export class EmailService {
 
   async sendPasswordReset(to: string, resetToken: string): Promise<void> {
     const resetUrl = `${config.frontend.url}/reset-password?token=${resetToken}`;
-    
+
     const html = `
       <h1>Password Reset Request</h1>
       <p>You requested to reset your password. Click the link below to reset it:</p>

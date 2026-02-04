@@ -282,6 +282,61 @@ Click the button below to set up your account. This invitation expires in 7 days
   });
 }
 
+export async function sendTicketConfirmationEmail(to: string, ticketData: {
+  customerName: string;
+  eventName: string;
+  eventDate: string;
+  eventTime: string;
+  eventLocation: string | null;
+  eventLocationAddress: string | null;
+  tierName: string;
+  quantity: number;
+  totalAmount: number;
+  tickets: { id: string; qrCode: string }[];
+  eventSlug: string;
+  apiUrl: string;
+}): Promise<void> {
+  const ticketRows = ticketData.tickets.map((t, i) => `
+    <div style="border: 1px solid #374151; border-radius: 12px; padding: 16px; margin-bottom: 12px; text-align: center;">
+      <img src="${ticketData.apiUrl}/tickets/${t.id}/qr.png" alt="QR Code" width="180" height="180" style="display: block; margin: 0 auto 12px;" />
+      <p style="margin: 0; font-size: 12px; color: #9CA3AF;">Ticket ${ticketData.quantity > 1 ? `${i + 1} of ${ticketData.quantity}` : ''} · ${ticketData.tierName}</p>
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin: 12px auto 0;" align="center"><tr>
+        <td style="padding: 0 6px;" valign="middle"><a href="${ticketData.apiUrl}/tickets/${t.id}/wallet/apple" style="text-decoration: none;" target="_blank"><img src="${ticketData.apiUrl}/public/apple-badge.png" alt="Add to Apple Wallet" height="36" style="display: block; height: 36px; width: auto; border: 0;" /></a></td>
+        <td style="padding: 0 6px;" valign="middle"><a href="${ticketData.apiUrl}/tickets/${t.id}/wallet/google" style="text-decoration: none;" target="_blank"><img src="${ticketData.apiUrl}/public/google-badge.png" alt="Add to Google Wallet" height="36" style="display: block; height: 36px; width: auto; border: 0;" /></a></td>
+      </tr></table>
+      <a href="${ticketData.apiUrl}/tickets/${t.id}/calendar.ics" style="display: inline-block; margin-top: 10px; font-size: 12px; color: #60A5FA; text-decoration: underline;" target="_blank">Add to Calendar</a>
+    </div>
+  `).join('');
+
+  // Use address for maps link if available, fallback to location name
+  const mapsQuery = encodeURIComponent(ticketData.eventLocationAddress || ticketData.eventLocation || '');
+  const appleMapsUrl = `https://maps.apple.com/?q=${mapsQuery}`;
+  const googleMapsUrl = `https://maps.google.com/maps?q=${mapsQuery}`;
+  const locationLine = ticketData.eventLocation
+    ? `<br><strong>Location:</strong> ${ticketData.eventLocation}<br><span style="font-size: 12px;"><a href="${appleMapsUrl}" style="color: #60A5FA; text-decoration: underline;" target="_blank">Apple Maps</a> · <a href="${googleMapsUrl}" style="color: #60A5FA; text-decoration: underline;" target="_blank">Google Maps</a></span>`
+    : '';
+
+  const emailContent = `Hi ${ticketData.customerName},<br><br>
+Your ticket${ticketData.quantity > 1 ? 's are' : ' is'} confirmed for <strong>${ticketData.eventName}</strong>!<br><br>
+<strong>Date:</strong> ${ticketData.eventDate}<br>
+<strong>Time:</strong> ${ticketData.eventTime}${locationLine}<br>
+<strong>Ticket:</strong> ${ticketData.tierName} × ${ticketData.quantity}<br>
+<strong>Total:</strong> ${ticketData.totalAmount === 0 ? 'Free' : `$${ticketData.totalAmount.toFixed(2)}`}<br><br>
+Show the QR code${ticketData.quantity > 1 ? 's' : ''} below at the door:<br><br>
+${ticketRows}`;
+
+  const siteUrl = config.email.siteUrl || 'https://lumapos.co';
+
+  await sendTemplatedEmail(to, {
+    subject: `Your ticket${ticketData.quantity > 1 ? 's' : ''} for ${ticketData.eventName}`,
+    preheader_text: `You're in! Show this QR code at the door.`,
+    email_title: `You're In!`,
+    email_content: emailContent,
+    cta_url: `${siteUrl}/events/${ticketData.eventSlug}`,
+    cta_text: 'View Event Details',
+  });
+}
+
 export async function sendStaffDisabledEmail(to: string, staffData: {
   firstName: string;
   organizationName: string;
@@ -295,5 +350,83 @@ Please contact your organization administrator for more information.`;
     preheader_text: 'Your account access has been temporarily disabled',
     email_title: 'Account Access Disabled',
     email_content: emailContent,
+  });
+}
+
+export async function sendTicketRefundEmail(to: string, refundData: {
+  customerName: string;
+  eventName: string;
+  eventDate: string;
+  tierName: string;
+  refundAmount: number;
+  isFullRefund: boolean;
+  reason?: string;
+}): Promise<void> {
+  const reasonLine = refundData.reason
+    ? `<br><strong>Reason:</strong> ${refundData.reason}`
+    : '';
+
+  const emailContent = `Hi ${refundData.customerName},<br><br>
+${refundData.isFullRefund
+    ? `Your ticket for <strong>${refundData.eventName}</strong> has been refunded.`
+    : `A partial refund has been issued for your ticket to <strong>${refundData.eventName}</strong>.`
+}<br><br>
+<strong>Event:</strong> ${refundData.eventName}<br>
+<strong>Date:</strong> ${refundData.eventDate}<br>
+<strong>Ticket:</strong> ${refundData.tierName}<br>
+<strong>Refund Amount:</strong> $${refundData.refundAmount.toFixed(2)}${reasonLine}<br><br>
+The refund will be credited back to your original payment method within 5-10 business days, depending on your bank.<br><br>
+If you have any questions, please contact the event organizer.`;
+
+  await sendTemplatedEmail(to, {
+    subject: `Refund Processed - ${refundData.eventName}`,
+    preheader_text: `Your $${refundData.refundAmount.toFixed(2)} refund has been processed`,
+    email_title: 'Refund Processed',
+    email_content: emailContent,
+  });
+}
+
+export async function sendTicketReminderEmail(to: string, ticketData: {
+  customerName: string;
+  eventName: string;
+  eventDate: string;
+  eventTime: string;
+  eventLocation: string | null;
+  eventLocationAddress: string | null;
+  tickets: { id: string; qrCode: string }[];
+  eventSlug: string;
+  apiUrl: string;
+}): Promise<void> {
+  // Use address for maps link if available, fallback to location name
+  const mapsQuery = encodeURIComponent(ticketData.eventLocationAddress || ticketData.eventLocation || '');
+  const appleMapsUrl = `https://maps.apple.com/?q=${mapsQuery}`;
+  const googleMapsUrl = `https://maps.google.com/maps?q=${mapsQuery}`;
+  const locationLine = ticketData.eventLocation
+    ? `<br><strong>Location:</strong> ${ticketData.eventLocation}<br><span style="font-size: 12px;"><a href="${appleMapsUrl}" style="color: #60A5FA; text-decoration: underline;" target="_blank">Apple Maps</a> · <a href="${googleMapsUrl}" style="color: #60A5FA; text-decoration: underline;" target="_blank">Google Maps</a></span>`
+    : '';
+
+  const qrSection = ticketData.tickets.map((t, i) => `
+    <div style="border: 1px solid #374151; border-radius: 12px; padding: 16px; margin-bottom: 12px; text-align: center;">
+      <img src="${ticketData.apiUrl}/tickets/${t.id}/qr.png" alt="QR Code" width="160" height="160" style="display: block; margin: 0 auto 8px;" />
+      <p style="margin: 0; font-size: 12px; color: #9CA3AF;">Ticket${ticketData.tickets.length > 1 ? ` ${i + 1} of ${ticketData.tickets.length}` : ''}</p>
+    </div>
+  `).join('');
+
+  const siteUrl = config.email.siteUrl || 'https://lumapos.co';
+
+  const emailContent = `Hi ${ticketData.customerName},<br><br>
+Just a friendly reminder — <strong>${ticketData.eventName}</strong> is tomorrow!<br><br>
+<strong>Date:</strong> ${ticketData.eventDate}<br>
+<strong>Time:</strong> ${ticketData.eventTime}${locationLine}<br><br>
+Here's your QR code${ticketData.tickets.length > 1 ? 's' : ''} to show at the door:<br><br>
+${qrSection}`;
+
+  await sendTemplatedEmail(to, {
+    subject: `Reminder: ${ticketData.eventName} is tomorrow!`,
+    preheader_text: `${ticketData.eventName} is tomorrow — don't forget your ticket!`,
+    email_title: 'Event Tomorrow!',
+    email_content: emailContent,
+    cta_url: `${siteUrl}/events/${ticketData.eventSlug}`,
+    cta_text: 'View Event Details',
   });
 }

@@ -31,6 +31,7 @@ const envSchema = z.object({
   COGNITO_CLIENT_SECRET: z.string().optional(),
   
   EMAIL_DEFAULT_FROM: z.string().optional(),
+  RESEND_API_KEY: z.string().optional(),
   CONTACT_URL: z.string().optional(),
   DASHBOARD_URL: z.string().optional(),
   SITE_URL: z.string().optional(),
@@ -57,6 +58,19 @@ const envSchema = z.object({
   // Google Play Billing
   GOOGLE_PLAY_PACKAGE_NAME: z.string().optional(),
   GOOGLE_PLAY_CREDENTIALS: z.string().optional(), // JSON string of service account credentials
+
+  // Apple Wallet
+  APPLE_WALLET_PASS_TYPE_ID: z.string().optional(),
+  APPLE_WALLET_TEAM_ID: z.string().optional(),
+  APPLE_WALLET_CERT_PATH: z.string().optional(),
+  APPLE_WALLET_CERT_PASSWORD: z.string().optional(),
+  APPLE_WALLET_WWDR_CERT_PATH: z.string().optional(), // Path to Apple WWDR G4 cert (.pem)
+
+  // Google Wallet
+  GOOGLE_WALLET_ISSUER_ID: z.string().optional(),
+
+  // Google Maps Geocoding
+  GOOGLE_MAPS_API_KEY: z.string().optional(),
 
   // App Download Links
   ANDROID_LINK: z.string().url().optional(),
@@ -104,6 +118,7 @@ export const config = {
   },
   email: {
     defaultFrom: env.EMAIL_DEFAULT_FROM,
+    resendApiKey: env.RESEND_API_KEY,
     contactUrl: env.CONTACT_URL,
     dashboardUrl: env.DASHBOARD_URL,
     siteUrl: env.SITE_URL,
@@ -137,6 +152,19 @@ export const config = {
   googlePlay: {
     packageName: env.GOOGLE_PLAY_PACKAGE_NAME,
     credentials: env.GOOGLE_PLAY_CREDENTIALS,
+  },
+  appleWallet: {
+    passTypeId: env.APPLE_WALLET_PASS_TYPE_ID,
+    teamId: env.APPLE_WALLET_TEAM_ID,
+    certPath: env.APPLE_WALLET_CERT_PATH,
+    certPassword: env.APPLE_WALLET_CERT_PASSWORD,
+    wwdrCertPath: env.APPLE_WALLET_WWDR_CERT_PATH,
+  },
+  googleWallet: {
+    issuerId: env.GOOGLE_WALLET_ISSUER_ID,
+  },
+  googleMaps: {
+    apiKey: env.GOOGLE_MAPS_API_KEY,
   },
   appLinks: {
     android: env.ANDROID_LINK,

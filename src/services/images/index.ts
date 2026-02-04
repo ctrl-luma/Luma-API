@@ -14,11 +14,13 @@ const ALLOWED_MIME_TYPES = new Set([
 ]);
 
 // Image type configurations for resizing
-export type ImageType = 'product' | 'avatar';
+export type ImageType = 'product' | 'avatar' | 'event-banner' | 'event-image';
 
 const IMAGE_SIZE_CONFIGS: Record<ImageType, { maxWidth: number; maxHeight: number; quality: number }> = {
   product: { maxWidth: 1200, maxHeight: 1200, quality: 85 },
   avatar: { maxWidth: 400, maxHeight: 400, quality: 90 },
+  'event-banner': { maxWidth: 1920, maxHeight: 480, quality: 85 },
+  'event-image': { maxWidth: 1200, maxHeight: 675, quality: 85 },
 };
 
 

@@ -1,5 +1,5 @@
 # Build stage
-FROM node:18-alpine AS builder
+FROM node:20-alpine AS builder
 WORKDIR /app
 
 # Copy package files
@@ -18,7 +18,7 @@ RUN npm run build
 RUN cp -r src/services/email/templates dist/services/email/
 
 # Production stage
-FROM node:18-alpine
+FROM node:20-alpine
 WORKDIR /app
 
 # Install dumb-init for proper signal handling
@@ -39,6 +39,12 @@ COPY --from=builder /app/dist ./dist
 
 # Copy database files
 COPY db ./db
+
+# Copy public assets (wallet badges, etc.)
+COPY public ./public
+
+# Copy Apple Wallet signing certificates
+COPY --from=builder /app/apple-wallet-cert.pem /app/apple-wallet-key.pem /app/wwdr-g4.pem ./
 
 # Create image storage directory (will be overridden by PVC mount in production)
 RUN mkdir -p /data/images/.tmp

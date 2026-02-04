@@ -67,4 +67,15 @@ The API follows a modular architecture:
 
 TO clear redis cache
  docker exec -it luma_redis redis-cli FLUSHALL
+
+## Apple Wallet Certificates
+
+Two certificate files are required for Apple Wallet pass generation. Both are gitignored and must be present in the repo root.
+
+| File | Purpose | Expires | Renewal |
+|------|---------|---------|---------|
+| `apple-wallet.p12` | Pass signing certificate (Pass Type ID: `pass.co.lumapos.ticket`) | **2027-03-03** | Regenerate in Apple Developer portal under Certificates > Pass Type ID, export as .p12 |
+| `wwdr-g4.pem` | Apple WWDR G4 intermediate certificate | **2030-12-10** | Download from https://www.apple.com/certificateauthority/ (G4), convert: `openssl x509 -inform der -in AppleWWDRCAG4.cer -out wwdr-g4.pem` |
+
+When renewing `apple-wallet.p12`, update `APPLE_WALLET_CERT_PASSWORD` in `.env` if the passphrase changes.
  

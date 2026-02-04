@@ -8,13 +8,14 @@ Luma API is the backend service powering the Luma POS ecosystem - a Stripe-integ
 
 **Tech Stack:**
 - **Framework:** Hono v4.6.14 (ultra-fast edge-ready web framework)
-- **Runtime:** Node.js 18+, TypeScript 5.7
+- **Runtime:** Node.js 20+, TypeScript 5.7
 - **Database:** PostgreSQL 17
 - **Cache:** Redis 8
 - **Queue:** BullMQ v5.63
 - **Auth:** AWS Cognito + JWT
 - **Payments:** Stripe v19.3 (Connect, Terminal, Webhooks)
-- **Email:** Amazon SES with HTML templates
+- **Email:** Resend with centralized HTML template
+- **Geocoding:** Google Maps Geocoding API
 - **Real-time:** Socket.IO v4.8
 
 ---
@@ -90,10 +91,12 @@ Luma-API/
 │   │   ├── billing.ts               # Subscription management
 │   │   ├── staff.ts                 # Staff invitations
 │   │   ├── splits.ts                # Revenue splits
-│   │   └── tips.ts                  # Tip pooling
+│   │   ├── tips.ts                  # Tip pooling
+│   │   └── events.ts                # Events & ticketing
 │   ├── services/
 │   │   ├── auth/                    # Auth + Cognito
-│   │   ├── email/                   # SES + templates
+│   │   ├── email/                   # Resend + centralized template
+│   │   ├── geocoder/                # Google Maps geocoding
 │   │   ├── stripe/                  # Stripe + Terminal
 │   │   ├── redis/                   # Cache layer
 │   │   ├── socket/                  # Socket.IO
@@ -203,6 +206,25 @@ Luma-API/
 | GET/POST | `/tips/pools` | List/create tip pools |
 | POST | `/tips/pools/{id}/finalize` | Finalize tip pool |
 | GET/POST | `/catalogs/{id}/splits` | Revenue splits |
+
+### Events & Ticketing
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/events` | List public events |
+| POST | `/events` | Create event |
+| GET | `/events/:id` | Get event details |
+| PUT | `/events/:id` | Update event |
+| DELETE | `/events/:id` | Delete event |
+| GET | `/events/:id/tickets` | List tickets sold |
+| POST | `/events/:id/tickets/:ticketId/refund` | Refund ticket |
+| POST | `/events/:id/ticket-tiers` | Create ticket tier |
+| PATCH | `/events/:id/ticket-tiers/:tierId` | Update tier |
+| DELETE | `/events/:id/ticket-tiers/:tierId` | Delete tier |
+| POST | `/tickets/:ticketId/scan` | Scan ticket QR code |
+| GET | `/tickets/:ticketId/qr.png` | Get ticket QR image |
+| GET | `/tickets/:ticketId/wallet/apple` | Apple Wallet pass |
+| GET | `/tickets/:ticketId/wallet/google` | Google Wallet pass |
 
 ### Webhooks
 
@@ -383,10 +405,14 @@ COGNITO_USER_POOL_ID=us-east-2_xxxxx
 COGNITO_CLIENT_ID=xxxxx
 COGNITO_CLIENT_SECRET=xxxxx
 
-# Email (SES)
+# Email (Resend)
+RESEND_API_KEY=re_xxxxx
 EMAIL_DEFAULT_FROM=no-reply@lumapos.co
 DASHBOARD_URL=https://portal.lumapos.co
 SITE_URL=https://lumapos.co
+
+# Google Maps Geocoding
+GOOGLE_MAPS_API_KEY=AIzaSyXXXXXXX
 
 # CORS
 CORS_ORIGIN=http://localhost:3001,http://localhost:3333
@@ -474,6 +500,36 @@ socketService.emit(SocketEvents.ORDER_CREATED, {
 }, [`org:${organizationId}`]);
 ```
 
+### Email Template System
+All emails use a centralized HTML template for consistent branding:
+
+```typescript
+// src/services/email/template-sender.ts
+import { sendTemplatedEmail } from './template-sender';
+
+// Send any email using the centralized template
+await sendTemplatedEmail(to, {
+  subject: 'Your Subject',
+  email_title: 'Email Title',
+  email_content: '<p>HTML content here</p>',
+  cta_url: 'https://...',      // Optional button
+  cta_text: 'Click Here',      // Optional button text
+});
+```
+
+**Template location:** `src/services/email/templates/email-template.html`
+
+**Available email functions:**
+- `sendWelcomeEmail()` - New user welcome
+- `sendPasswordResetEmail()` - Password reset link
+- `sendTicketConfirmationEmail()` - Event ticket with QR codes
+- `sendTicketRefundEmail()` - Ticket refund notification
+- `sendTicketReminderEmail()` - Day-before event reminder
+- `sendStaffInviteEmail()` - Staff invitation
+- `sendOrderConfirmationEmail()` - Order confirmation
+- `sendReceiptEmail()` - Payment receipt
+- `sendPayoutEmail()` - Payout confirmation
+
 ---
 
 ## Troubleshooting
@@ -482,9 +538,10 @@ socketService.emit(SocketEvents.ORDER_CREATED, {
 |-------|----------|
 | CORS errors | Check `CORS_ORIGIN` includes all frontend origins |
 | Stale user data | Ensure cache invalidation after user updates |
-| Email failures | Verify SES identity and sandbox status |
+| Email failures | Verify Resend API key and domain verification |
 | Auth issues | Check Cognito config and JWT expiration |
 | Session kicked unexpectedly | Check `session_version` increment logic |
+| Geocoding failures | Check Google Maps API key and billing enabled |
 
 ---
 

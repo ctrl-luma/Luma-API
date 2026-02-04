@@ -296,4 +296,72 @@ export interface RevenueSplitReport {
   }>;
 }
 
+export type EventVisibility = 'public' | 'link_only';
+export type EventStatus = 'draft' | 'published' | 'cancelled' | 'completed';
+export type TicketStatus = 'valid' | 'used' | 'refunded' | 'cancelled';
+
+export interface Event {
+  id: string;
+  organization_id: string;
+  name: string;
+  slug: string;
+  description: string | null;
+  location_name: string | null;
+  location_address: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  starts_at: Date;
+  ends_at: Date;
+  sales_start_at: Date | null;
+  sales_end_at: Date | null;
+  image_url: string | null;
+  banner_url: string | null;
+  visibility: EventVisibility;
+  status: EventStatus;
+  created_by: string | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface TicketTier {
+  id: string;
+  event_id: string;
+  name: string;
+  description: string | null;
+  price: number;
+  max_quantity: number | null;
+  sort_order: number;
+  is_active: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface Ticket {
+  id: string;
+  ticket_tier_id: string;
+  event_id: string;
+  organization_id: string;
+  customer_email: string;
+  customer_name: string | null;
+  qr_code: string;
+  status: TicketStatus;
+  used_at: Date | null;
+  used_by: string | null;
+  stripe_payment_intent_id: string | null;
+  stripe_charge_id: string | null;
+  amount_paid: number;
+  platform_fee_cents: number;
+  purchased_at: Date;
+  created_at: Date;
+}
+
+export interface TicketLock {
+  id: string;
+  ticket_tier_id: string;
+  quantity: number;
+  session_id: string;
+  expires_at: Date;
+  created_at: Date;
+}
+
 export * from './subscription';

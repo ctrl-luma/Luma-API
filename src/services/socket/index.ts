@@ -33,6 +33,25 @@ export class SocketService {
   private setupMiddleware() {
     if (!this.io) return;
 
+    // Public namespace for anonymous event page connections (marketing site)
+    const publicNs = this.io.of('/public');
+    publicNs.on('connection', (socket) => {
+      logger.debug('Public socket connected', { socketId: socket.id });
+
+      socket.on('join', (room: string) => {
+        // Only allow joining event-specific or public rooms
+        if (room === 'events:public' || room.startsWith('event:')) {
+          socket.join(room);
+          logger.debug('Public socket joined room', { socketId: socket.id, room });
+        }
+      });
+
+      socket.on('disconnect', () => {
+        logger.debug('Public socket disconnected', { socketId: socket.id });
+      });
+    });
+
+    // Authenticated namespace (default)
     this.io.use(async (socket, next) => {
       try {
         const token = socket.handshake.auth.token;
@@ -155,7 +174,11 @@ export class SocketService {
 
   emitToEvent(eventId: string, event: string, data: any) {
     if (!this.io) return;
+    // Emit to authenticated clients in event room
     this.io.to(`event:${eventId}`).emit(event, data);
+    // Also emit to public namespace for marketing site viewers
+    this.io.of('/public').to(`event:${eventId}`).emit(event, data);
+    this.io.of('/public').to('events:public').emit(event, data);
     logger.debug('Emitted to event', { eventId, event });
   }
 
@@ -248,4 +271,12 @@ export const SocketEvents = {
   CATEGORY_CREATED: 'category:created',
   CATEGORY_DELETED: 'category:deleted',
   CATEGORIES_REORDERED: 'categories:reordered',
+  // Event events
+  EVENT_CREATED: 'event:created',
+  EVENT_UPDATED: 'event:updated',
+  EVENT_DELETED: 'event:deleted',
+  // Ticket events
+  TICKET_PURCHASED: 'ticket:purchased',
+  TICKET_SCANNED: 'ticket:scanned',
+  TICKET_REFUNDED: 'ticket:refunded',
 } as const;

@@ -1,5 +1,8 @@
 # Dependencies
 node_modules/
+
+# Signing certificates
+*.p12
 package-lock.json
 yarn.lock
 pnpm-lock.yaml

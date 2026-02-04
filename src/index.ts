@@ -1,4 +1,5 @@
 import { serve } from '@hono/node-server';
+import { serveStatic } from '@hono/node-server/serve-static';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
 import { prettyJSON } from 'hono/pretty-json';
@@ -34,6 +35,7 @@ import orderRoutes from './routes/orders';
 import tipsRoutes from './routes/tips';
 import staffRoutes from './routes/staff';
 import splitsRoutes from './routes/splits';
+import eventRoutes from './routes/events';
 
 const app = new OpenAPIHono({
   defaultHook: (result, c) => {
@@ -95,6 +97,9 @@ app.get('/health', (c) => {
   });
 });
 
+// Serve static files from public/ directory (wallet badges, etc.)
+app.use('/public/*', serveStatic({ root: './' }));
+
 app.doc('/openapi.json', {
   openapi: '3.0.0',
   info: {
@@ -134,6 +139,7 @@ app.route('/', customerRoutes);
 app.route('/', tipsRoutes);
 app.route('/', staffRoutes);
 app.route('/', splitsRoutes);
+app.route('/', eventRoutes);
 
 app.onError(errorHandler);
 

@@ -1,7 +1,7 @@
 import { Job } from 'bullmq';
 import { QueueName, JobData, queueService } from '../index';
 import { logger } from '../../../utils/logger';
-import { sendOrderConfirmationEmail, sendReceiptEmail, sendPayoutEmail, sendWelcomeEmail } from '../../email/template-sender';
+import { sendOrderConfirmationEmail, sendReceiptEmail, sendPayoutEmail, sendWelcomeEmail, sendTicketConfirmationEmail, sendTicketReminderEmail, sendTicketRefundEmail } from '../../email/template-sender';
 
 export function registerEmailNotifications() {
   return queueService.registerWorker(
@@ -32,7 +32,19 @@ export function registerEmailNotifications() {
           case 'payout_confirmation':
             await sendPayoutConfirmation(to, data);
             break;
-          
+
+          case 'ticket_confirmation':
+            await sendTicketConfirmationEmail(to, data as any);
+            break;
+
+          case 'ticket_reminder':
+            await sendTicketReminderEmail(to, data as any);
+            break;
+
+          case 'ticket_refund':
+            await sendTicketRefundEmail(to, data as any);
+            break;
+
           default:
             throw new Error(`Unknown email type: ${type}`);
         }
