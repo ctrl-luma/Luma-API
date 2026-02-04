@@ -364,4 +364,23 @@ export interface TicketLock {
   created_at: Date;
 }
 
+export interface ApiError {
+  id: string;
+  request_id: string | null;
+  error_message: string;
+  error_stack: string | null;
+  path: string | null;
+  method: string | null;
+  user_id: string | null;
+  organization_id: string | null;
+  request_body: Record<string, unknown> | null;
+  request_headers: Record<string, string> | null;
+  status_code: number;
+  resolved: boolean;
+  resolved_at: Date | null;
+  resolved_by: string | null;
+  notes: string | null;
+  created_at: Date;
+}
+
 export * from './subscription';

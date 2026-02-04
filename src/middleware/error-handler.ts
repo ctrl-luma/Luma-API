@@ -1,10 +1,12 @@
 import { ErrorHandler } from 'hono';
 import { ZodError } from 'zod';
 import { logger } from '../utils/logger';
+import { config } from '../config';
+import { logApiError } from '../services/error-logging';
 
 export const errorHandler: ErrorHandler = (err, c) => {
   const requestId = c.get('requestId');
-  
+
   logger.error({
     message: err.message,
     error: err,
@@ -43,6 +45,26 @@ export const errorHandler: ErrorHandler = (err, c) => {
       message: 'The requested resource was not found',
       requestId,
     }, 404);
+  }
+
+  // Log 500 errors to database in production
+  if (config.env === 'production') {
+    // Get user info if available from context
+    const user = c.get('user') as { id?: string; organizationId?: string } | undefined;
+
+    // Log asynchronously - don't await to avoid slowing down error response
+    logApiError({
+      requestId,
+      errorMessage: err.message,
+      errorStack: err.stack,
+      path: c.req.path,
+      method: c.req.method,
+      userId: user?.id,
+      organizationId: user?.organizationId,
+      statusCode: 500,
+    }).catch(() => {
+      // Already logged in logApiError, ignore here
+    });
   }
 
   return c.json({
