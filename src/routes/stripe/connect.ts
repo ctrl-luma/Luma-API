@@ -2442,8 +2442,10 @@ const analyticsRoute = createRoute({
   security: [{ bearerAuth: [] }],
   request: {
     query: z.object({
-      range: z.enum(['today', 'week', 'month', 'all']).default('week'),
+      range: z.enum(['today', 'week', 'month', 'custom']).default('week'),
       offset: z.string().transform(Number).optional(), // Negative number to go back in time (e.g., -1 = previous period)
+      startDate: z.string().optional(), // ISO date string for custom range (YYYY-MM-DD)
+      endDate: z.string().optional(), // ISO date string for custom range (YYYY-MM-DD)
     }),
   },
   responses: {
@@ -2551,6 +2553,9 @@ const analyticsRoute = createRoute({
             })),
             deviceBreakdown: z.array(z.object({
               deviceId: z.string(),
+              deviceName: z.string().nullable(),
+              modelName: z.string().nullable(),
+              osName: z.string().nullable(),
               orderCount: z.number(),
               revenue: z.number(),
               avgOrder: z.number(),
@@ -2580,6 +2585,8 @@ app.openapi(analyticsRoute, async (c) => {
 
     const range = c.req.query('range') || 'week';
     const offset = parseInt(c.req.query('offset') || '0') || 0; // Offset for navigating to previous periods
+    const customStartDate = c.req.query('startDate'); // ISO date string for custom range
+    const customEndDate = c.req.query('endDate'); // ISO date string for custom range
     const now = new Date();
     let currentStart: Date;
     let currentEnd: Date;
@@ -2612,23 +2619,40 @@ app.openapi(analyticsRoute, async (c) => {
         previousStart = new Date(now.getFullYear(), now.getMonth() + offset - 1, 1);
         previousEnd = new Date(currentStart.getTime() - 1);
         break;
-      case 'all':
+      case 'custom':
+        // Custom date range from query parameters
+        if (!customStartDate || !customEndDate) {
+          return c.json({ error: 'startDate and endDate required for custom range' }, 400);
+        }
+        currentStart = new Date(customStartDate);
+        currentStart.setHours(0, 0, 0, 0);
+        currentEnd = new Date(customEndDate);
+        currentEnd.setHours(23, 59, 59, 999);
+        // Previous period is same duration before the custom range
+        const customDuration = currentEnd.getTime() - currentStart.getTime();
+        previousEnd = new Date(currentStart.getTime() - 1);
+        previousStart = new Date(currentStart.getTime() - customDuration - 1);
+        break;
       default:
-        // All time - no offset support
-        currentStart = new Date(now.getFullYear() - 1, now.getMonth(), 1);
-        currentEnd = now;
-        previousStart = new Date(now.getFullYear() - 3, now.getMonth(), 1);
+        // Default to week
+        const defaultDayOfWeek = now.getDay();
+        const defaultDaysFromMonday = defaultDayOfWeek === 0 ? 6 : defaultDayOfWeek - 1;
+        currentStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - defaultDaysFromMonday);
+        currentEnd = new Date(currentStart.getTime() + 7 * 24 * 60 * 60 * 1000 - 1);
+        previousStart = new Date(currentStart.getTime() - 7 * 24 * 60 * 60 * 1000);
         previousEnd = new Date(currentStart.getTime() - 1);
         break;
     }
 
+    // Use bounded query when viewing past periods (offset != 0) or custom date range
+    const useBoundedQuery = offset !== 0 || range === 'custom';
+
     // Query current period metrics from database
-    // Use bounded query when viewing past periods (offset != 0)
     const currentMetricsQuery = await query<{
       revenue: string;
       transactions: string;
     }>(
-      offset !== 0
+      useBoundedQuery
         ? `SELECT
             COALESCE(SUM(total_amount), 0)::text as revenue,
             COUNT(*)::text as transactions
@@ -2644,7 +2668,7 @@ app.openapi(analyticsRoute, async (c) => {
           WHERE organization_id = $1
             AND status = 'completed'
             AND created_at >= $2`,
-      offset !== 0
+      useBoundedQuery
         ? [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
         : [payload.organizationId, currentStart.toISOString()]
     );
@@ -2799,42 +2823,129 @@ app.openapi(analyticsRoute, async (c) => {
           count: dailyCountMap[dateStr] || 0
         });
       }
-    } else {
-      // 'all' - Group by year
-      const yearlyQuery = await query<{ year: string; revenue: string; order_count: string }>(
-        `SELECT
-          EXTRACT(YEAR FROM created_at)::text as year,
-          COALESCE(SUM(total_amount), 0)::text as revenue,
-          COUNT(*)::text as order_count
-        FROM orders
-        WHERE organization_id = $1
-          AND status = 'completed'
-          AND created_at >= $2
-        GROUP BY EXTRACT(YEAR FROM created_at)
-        ORDER BY EXTRACT(YEAR FROM created_at)`,
-        [payload.organizationId, currentStart.toISOString()]
-      );
+    } else if (range === 'custom') {
+      // Custom date range - determine appropriate bucketing based on range length
+      const daysDiff = Math.ceil((currentEnd.getTime() - currentStart.getTime()) / (1000 * 60 * 60 * 24));
 
-      const yearlyMap: Record<string, number> = {};
-      const yearlyCountMap: Record<string, number> = {};
-      yearlyQuery.forEach(row => {
-        yearlyMap[row.year] = parseFloat(row.revenue);
-        yearlyCountMap[row.year] = parseInt(row.order_count);
-      });
+      if (daysDiff <= 1) {
+        // Same day or next day - group by hour (similar to 'today')
+        const hourlyQuery = await query<{ hour: string; revenue: string; order_count: string }>(
+          `SELECT
+            EXTRACT(HOUR FROM created_at)::text as hour,
+            COALESCE(SUM(total_amount), 0)::text as revenue,
+            COUNT(*)::text as order_count
+          FROM orders
+          WHERE organization_id = $1
+            AND status = 'completed'
+            AND created_at >= $2
+            AND created_at <= $3
+          GROUP BY EXTRACT(HOUR FROM created_at)
+          ORDER BY EXTRACT(HOUR FROM created_at)`,
+          [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
+        );
 
-      // Show last 2 years
-      for (let i = 1; i >= 0; i--) {
-        const year = now.getFullYear() - i;
-        revenueData.push({ label: year.toString(), revenue: Math.round((yearlyMap[year.toString()] || 0) * 100) / 100 });
-        transactionData.push({ label: year.toString(), count: yearlyCountMap[year.toString()] || 0 });
+        const hourlyMap: Record<number, number> = {};
+        const hourlyCountMap: Record<number, number> = {};
+        hourlyQuery.forEach(row => {
+          const h = parseInt(row.hour);
+          hourlyMap[h] = parseFloat(row.revenue);
+          hourlyCountMap[h] = parseInt(row.order_count);
+        });
+
+        for (let h = 0; h < 24; h++) {
+          const hour12 = h === 0 ? 12 : (h > 12 ? h - 12 : h);
+          const ampm = h >= 12 ? 'PM' : 'AM';
+          const label = `${hour12}${ampm}`;
+          revenueData.push({ label, revenue: Math.round((hourlyMap[h] || 0) * 100) / 100 });
+          transactionData.push({ label, count: hourlyCountMap[h] || 0 });
+        }
+      } else if (daysDiff <= 90) {
+        // Up to 3 months - group by day
+        const dailyQuery = await query<{ day_date: string; revenue: string; order_count: string }>(
+          `SELECT
+            DATE(created_at)::text as day_date,
+            COALESCE(SUM(total_amount), 0)::text as revenue,
+            COUNT(*)::text as order_count
+          FROM orders
+          WHERE organization_id = $1
+            AND status = 'completed'
+            AND created_at >= $2
+            AND created_at <= $3
+          GROUP BY DATE(created_at)
+          ORDER BY DATE(created_at)`,
+          [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
+        );
+
+        const dailyMap: Record<string, number> = {};
+        const dailyCountMap: Record<string, number> = {};
+        dailyQuery.forEach(row => {
+          dailyMap[row.day_date] = parseFloat(row.revenue);
+          dailyCountMap[row.day_date] = parseInt(row.order_count);
+        });
+
+        // Generate each day in the range
+        const current = new Date(currentStart);
+        while (current <= currentEnd) {
+          const dateStr = current.toISOString().split('T')[0];
+          const label = current.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+          revenueData.push({
+            label,
+            revenue: Math.round((dailyMap[dateStr] || 0) * 100) / 100
+          });
+          transactionData.push({
+            label,
+            count: dailyCountMap[dateStr] || 0
+          });
+          current.setDate(current.getDate() + 1);
+        }
+      } else {
+        // More than 3 months - group by month
+        const monthlyQuery = await query<{ year_month: string; revenue: string; order_count: string }>(
+          `SELECT
+            TO_CHAR(created_at, 'YYYY-MM') as year_month,
+            COALESCE(SUM(total_amount), 0)::text as revenue,
+            COUNT(*)::text as order_count
+          FROM orders
+          WHERE organization_id = $1
+            AND status = 'completed'
+            AND created_at >= $2
+            AND created_at <= $3
+          GROUP BY TO_CHAR(created_at, 'YYYY-MM')
+          ORDER BY TO_CHAR(created_at, 'YYYY-MM')`,
+          [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
+        );
+
+        const monthlyMap: Record<string, number> = {};
+        const monthlyCountMap: Record<string, number> = {};
+        monthlyQuery.forEach(row => {
+          monthlyMap[row.year_month] = parseFloat(row.revenue);
+          monthlyCountMap[row.year_month] = parseInt(row.order_count);
+        });
+
+        // Generate each month in the range
+        const current = new Date(currentStart.getFullYear(), currentStart.getMonth(), 1);
+        const endMonth = new Date(currentEnd.getFullYear(), currentEnd.getMonth(), 1);
+        while (current <= endMonth) {
+          const yearMonth = `${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, '0')}`;
+          const label = current.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
+          revenueData.push({
+            label,
+            revenue: Math.round((monthlyMap[yearMonth] || 0) * 100) / 100
+          });
+          transactionData.push({
+            label,
+            count: monthlyCountMap[yearMonth] || 0
+          });
+          current.setMonth(current.getMonth() + 1);
+        }
       }
     }
 
     // Helper for date-bounded queries
-    const dateCondition = offset !== 0
+    const dateCondition = useBoundedQuery
       ? 'AND created_at >= $2 AND created_at <= $3'
       : 'AND created_at >= $2';
-    const dateParams = offset !== 0
+    const dateParams = useBoundedQuery
       ? [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
       : [payload.organizationId, currentStart.toISOString()];
 
@@ -2917,7 +3028,7 @@ app.openapi(analyticsRoute, async (c) => {
     }
 
     // Query top products from orders with product details
-    const orderDateCondition = offset !== 0
+    const orderDateCondition = useBoundedQuery
       ? 'AND o.created_at >= $2 AND o.created_at <= $3'
       : 'AND o.created_at >= $2';
 
@@ -3125,7 +3236,7 @@ app.openapi(analyticsRoute, async (c) => {
         GROUP BY customer_id
       )
       SELECT
-        COUNT(CASE WHEN fo.first_order_at >= $2 ${offset !== 0 ? 'AND fo.first_order_at <= $3' : ''} THEN 1 END)::text as new_customers,
+        COUNT(CASE WHEN fo.first_order_at >= $2 ${useBoundedQuery ? 'AND fo.first_order_at <= $3' : ''} THEN 1 END)::text as new_customers,
         COUNT(CASE WHEN fo.first_order_at < $2 THEN 1 END)::text as returning_customers
       FROM (
         SELECT DISTINCT customer_id FROM orders
@@ -3195,7 +3306,7 @@ app.openapi(analyticsRoute, async (c) => {
       WHERE o.organization_id = $1
         AND o.status = 'completed'
         AND o.user_id IS NOT NULL
-        AND o.created_at >= $2${offset !== 0 ? ' AND o.created_at <= $3' : ''}
+        AND o.created_at >= $2${useBoundedQuery ? ' AND o.created_at <= $3' : ''}
       GROUP BY o.user_id, u.first_name, u.last_name, u.avatar_image_id
       ORDER BY SUM(o.total_amount) DESC`,
       dateParams
@@ -3218,24 +3329,35 @@ app.openapi(analyticsRoute, async (c) => {
       };
     });
 
-    // Query device breakdown
+    // Query device breakdown (LEFT JOIN devices table for device info)
+    // Note: Using explicit o.created_at since dateCondition is ambiguous with JOIN
+    const deviceDateCondition = useBoundedQuery
+      ? 'AND o.created_at >= $2 AND o.created_at <= $3'
+      : 'AND o.created_at >= $2';
     const deviceQuery = await query<{
       device_id: string;
+      device_name: string | null;
+      model_name: string | null;
+      os_name: string | null;
       order_count: string;
       revenue: string;
       last_used: string | null;
     }>(
       `SELECT
         o.device_id,
+        d.device_name,
+        d.model_name,
+        d.os_name,
         COUNT(*)::text as order_count,
         COALESCE(SUM(o.total_amount), 0)::text as revenue,
         MAX(o.created_at)::text as last_used
       FROM orders o
+      LEFT JOIN devices d ON d.device_id = o.device_id
       WHERE o.organization_id = $1
         AND o.status = 'completed'
         AND o.device_id IS NOT NULL
-        ${dateCondition}
-      GROUP BY o.device_id
+        ${deviceDateCondition}
+      GROUP BY o.device_id, d.device_name, d.model_name, d.os_name
       ORDER BY SUM(o.total_amount) DESC`,
       dateParams
     );
@@ -3246,6 +3368,9 @@ app.openapi(analyticsRoute, async (c) => {
       const revenue = Math.round(parseFloat(d.revenue || '0') * 100) / 100;
       return {
         deviceId: d.device_id,
+        deviceName: d.device_name || null,
+        modelName: d.model_name || null,
+        osName: d.os_name || null,
         orderCount,
         revenue,
         avgOrder: orderCount > 0 ? Math.round((revenue / orderCount) * 100) / 100 : 0,

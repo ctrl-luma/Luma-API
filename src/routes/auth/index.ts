@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { authService } from '../../services/auth';
 import { cognitoService } from '../../services/auth/cognito';
 import { staffService } from '../../services/staff';
+import { deviceService } from '../../services/device';
 import { logger } from '../../utils/logger';
 import { query } from '../../db';
 import { config } from '../../config';
@@ -37,10 +38,21 @@ const app = new OpenAPIHono({
 // Mount signup routes
 app.route('/', signupRoutes);
 
+const DeviceInfoSchema = z.object({
+  name: z.string().max(255).optional(),
+  model: z.string().max(100).optional(),
+  os: z.string().max(50).optional(),
+  osVersion: z.string().max(50).optional(),
+  appVersion: z.string().max(50).optional(),
+});
+
 const LoginRequestSchema = z.object({
   email: z.string().email(),
   password: z.string(),
   source: z.enum(['app', 'web']).optional().default('web'),
+  // Device tracking fields (for mobile app)
+  deviceId: z.string().max(255).optional(),
+  deviceInfo: DeviceInfoSchema.optional(),
 });
 
 const LoginResponseSchema = z.object({
@@ -237,7 +249,32 @@ app.openapi(loginRoute, async (c) => {
       }
     }
 
-    logger.info('User logged in', { userId: user.id, email: user.email, sessionVersion: tokens.sessionVersion, isStaff: !!user.invited_by, tier: subscription.tier });
+    // Register device if deviceId provided (mobile app logins)
+    if (validated.deviceId && validated.source === 'app') {
+      try {
+        await deviceService.registerDeviceOnLogin(
+          user.organization_id,
+          user.id,
+          {
+            deviceId: validated.deviceId,
+            name: validated.deviceInfo?.name,
+            model: validated.deviceInfo?.model,
+            os: validated.deviceInfo?.os,
+            osVersion: validated.deviceInfo?.osVersion,
+            appVersion: validated.deviceInfo?.appVersion,
+          }
+        );
+      } catch (deviceError) {
+        // Log but don't fail login if device registration fails
+        logger.error('Failed to register device on login', {
+          error: deviceError,
+          deviceId: validated.deviceId,
+          userId: user.id,
+        });
+      }
+    }
+
+    logger.info('User logged in', { userId: user.id, email: user.email, sessionVersion: tokens.sessionVersion, isStaff: !!user.invited_by, tier: subscription.tier, deviceId: validated.deviceId });
 
     return c.json({
       user: {

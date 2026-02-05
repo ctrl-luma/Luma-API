@@ -383,4 +383,35 @@ export interface ApiError {
   created_at: Date;
 }
 
+export interface Device {
+  id: string;
+  device_id: string; // App-generated UUID stored in AsyncStorage
+  organization_id: string;
+  device_name: string | null;
+  model_name: string | null;
+  os_name: string | null;
+  os_version: string | null;
+  app_version: string | null;
+  has_tap_to_pay: boolean;
+  tap_to_pay_enabled_at: Date | null;
+  first_seen_at: Date;
+  last_seen_at: Date;
+  last_user_id: string | null;
+  metadata: Record<string, any>;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface UserDevice {
+  id: string;
+  user_id: string;
+  device_id: string; // References devices.id (database UUID, not app device_id)
+  first_login_at: Date;
+  last_login_at: Date;
+  login_count: number;
+  is_active: boolean;
+  created_at: Date;
+  updated_at: Date;
+}
+
 export * from './subscription';
