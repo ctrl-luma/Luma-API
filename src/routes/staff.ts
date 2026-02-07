@@ -507,7 +507,7 @@ app.openapi(uploadStaffAvatarRoute, async (c) => {
     if (oldAvatarId) {
       try {
         await imageService.delete(oldAvatarId);
-      } catch (e) {
+      } catch {
         logger.warn('Failed to delete old staff avatar', { staffId: id, oldAvatarId });
       }
     }

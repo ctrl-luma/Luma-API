@@ -100,7 +100,7 @@ export const optionalAuth = (): MiddlewareHandler => {
           organizationId: payload.organizationId,
           role: payload.role,
         });
-      } catch (error) {
+      } catch {
         // Ignore error for optional auth
       }
     }

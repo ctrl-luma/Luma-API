@@ -231,7 +231,7 @@ const billingHistoryRoute = createRoute({
   },
 });
 
-// @ts-ignore - OpenAPI handler type mismatch
+// @ts-expect-error - OpenAPI handler type mismatch
 app.openapi(billingHistoryRoute, async (c) => {
   const authHeader = c.req.header('Authorization');
   
@@ -377,7 +377,11 @@ app.openapi(billingHistoryRoute, async (c) => {
       },
     });
 
-  } catch (error) {
+  } catch (error: any) {
+    // Check if this is an auth error (invalid/expired token)
+    if (error?.message?.includes('Invalid token') || error?.message?.includes('Token expired') || error?.message === 'Unauthorized') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
     logger.error('Billing history retrieval failed', { error });
     return c.json({ error: 'Failed to retrieve billing history' }, 500);
   }
@@ -615,7 +619,7 @@ app.openapi(paymentInfoRoute, async (c) => {
             } else if (coupon.percent_off) {
               upcomingInvoiceAmount = Math.round(basePrice * (1 - coupon.percent_off / 100));
             }
-          } catch (e) {
+          } catch {
             // Coupon fetch failed, continue without discount info
           }
         }
@@ -724,6 +728,11 @@ app.openapi(paymentInfoRoute, async (c) => {
     });
 
   } catch (error: any) {
+    // Check if this is an auth error (invalid/expired token)
+    if (error?.message?.includes('Invalid token') || error?.message?.includes('Token expired') || error?.message === 'Unauthorized') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
     logger.error('Payment info retrieval failed', {
       error: {
         message: error?.message,

@@ -244,7 +244,7 @@ app.openapi(listEventsRoute, async (c) => {
 
     const rows = await query(
       `SELECT e.*,
-        COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.event_id = e.id AND t.status != 'cancelled'), 0)::int AS tickets_sold,
+        COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.event_id = e.id AND t.status NOT IN ('cancelled', 'refunded')), 0)::int AS tickets_sold,
         COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.event_id = e.id AND t.status = 'used'), 0)::int AS tickets_scanned,
         (SELECT SUM(tt.max_quantity) FROM ticket_tiers tt WHERE tt.event_id = e.id)::int AS total_capacity
        FROM events e
@@ -426,7 +426,7 @@ app.openapi(listPublicEventsRoute, async (c) => {
     // Fetch page
     const rows = await query(
       `SELECT e.*,
-        COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.event_id = e.id AND t.status != 'cancelled'), 0)::int AS tickets_sold,
+        COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.event_id = e.id AND t.status NOT IN ('cancelled', 'refunded')), 0)::int AS tickets_sold,
         (SELECT SUM(tt.max_quantity) FROM ticket_tiers tt WHERE tt.event_id = e.id)::int AS total_capacity,
         (SELECT MIN(tt.price) FROM ticket_tiers tt WHERE tt.event_id = e.id AND tt.is_active = true) AS min_price,
         o.name AS organization_name
@@ -484,7 +484,7 @@ app.openapi(getPublicEventRoute, async (c) => {
     // Get tiers with availability
     const tiers = await query(
       `SELECT tt.*,
-        COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.ticket_tier_id = tt.id AND t.status != 'cancelled'), 0)::int AS sold_count,
+        COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.ticket_tier_id = tt.id AND t.status NOT IN ('cancelled', 'refunded')), 0)::int AS sold_count,
         COALESCE((SELECT SUM(tl.quantity) FROM ticket_locks tl WHERE tl.ticket_tier_id = tt.id AND tl.expires_at > NOW()), 0)::int AS locked_count
        FROM ticket_tiers tt
        WHERE tt.event_id = $1 AND tt.is_active = true
@@ -616,7 +616,7 @@ app.openapi(lockTicketsRoute, async (c) => {
 
     const tier = await query(
       `SELECT tt.*,
-        COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.ticket_tier_id = tt.id AND t.status != 'cancelled'), 0)::int AS sold_count,
+        COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.ticket_tier_id = tt.id AND t.status NOT IN ('cancelled', 'refunded')), 0)::int AS sold_count,
         COALESCE((SELECT SUM(tl.quantity) FROM ticket_locks tl WHERE tl.ticket_tier_id = tt.id AND tl.expires_at > NOW()), 0)::int AS locked_count
        FROM ticket_tiers tt
        WHERE tt.id = $1 AND tt.event_id = $2 AND tt.is_active = true`,
@@ -1463,7 +1463,7 @@ app.openapi(getEventRoute, async (c) => {
 
     const rows = await query(
       `SELECT e.*,
-        COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.event_id = e.id AND t.status != 'cancelled'), 0)::int AS tickets_sold,
+        COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.event_id = e.id AND t.status NOT IN ('cancelled', 'refunded')), 0)::int AS tickets_sold,
         (SELECT SUM(tt.max_quantity) FROM ticket_tiers tt WHERE tt.event_id = e.id)::int AS total_capacity
        FROM events e
        WHERE e.id = $1 AND e.organization_id = $2`,
@@ -1474,7 +1474,7 @@ app.openapi(getEventRoute, async (c) => {
     // Get tiers with sold counts
     const tiers = await query(
       `SELECT tt.*,
-        COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.ticket_tier_id = tt.id AND t.status != 'cancelled'), 0)::int AS sold_count
+        COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.ticket_tier_id = tt.id AND t.status NOT IN ('cancelled', 'refunded')), 0)::int AS sold_count
        FROM ticket_tiers tt
        WHERE tt.event_id = $1
        ORDER BY tt.sort_order ASC`,

@@ -273,6 +273,7 @@ app.openapi(createCategoryRoute, async (c) => {
       catalogId,
       name: row.name,
     });
+    socketService.emitToCatalog(catalogId, SocketEvents.CATALOG_UPDATED, { catalogId, type: 'category_created' });
 
     return c.json({
       id: row.id,
@@ -401,6 +402,7 @@ app.openapi(updateCategoryRoute, async (c) => {
       catalogId,
       name: row.name,
     });
+    socketService.emitToCatalog(catalogId, SocketEvents.CATALOG_UPDATED, { catalogId, type: 'category_updated' });
 
     return c.json({
       id: row.id,
@@ -470,6 +472,7 @@ app.openapi(deleteCategoryRoute, async (c) => {
       categoryId: id,
       catalogId,
     });
+    socketService.emitToCatalog(catalogId, SocketEvents.CATALOG_UPDATED, { catalogId, type: 'category_deleted' });
 
     return c.body(null, 204);
   } catch (error: any) {
@@ -533,6 +536,7 @@ app.openapi(reorderCategoriesRoute, async (c) => {
     socketService.emitToOrganization(payload.organizationId, SocketEvents.CATEGORIES_REORDERED, {
       catalogId,
     });
+    socketService.emitToCatalog(catalogId, SocketEvents.CATALOG_UPDATED, { catalogId, type: 'categories_reordered' });
 
     return c.json({ success: true });
   } catch (error: any) {

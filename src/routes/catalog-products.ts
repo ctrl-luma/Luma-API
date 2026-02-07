@@ -275,6 +275,7 @@ app.openapi(addProductToCatalogRoute, async (c) => {
       SocketEvents.CATALOG_UPDATED,
       { catalogId, type: 'product_added' }
     );
+    socketService.emitToCatalog(catalogId, SocketEvents.CATALOG_UPDATED, { catalogId, type: 'product_added' });
 
     return c.json({
       id: row.id,
@@ -428,6 +429,7 @@ app.openapi(updateCatalogProductRoute, async (c) => {
       SocketEvents.CATALOG_UPDATED,
       { catalogId, type: 'product_updated' }
     );
+    socketService.emitToCatalog(catalogId, SocketEvents.CATALOG_UPDATED, { catalogId, type: 'product_updated' });
 
     return c.json({
       id: row.id,
@@ -505,6 +507,7 @@ app.openapi(removeProductFromCatalogRoute, async (c) => {
       SocketEvents.CATALOG_UPDATED,
       { catalogId, type: 'product_removed' }
     );
+    socketService.emitToCatalog(catalogId, SocketEvents.CATALOG_UPDATED, { catalogId, type: 'product_removed' });
 
     return c.body(null, 204);
   } catch (error: any) {
@@ -615,6 +618,7 @@ app.openapi(bulkAddProductsRoute, async (c) => {
       SocketEvents.CATALOG_UPDATED,
       { catalogId, type: 'products_bulk_added', added }
     );
+    socketService.emitToCatalog(catalogId, SocketEvents.CATALOG_UPDATED, { catalogId, type: 'products_bulk_added' });
 
     return c.json({ added, skipped }, 201);
   } catch (error: any) {
@@ -693,6 +697,7 @@ app.openapi(reorderProductsRoute, async (c) => {
       SocketEvents.CATALOG_UPDATED,
       { catalogId, type: 'products_reordered' }
     );
+    socketService.emitToCatalog(catalogId, SocketEvents.CATALOG_UPDATED, { catalogId, type: 'products_reordered' });
 
     return c.json({ success: true });
   } catch (error: any) {

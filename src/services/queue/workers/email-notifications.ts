@@ -1,7 +1,7 @@
 import { Job } from 'bullmq';
 import { QueueName, JobData, queueService } from '../index';
 import { logger } from '../../../utils/logger';
-import { sendOrderConfirmationEmail, sendReceiptEmail, sendPayoutEmail, sendWelcomeEmail, sendTicketConfirmationEmail, sendTicketReminderEmail, sendTicketRefundEmail } from '../../email/template-sender';
+import { sendOrderConfirmationEmail, sendReceiptEmail, sendPayoutEmail, sendWelcomeEmail, sendTicketConfirmationEmail, sendTicketReminderEmail, sendTicketRefundEmail, sendPreorderConfirmationEmail, sendPreorderReadyEmail, sendPreorderCancelledEmail } from '../../email/template-sender';
 
 export function registerEmailNotifications() {
   return queueService.registerWorker(
@@ -43,6 +43,18 @@ export function registerEmailNotifications() {
 
           case 'ticket_refund':
             await sendTicketRefundEmail(to, data as any);
+            break;
+
+          case 'preorder_confirmation':
+            await sendPreorderConfirmationEmail(to, data as any);
+            break;
+
+          case 'preorder_ready':
+            await sendPreorderReadyEmail(to, data as any);
+            break;
+
+          case 'preorder_cancelled':
+            await sendPreorderCancelledEmail(to, data as any);
             break;
 
           default:

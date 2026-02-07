@@ -7,6 +7,7 @@ import { config } from '../../config';
 import { logger } from '../../utils/logger';
 import { socketService, SocketEvents } from '../../services/socket';
 import { emailService } from '../../services/email';
+import { queueService, QueueName } from '../../services/queue';
 import Stripe from 'stripe';
 
 const app = new OpenAPIHono();
@@ -1082,17 +1083,20 @@ const listTransactionsRoute = createRoute({
   request: {
     query: z.object({
       limit: z.string().transform(Number).optional(),
+      offset: z.string().transform(Number).optional(),
       starting_after: z.string().optional(),
       ending_before: z.string().optional(),
+      source: z.enum(['all', 'orders', 'preorders', 'tickets']).optional(),
       catalog_id: z.string().uuid().optional(),
-      customer_email: z.string().optional(), // Allow partial email for "contains" search
-      device_id: z.string().optional(), // Filter by device that processed the order
-      date_from: z.string().transform(Number).optional(), // Unix timestamp
-      date_to: z.string().transform(Number).optional(), // Unix timestamp
-      amount_min: z.string().transform(Number).optional(), // In cents
-      amount_max: z.string().transform(Number).optional(), // In cents
+      customer_email: z.string().optional(),
+      device_id: z.string().optional(),
+      date_from: z.string().transform(Number).optional(),
+      date_to: z.string().transform(Number).optional(),
+      amount_min: z.string().transform(Number).optional(),
+      amount_max: z.string().transform(Number).optional(),
       sort_by: z.enum(['date', 'amount', 'email']).optional(),
       sort_order: z.enum(['asc', 'desc']).optional(),
+      status: z.enum(['all', 'succeeded', 'refunded', 'failed', 'pending', 'cancelled']).optional(),
     }),
   },
   responses: {
@@ -1122,8 +1126,16 @@ const listTransactionsRoute = createRoute({
                 processingFee: z.number(),
                 netAmount: z.number(),
               }).optional(),
+              sourceType: z.enum(['order', 'preorder', 'ticket']),
+              catalogName: z.string().nullable().optional(),
+              eventName: z.string().nullable().optional(),
+              eventId: z.string().nullable().optional(),
+              tierName: z.string().nullable().optional(),
+              dailyNumber: z.number().nullable().optional(),
+              itemCount: z.number().optional(),
             })),
             hasMore: z.boolean(),
+            total: z.number().optional(),
           }),
         },
       },
@@ -1146,18 +1158,15 @@ app.openapi(listTransactionsRoute, async (c) => {
     const { authService } = await import('../../services/auth');
     const payload = await authService.verifyToken(token);
 
-    // Get connected account (needed for Stripe charge lookups)
-    const rows = await query<StripeConnectedAccount>(
+    // Get connected account (optional — needed for Stripe charge enrichment only)
+    const accountRows = await query<StripeConnectedAccount>(
       'SELECT * FROM stripe_connected_accounts WHERE organization_id = $1',
       [payload.organizationId]
     );
+    const connectedAccount = accountRows.length > 0 ? accountRows[0] : null;
 
-    if (rows.length === 0) {
-      return c.json({ error: 'No connected account found' }, 404);
-    }
-
-    const connectedAccount = rows[0];
     const queryParams = c.req.query();
+    const source = (queryParams.source || 'all') as string;
     const catalogIdFilter = queryParams.catalog_id || null;
     const customerEmailFilter = queryParams.customer_email?.toLowerCase() || null;
     const deviceIdFilter = queryParams.device_id || null;
@@ -1168,261 +1177,302 @@ app.openapi(listTransactionsRoute, async (c) => {
     const sortBy = queryParams.sort_by || 'date';
     const sortOrder = queryParams.sort_order || 'desc';
     const requestedLimit = queryParams.limit ? parseInt(queryParams.limit) : 25;
+    const requestedOffset = queryParams.offset ? parseInt(queryParams.offset) : 0;
+    const statusFilter = queryParams.status || 'all';
     const startingAfter = queryParams.starting_after || null;
 
-    // DB-first: Query orders table with all filters applied at the DB level
-    // This includes ALL payment types: tap_to_pay, cash, split, card
-    const conditions: string[] = ['o.organization_id = $1', "o.status IN ('completed', 'refunded')"];
-    const params: any[] = [payload.organizationId];
-    let paramIndex = 2;
-
-    if (catalogIdFilter) {
-      conditions.push(`o.catalog_id = $${paramIndex}`);
-      params.push(catalogIdFilter);
-      paramIndex++;
-    }
-    if (deviceIdFilter) {
-      conditions.push(`o.device_id = $${paramIndex}`);
-      params.push(deviceIdFilter);
-      paramIndex++;
-    }
-    if (customerEmailFilter) {
-      conditions.push(`LOWER(o.customer_email) LIKE $${paramIndex}`);
-      params.push(`%${customerEmailFilter}%`);
-      paramIndex++;
-    }
-    if (dateFrom) {
-      conditions.push(`o.created_at >= to_timestamp($${paramIndex})`);
-      params.push(dateFrom);
-      paramIndex++;
-    }
-    if (dateTo) {
-      conditions.push(`o.created_at <= to_timestamp($${paramIndex})`);
-      params.push(dateTo);
-      paramIndex++;
-    }
-    if (amountMin !== null) {
-      conditions.push(`o.total_amount >= $${paramIndex}`);
-      params.push(amountMin);
-      paramIndex++;
-    }
-    if (amountMax !== null) {
-      conditions.push(`o.total_amount <= $${paramIndex}`);
-      params.push(amountMax);
-      paramIndex++;
-    }
-
-    // Cursor pagination: fetch orders created before the cursor order
-    if (startingAfter) {
-      // Look up the created_at of the cursor order
-      const cursorRows = await query<{ created_at: Date }>(
-        'SELECT created_at FROM orders WHERE id = $1',
-        [startingAfter]
+    // Resolve cursor for keyset pagination (used by mobile app's infinite scroll)
+    let cursorCreatedAt: Date | null = null;
+    if (startingAfter && !queryParams.offset) {
+      const cursorResult = await query<{ created_at: Date }>(
+        `SELECT created_at FROM (
+          SELECT id, created_at FROM orders WHERE organization_id = $1 AND id = $2
+          UNION ALL
+          SELECT id, created_at FROM preorders WHERE organization_id = $1 AND id = $2
+          UNION ALL
+          SELECT id, purchased_at as created_at FROM tickets WHERE organization_id = $1 AND id = $2
+        ) as cursor_lookup LIMIT 1`,
+        [payload.organizationId, startingAfter]
       );
-      if (cursorRows.length > 0) {
-        conditions.push(`(o.created_at < $${paramIndex} OR (o.created_at = $${paramIndex} AND o.id < $${paramIndex + 1}))`);
-        params.push(cursorRows[0].created_at, startingAfter);
-        paramIndex += 2;
+      if (cursorResult.length > 0) {
+        cursorCreatedAt = cursorResult[0].created_at;
       }
     }
 
-    // Build sort clause
-    let orderClause = 'o.created_at DESC, o.id DESC';
-    if (sortBy === 'amount') {
-      orderClause = sortOrder === 'asc' ? 'o.total_amount ASC, o.id DESC' : 'o.total_amount DESC, o.id DESC';
-    } else if (sortBy === 'email') {
-      orderClause = sortOrder === 'asc' ? 'o.customer_email ASC NULLS LAST, o.id DESC' : 'o.customer_email DESC NULLS LAST, o.id DESC';
-    } else if (sortOrder === 'asc') {
-      orderClause = 'o.created_at ASC, o.id ASC';
+    // Build UNION ALL query across orders, preorders, and tickets
+    const includeOrders = source === 'all' || source === 'orders';
+    const includePreorders = source === 'all' || source === 'preorders';
+    // Exclude tickets when device_id is present (mobile POS app doesn't show ticket sales)
+    const includeTickets = (source === 'all' || source === 'tickets') && !deviceIdFilter;
+
+    const subqueries: string[] = [];
+    const params: any[] = [payload.organizationId]; // $1
+    let paramIdx = 2;
+    const addParam = (val: any): string => {
+      params.push(val);
+      return `$${paramIdx++}`;
+    };
+
+    // Add cursor params once (shared across all subqueries)
+    let cursorTsParam: string | null = null;
+    let cursorIdParam: string | null = null;
+    if (cursorCreatedAt && startingAfter) {
+      cursorTsParam = addParam(cursorCreatedAt);
+      cursorIdParam = addParam(startingAfter);
     }
 
-    // Fetch one extra to check hasMore
-    params.push(requestedLimit + 1);
+    // --- Orders subquery ---
+    if (includeOrders && statusFilter !== 'pending' && statusFilter !== 'cancelled') {
+      const conds: string[] = ['o.organization_id = $1'];
+      if (statusFilter === 'succeeded') conds.push("o.status = 'completed'");
+      else if (statusFilter === 'refunded') conds.push("o.status = 'refunded'");
+      else if (statusFilter === 'failed') conds.push("o.status = 'failed'");
+      else conds.push("o.status IN ('completed', 'refunded')");
+      if (catalogIdFilter) conds.push(`o.catalog_id = ${addParam(catalogIdFilter)}`);
+      if (deviceIdFilter) conds.push(`o.device_id = ${addParam(deviceIdFilter)}`);
+      if (customerEmailFilter) conds.push(`LOWER(o.customer_email) LIKE ${addParam(`%${customerEmailFilter}%`)}`);
+      if (dateFrom) conds.push(`o.created_at >= to_timestamp(${addParam(dateFrom)})`);
+      if (dateTo) conds.push(`o.created_at <= to_timestamp(${addParam(dateTo)})`);
+      if (amountMin !== null) conds.push(`o.total_amount >= ${addParam(amountMin)}`);
+      if (amountMax !== null) conds.push(`o.total_amount <= ${addParam(amountMax)}`);
+      if (cursorTsParam) conds.push(`(o.created_at, o.id) < (${cursorTsParam}, ${cursorIdParam})`);
 
-    const orderRows = await query<{
-      id: string;
-      order_number: string;
-      status: string;
-      payment_method: string | null;
-      subtotal: string;
-      tax_amount: string;
-      tip_amount: string;
-      total_amount: string;
-      stripe_charge_id: string | null;
-      stripe_payment_intent_id: string | null;
-      customer_email: string | null;
-      device_id: string | null;
-      catalog_id: string | null;
-      metadata: any;
-      created_at: Date;
-    }>(
-      `SELECT o.id, o.order_number, o.status, o.payment_method,
-              o.subtotal, o.tax_amount, o.tip_amount, o.total_amount,
-              o.stripe_charge_id, o.stripe_payment_intent_id,
-              o.customer_email, o.device_id, o.catalog_id,
-              o.metadata, o.created_at
-       FROM orders o
-       WHERE ${conditions.join(' AND ')}
-       ORDER BY ${orderClause}
-       LIMIT $${paramIndex}`,
-      params
-    );
+      subqueries.push(`
+        SELECT o.id, 'order'::text as source_type, o.order_number as display_number,
+               o.status::text as raw_status, o.total_amount, o.tip_amount,
+               o.customer_email, NULL::varchar as customer_name,
+               o.payment_method::text as payment_method, o.stripe_charge_id, o.stripe_payment_intent_id,
+               c.name as catalog_name, NULL::varchar as event_name, NULL::varchar as event_id, NULL::varchar as tier_name,
+               NULL::integer as daily_number, o.device_id,
+               o.metadata, o.created_at,
+               (SELECT COUNT(*)::int FROM order_items oi WHERE oi.order_id = o.id) as item_count
+        FROM orders o
+        LEFT JOIN catalogs c ON o.catalog_id = c.id
+        WHERE ${conds.join(' AND ')}
+      `);
+    }
 
-    const hasMore = orderRows.length > requestedLimit;
-    const orders = orderRows.slice(0, requestedLimit);
+    // --- Preorders subquery ---
+    if (includePreorders && statusFilter !== 'failed') {
+      const conds: string[] = ['p.organization_id = $1'];
+      if (statusFilter === 'succeeded') conds.push("p.status = 'picked_up'");
+      else if (statusFilter === 'refunded') conds.push("p.status = 'cancelled' AND p.payment_type = 'pay_now'");
+      else if (statusFilter === 'pending') conds.push("p.status IN ('pending', 'preparing', 'ready')");
+      else if (statusFilter === 'cancelled') conds.push("p.status = 'cancelled'");
+      if (catalogIdFilter) conds.push(`p.catalog_id = ${addParam(catalogIdFilter)}`);
+      if (customerEmailFilter) conds.push(`LOWER(p.customer_email) LIKE ${addParam(`%${customerEmailFilter}%`)}`);
+      if (dateFrom) conds.push(`p.created_at >= to_timestamp(${addParam(dateFrom)})`);
+      if (dateTo) conds.push(`p.created_at <= to_timestamp(${addParam(dateTo)})`);
+      if (amountMin !== null) conds.push(`p.total_amount >= ${addParam(amountMin)}`);
+      if (amountMax !== null) conds.push(`p.total_amount <= ${addParam(amountMax)}`);
+      if (cursorTsParam) conds.push(`(p.created_at, p.id) < (${cursorTsParam}, ${cursorIdParam})`);
 
-    // Batch-fetch Stripe charge details for orders that have stripe_charge_id
-    const chargeIds = orders
-      .map(o => o.stripe_charge_id)
-      .filter((id): id is string => id !== null);
+      subqueries.push(`
+        SELECT p.id, 'preorder'::text as source_type, p.order_number as display_number,
+               p.status::text as raw_status, p.total_amount, p.tip_amount,
+               p.customer_email, p.customer_name,
+               p.payment_type::text as payment_method, p.stripe_charge_id, p.stripe_payment_intent_id,
+               c.name as catalog_name, NULL::varchar as event_name, NULL::varchar as event_id, NULL::varchar as tier_name,
+               p.daily_number, NULL::varchar as device_id,
+               NULL::jsonb as metadata, p.created_at,
+               (SELECT COUNT(*)::int FROM preorder_items pi WHERE pi.preorder_id = p.id) as item_count
+        FROM preorders p
+        LEFT JOIN catalogs c ON p.catalog_id = c.id
+        WHERE ${conds.join(' AND ')}
+      `);
+    }
+
+    // --- Tickets subquery ---
+    if (includeTickets && statusFilter !== 'pending' && statusFilter !== 'cancelled' && statusFilter !== 'failed') {
+      const conds: string[] = ['t.organization_id = $1'];
+      if (statusFilter === 'succeeded') conds.push("t.status IN ('valid', 'used')");
+      else if (statusFilter === 'refunded') conds.push("t.status = 'refunded'");
+      else conds.push("t.status IN ('valid', 'used', 'refunded')");
+
+      if (customerEmailFilter) conds.push(`LOWER(t.customer_email) LIKE ${addParam(`%${customerEmailFilter}%`)}`);
+      if (dateFrom) conds.push(`t.purchased_at >= to_timestamp(${addParam(dateFrom)})`);
+      if (dateTo) conds.push(`t.purchased_at <= to_timestamp(${addParam(dateTo)})`);
+      if (amountMin !== null) conds.push(`t.amount_paid >= ${addParam(amountMin)}`);
+      if (amountMax !== null) conds.push(`t.amount_paid <= ${addParam(amountMax)}`);
+      if (cursorTsParam) conds.push(`(t.purchased_at, t.id) < (${cursorTsParam}, ${cursorIdParam})`);
+
+      subqueries.push(`
+        SELECT t.id, 'ticket'::text as source_type, t.qr_code as display_number,
+               t.status::text as raw_status, t.amount_paid as total_amount, 0::decimal(10,2) as tip_amount,
+               t.customer_email, t.customer_name,
+               'online'::text as payment_method, t.stripe_charge_id, t.stripe_payment_intent_id,
+               NULL::varchar as catalog_name, e.name as event_name, e.id::varchar as event_id, tt.name as tier_name,
+               NULL::integer as daily_number, NULL::varchar as device_id,
+               NULL::jsonb as metadata, t.purchased_at as created_at,
+               1::int as item_count
+        FROM tickets t
+        JOIN events e ON t.event_id = e.id
+        JOIN ticket_tiers tt ON t.ticket_tier_id = tt.id
+        WHERE ${conds.join(' AND ')}
+      `);
+    }
+
+    // If no subqueries match the filters, return empty result
+    if (subqueries.length === 0) {
+      return c.json({ data: [], hasMore: false, total: 0 } as any);
+    }
+
+    const unionQuery = subqueries.join('\nUNION ALL\n');
+
+    // Build ORDER BY clause
+    let orderByClause = 'created_at DESC';
+    if (sortBy === 'amount') {
+      orderByClause = sortOrder === 'asc' ? 'total_amount ASC' : 'total_amount DESC';
+    } else if (sortBy === 'email') {
+      orderByClause = sortOrder === 'asc' ? 'customer_email ASC NULLS LAST' : 'customer_email DESC NULLS LAST';
+    } else if (sortOrder === 'asc') {
+      orderByClause = 'created_at ASC';
+    }
+
+    // Run count + data queries in parallel
+    const countParams = [...params];
+    const dataParams = [...params];
+    const limitParamIdx = dataParams.length + 1;
+    const offsetParamIdx = dataParams.length + 2;
+    dataParams.push(requestedLimit, requestedOffset);
+
+    const [countResult, unifiedRows] = await Promise.all([
+      query<{ total: string }>(
+        `SELECT COUNT(*) as total FROM (${unionQuery}) as combined`,
+        countParams
+      ),
+      query<{
+        id: string;
+        source_type: string;
+        display_number: string;
+        raw_status: string;
+        total_amount: string;
+        tip_amount: string;
+        customer_email: string | null;
+        customer_name: string | null;
+        payment_method: string | null;
+        stripe_charge_id: string | null;
+        stripe_payment_intent_id: string | null;
+        catalog_name: string | null;
+        event_name: string | null;
+        event_id: string | null;
+        tier_name: string | null;
+        daily_number: number | null;
+        device_id: string | null;
+        metadata: any;
+        created_at: Date;
+        item_count: number;
+      }>(
+        `SELECT * FROM (${unionQuery}) as combined ORDER BY ${orderByClause} LIMIT $${limitParamIdx} OFFSET $${offsetParamIdx}`,
+        dataParams
+      ),
+    ]);
+
+    const total = parseInt(countResult[0]?.total || '0');
+    const hasMore = requestedOffset + unifiedRows.length < total;
+    const orders = unifiedRows;
+
+    // Batch-fetch Stripe charge details for rows that have stripe_charge_id
+    const chargeIds = [...new Set(
+      orders.map(o => o.stripe_charge_id).filter((id): id is string => id !== null)
+    )];
 
     const chargeMap = new Map<string, Stripe.Charge>();
-    // Also map order ID → charge for orders where charge comes from order_payments
+    // Also map order ID → charge for POS orders where charge comes from order_payments
     const orderChargeMap = new Map<string, Stripe.Charge>();
 
-    logger.info('[FEES DEBUG] Order summary', {
-      totalOrders: orders.length,
-      ordersWithChargeId: chargeIds.length,
-      orderBreakdown: orders.map(o => ({
-        id: o.id,
-        paymentMethod: o.payment_method,
-        stripeChargeId: o.stripe_charge_id,
-        stripePaymentIntentId: o.stripe_payment_intent_id,
-        totalAmount: o.total_amount,
-      })),
-    });
-
-    if (chargeIds.length > 0) {
+    if (chargeIds.length > 0 && connectedAccount) {
       try {
         const chargePromises = chargeIds.map(id =>
           stripeService.retrieveConnectedAccountCharge(
             connectedAccount.stripe_account_id,
             id
           ).catch(err => {
-            logger.warn('[FEES DEBUG] Failed to fetch Stripe charge', { chargeId: id, error: err.message });
+            logger.warn('Failed to fetch Stripe charge', { chargeId: id, error: err.message });
             return null;
           })
         );
         const charges = await Promise.all(chargePromises);
         charges.forEach((charge) => {
-          if (charge) {
-            chargeMap.set(charge.id, charge);
-            logger.info('[FEES DEBUG] Charge fetched from order.stripe_charge_id', {
-              chargeId: charge.id,
-              amount: charge.amount,
-              applicationFeeAmount: (charge as any).application_fee_amount,
-              metadata: charge.metadata,
-              paymentMethodType: charge.payment_method_details?.type,
-            });
-          }
+          if (charge) chargeMap.set(charge.id, charge);
         });
       } catch (err) {
-        logger.warn('[FEES DEBUG] Failed to batch-fetch Stripe charges', { error: err });
+        logger.warn('Failed to batch-fetch Stripe charges', { error: err });
       }
     }
 
-    // For split/card orders without stripe_charge_id on the order, look up from order_payments
-    const ordersNeedingPaymentLookup = orders.filter(
-      o => !o.stripe_charge_id && (o.payment_method === 'split' || o.payment_method === 'card')
-    );
-    logger.info('[FEES DEBUG] Orders needing order_payments lookup', {
-      count: ordersNeedingPaymentLookup.length,
-      orderIds: ordersNeedingPaymentLookup.map(o => o.id),
-    });
+    // For POS order rows without stripe_charge_id (split/card), look up from order_payments
+    if (connectedAccount) {
+      const ordersNeedingPaymentLookup = orders.filter(
+        o => o.source_type === 'order' && !o.stripe_charge_id && (o.payment_method === 'split' || o.payment_method === 'card')
+      );
 
-    if (ordersNeedingPaymentLookup.length > 0) {
-      try {
-        const orderIds = ordersNeedingPaymentLookup.map(o => o.id);
-        const paymentRows = await query<{
-          order_id: string;
-          stripe_payment_intent_id: string;
-        }>(
-          `SELECT order_id, stripe_payment_intent_id FROM order_payments
-           WHERE order_id = ANY($1) AND stripe_payment_intent_id IS NOT NULL
-           AND payment_method IN ('card', 'tap_to_pay')`,
-          [orderIds]
-        );
+      if (ordersNeedingPaymentLookup.length > 0) {
+        try {
+          const orderIds = ordersNeedingPaymentLookup.map(o => o.id);
+          const paymentRows = await query<{
+            order_id: string;
+            stripe_payment_intent_id: string;
+          }>(
+            `SELECT order_id, stripe_payment_intent_id FROM order_payments
+             WHERE order_id = ANY($1) AND stripe_payment_intent_id IS NOT NULL
+             AND payment_method IN ('card', 'tap_to_pay')`,
+            [orderIds]
+          );
 
-        logger.info('[FEES DEBUG] order_payments rows found', {
-          count: paymentRows.length,
-          rows: paymentRows,
-        });
-
-        // Get unique payment intent IDs and fetch charges from them
-        const piPromises = paymentRows.map(async (row) => {
-          try {
-            const pi = await stripe.paymentIntents.retrieve(
-              row.stripe_payment_intent_id,
-              { stripeAccount: connectedAccount.stripe_account_id }
-            );
-            logger.info('[FEES DEBUG] PaymentIntent retrieved from order_payment', {
-              orderId: row.order_id,
-              piId: pi.id,
-              piStatus: pi.status,
-              latestCharge: pi.latest_charge,
-              metadata: pi.metadata,
-            });
-            if (pi.latest_charge) {
-              const chargeId = typeof pi.latest_charge === 'string' ? pi.latest_charge : pi.latest_charge.id;
-              const charge = await stripeService.retrieveConnectedAccountCharge(
-                connectedAccount.stripe_account_id,
-                chargeId
+          const piPromises = paymentRows.map(async (row) => {
+            try {
+              const pi = await stripe.paymentIntents.retrieve(
+                row.stripe_payment_intent_id,
+                { stripeAccount: connectedAccount!.stripe_account_id }
               );
-              if (charge) {
-                orderChargeMap.set(row.order_id, charge);
-                logger.info('[FEES DEBUG] Charge fetched from order_payment PI', {
-                  orderId: row.order_id,
-                  chargeId: charge.id,
-                  chargeAmount: charge.amount,
-                  applicationFeeAmount: (charge as any).application_fee_amount,
-                  metadata: charge.metadata,
-                  paymentMethodType: charge.payment_method_details?.type,
-                });
+              if (pi.latest_charge) {
+                const chargeId = typeof pi.latest_charge === 'string' ? pi.latest_charge : pi.latest_charge.id;
+                const charge = await stripeService.retrieveConnectedAccountCharge(
+                  connectedAccount!.stripe_account_id,
+                  chargeId
+                );
+                if (charge) orderChargeMap.set(row.order_id, charge);
               }
-            } else {
-              logger.warn('[FEES DEBUG] PaymentIntent has no latest_charge', {
-                orderId: row.order_id,
-                piId: pi.id,
-                piStatus: pi.status,
-              });
+            } catch (err: any) {
+              logger.warn('Failed to fetch charge from order_payment', { orderId: row.order_id, error: err.message });
             }
-          } catch (err: any) {
-            logger.warn('[FEES DEBUG] Failed to fetch charge from order_payment', { orderId: row.order_id, piId: row.stripe_payment_intent_id, error: err.message });
-          }
-        });
-        await Promise.all(piPromises);
-      } catch (err) {
-        logger.warn('[FEES DEBUG] Failed to lookup order_payments charges', { error: err });
+          });
+          await Promise.all(piPromises);
+        } catch (err) {
+          logger.warn('Failed to lookup order_payments charges', { error: err });
+        }
       }
     }
 
-    logger.info('[FEES DEBUG] Charge maps populated', {
-      chargeMapSize: chargeMap.size,
-      orderChargeMapSize: orderChargeMap.size,
-      chargeMapKeys: [...chargeMap.keys()],
-      orderChargeMapKeys: [...orderChargeMap.keys()],
-    });
-
-    // Format response: merge DB order data with Stripe charge details
+    // Format response: merge DB data with Stripe charge details
     const formattedTransactions = orders.map((order) => {
       const charge = order.stripe_charge_id
         ? chargeMap.get(order.stripe_charge_id) || null
-        : orderChargeMap.get(order.id) || null;
+        : (order.source_type === 'order' ? orderChargeMap.get(order.id) || null : null);
       const totalAmount = Math.round(parseFloat(order.total_amount) * 100);
 
-      // Determine status
+      // Determine status based on source type
       let status: 'succeeded' | 'pending' | 'failed' | 'refunded' | 'partially_refunded' = 'succeeded';
-      if (order.status === 'refunded') {
-        status = 'refunded';
-      } else if (charge) {
-        if (charge.refunded) {
-          status = 'refunded';
-        } else if (charge.amount_refunded > 0) {
-          status = 'partially_refunded';
+      if (order.source_type === 'order') {
+        if (order.raw_status === 'failed') status = 'failed';
+        else if (order.raw_status === 'refunded') status = 'refunded';
+        else status = 'succeeded';
+        if (charge) {
+          if (charge.refunded) status = 'refunded';
+          else if (charge.amount_refunded > 0) status = 'partially_refunded';
         }
+      } else if (order.source_type === 'preorder') {
+        if (order.raw_status === 'picked_up') status = 'succeeded';
+        else if (order.raw_status === 'cancelled') status = 'refunded';
+        else status = 'pending';
+      } else {
+        // ticket
+        if (order.raw_status === 'refunded') status = 'refunded';
+        else status = 'succeeded';
       }
 
-      // Payment method: from Stripe charge or from order payment_method
+      // Payment method: from Stripe charge or from DB payment_method
       let paymentMethod: { type: string; brand: string | null; last4: string | null } | null = null;
       if (charge?.payment_method_details) {
         const pm = charge.payment_method_details;
@@ -1434,7 +1484,6 @@ app.openapi(listTransactionsRoute, async (c) => {
           paymentMethod = { type: pm.type, brand: null, last4: null };
         }
       } else if (order.payment_method) {
-        // No Stripe charge — use order payment method (cash, split, etc.)
         paymentMethod = { type: order.payment_method, brand: null, last4: null };
       }
 
@@ -1449,35 +1498,11 @@ app.openapi(listTransactionsRoute, async (c) => {
         const stripeFeeFixed = isCardPresent ? 15 : 30;
         const stripeFee = Math.round(charge.amount * stripeFeePercent) + stripeFeeFixed;
         const processingFee = stripeFee + platformFee;
-
-        logger.info('[FEES DEBUG] Fee calculation for order', {
-          orderId: order.id,
-          chargeId: charge.id,
-          chargeAmount: charge.amount,
-          applicationFeeAmount: appFeeAmount,
-          metadataPlatformFeeCents: charge.metadata?.platform_fee_cents,
-          resolvedPlatformFee: platformFee,
-          isCardPresent,
-          stripeFeePercent,
-          stripeFeeFixed,
-          stripeFee,
-          totalProcessingFee: processingFee,
-          amountRefunded: charge.amount_refunded,
-          netAmount: charge.amount - processingFee - charge.amount_refunded,
-        });
-
         fees = {
           processingFee,
           netAmount: charge.amount - processingFee - charge.amount_refunded,
         };
       } else {
-        logger.info('[FEES DEBUG] No charge found for order — fees set to 0', {
-          orderId: order.id,
-          paymentMethod: order.payment_method,
-          stripeChargeId: order.stripe_charge_id,
-          inOrderChargeMap: orderChargeMap.has(order.id),
-        });
-        // Cash/split: no processing fees
         fees = { processingFee: 0, netAmount: totalAmount };
       }
 
@@ -1489,25 +1514,34 @@ app.openapi(listTransactionsRoute, async (c) => {
         status,
         description: charge?.description || null,
         customerEmail: order.customer_email || charge?.billing_details?.email || charge?.receipt_email || null,
-        customerName: charge?.billing_details?.name || null,
+        customerName: order.customer_name || charge?.billing_details?.name || null,
         paymentMethod,
         receiptUrl: charge?.receipt_url || null,
         created: Math.floor(new Date(order.created_at).getTime() / 1000),
-        metadata: charge?.metadata || (typeof order.metadata === 'object' ? order.metadata : undefined),
+        metadata: charge?.metadata || (order.metadata && typeof order.metadata === 'object' ? order.metadata : undefined),
         fees,
+        sourceType: order.source_type as 'order' | 'preorder' | 'ticket',
+        catalogName: order.catalog_name || null,
+        eventName: order.event_name || null,
+        eventId: order.event_id || null,
+        tierName: order.tier_name || null,
+        dailyNumber: order.daily_number || null,
+        itemCount: order.item_count || 0,
       };
     });
 
-    logger.info('Retrieved transactions (DB-first)', {
+    logger.info('Retrieved unified transactions', {
       organizationId: payload.organizationId,
+      source,
       count: formattedTransactions.length,
+      total,
       hasMore,
-      filters: { catalogIdFilter, deviceIdFilter, customerEmailFilter },
     });
 
     return c.json({
       data: formattedTransactions,
       hasMore,
+      total,
     });
   } catch (error) {
     logger.error('Error listing transactions', { error });
@@ -1639,7 +1673,204 @@ app.openapi(getTransactionRoute, async (c) => {
     );
 
     if (orderRows.length === 0) {
-      return c.json({ error: 'Transaction not found' }, 404);
+      // Not in orders table — check preorders
+      const preorderRows = await query<{
+        id: string;
+        order_number: string;
+        daily_number: number;
+        status: string;
+        payment_type: string;
+        subtotal: string;
+        tax_amount: string;
+        tip_amount: string;
+        total_amount: string;
+        stripe_charge_id: string | null;
+        stripe_payment_intent_id: string | null;
+        customer_name: string;
+        customer_email: string;
+        customer_phone: string | null;
+        catalog_id: string;
+        created_at: Date;
+        updated_at: Date;
+        picked_up_at: Date | null;
+        order_notes: string | null;
+      }>(
+        'SELECT id, order_number, daily_number, status, payment_type, subtotal, tax_amount, tip_amount, total_amount, stripe_charge_id, stripe_payment_intent_id, customer_name, customer_email, customer_phone, catalog_id, created_at, updated_at, picked_up_at, order_notes FROM preorders WHERE id = $1 AND organization_id = $2',
+        [transactionId, payload.organizationId]
+      );
+
+      if (preorderRows.length === 0) {
+        // Also check tickets
+        const ticketRows = await query<{
+          id: string;
+          status: string;
+          amount_paid: string;
+          customer_name: string;
+          customer_email: string;
+          stripe_charge_id: string | null;
+          purchased_at: Date;
+          event_name: string;
+          event_id: string;
+          tier_name: string;
+        }>(
+          `SELECT t.id, t.status, t.amount_paid, t.customer_name, t.customer_email, t.stripe_charge_id, t.purchased_at,
+                  e.name as event_name, e.id as event_id, tt.name as tier_name
+           FROM tickets t
+           JOIN events e ON t.event_id = e.id
+           JOIN ticket_tiers tt ON t.ticket_tier_id = tt.id
+           WHERE t.id = $1 AND t.organization_id = $2`,
+          [transactionId, payload.organizationId]
+        );
+
+        if (ticketRows.length === 0) {
+          return c.json({ error: 'Transaction not found' }, 404);
+        }
+
+        // Format ticket as transaction detail
+        const ticket = ticketRows[0];
+        const ticketAmount = Math.round(parseFloat(ticket.amount_paid) * 100);
+        let ticketStatus: string = 'succeeded';
+        if (ticket.status === 'refunded') ticketStatus = 'refunded';
+
+        let ticketCharge: Stripe.Charge | null = null;
+        if (ticket.stripe_charge_id) {
+          try {
+            ticketCharge = await stripeService.retrieveConnectedAccountCharge(
+              connectedAccount.stripe_account_id,
+              ticket.stripe_charge_id
+            );
+          } catch (err: any) {
+            logger.warn('Failed to fetch Stripe charge for ticket', { error: err.message });
+          }
+        }
+
+        const ticketRefunds = ticketCharge
+          ? (ticketCharge.refunds?.data || []).map((r) => ({
+              id: r.id, amount: r.amount, status: r.status || 'unknown', reason: r.reason, created: r.created,
+            }))
+          : [];
+
+        return c.json({
+          id: ticket.id,
+          amount: ticketAmount,
+          amountRefunded: ticketCharge?.amount_refunded || 0,
+          currency: ticketCharge?.currency || 'usd',
+          status: ticketStatus,
+          description: `${ticket.event_name} — ${ticket.tier_name}`,
+          customerEmail: ticket.customer_email || null,
+          customerName: ticket.customer_name || null,
+          billingAddress: null,
+          paymentMethod: ticketCharge?.payment_method_details?.card
+            ? { type: 'card', brand: ticketCharge.payment_method_details.card.brand, last4: ticketCharge.payment_method_details.card.last4 }
+            : { type: 'online', brand: null, last4: null },
+          receiptUrl: ticketCharge?.receipt_url || null,
+          created: Math.floor(new Date(ticket.purchased_at).getTime() / 1000),
+          metadata: {},
+          refunds: ticketRefunds,
+          fees: { processingFee: 0, netAmount: ticketAmount },
+          sourceType: 'ticket',
+          eventId: ticket.event_id,
+        });
+      }
+
+      // Format preorder as transaction detail
+      const preorder = preorderRows[0];
+      const preorderTotal = Math.round(parseFloat(preorder.total_amount) * 100);
+      const preorderTip = Math.round(parseFloat(preorder.tip_amount || '0') * 100);
+      const preorderTax = Math.round(parseFloat(preorder.tax_amount || '0') * 100);
+
+      let preorderStatus: string = 'succeeded';
+      if (preorder.status === 'picked_up') preorderStatus = 'succeeded';
+      else if (preorder.status === 'cancelled') preorderStatus = 'refunded';
+      else preorderStatus = 'pending';
+
+      // Fetch Stripe charge if available
+      let preorderCharge: Stripe.Charge | null = null;
+      if (preorder.stripe_charge_id) {
+        try {
+          preorderCharge = await stripeService.retrieveConnectedAccountCharge(
+            connectedAccount.stripe_account_id,
+            preorder.stripe_charge_id
+          );
+        } catch (err: any) {
+          logger.warn('Failed to fetch Stripe charge for preorder', { error: err.message });
+        }
+      }
+
+      const preorderRefunds = preorderCharge
+        ? (preorderCharge.refunds?.data || []).map((r) => ({
+            id: r.id, amount: r.amount, status: r.status || 'unknown', reason: r.reason, created: r.created,
+          }))
+        : [];
+
+      if (preorderCharge) {
+        if (preorderCharge.refunded) preorderStatus = 'refunded';
+        else if (preorderCharge.amount_refunded > 0) preorderStatus = 'partially_refunded';
+      }
+
+      // Fetch preorder items
+      const preorderItemRows = await query<{
+        id: string;
+        product_id: string | null;
+        name: string;
+        quantity: number;
+        unit_price: string;
+      }>(
+        'SELECT id, product_id, name, quantity, unit_price FROM preorder_items WHERE preorder_id = $1',
+        [preorder.id]
+      );
+
+      const preorderItems = preorderItemRows.map((item) => ({
+        id: item.id,
+        productId: item.product_id,
+        name: item.name,
+        quantity: item.quantity,
+        unitPrice: Math.round(parseFloat(item.unit_price) * 100),
+      }));
+
+      // Catalog name
+      const catalogRows = await query<{ name: string }>(
+        'SELECT name FROM catalogs WHERE id = $1',
+        [preorder.catalog_id]
+      );
+
+      let preorderFees = { processingFee: 0, netAmount: preorderTotal };
+      if (preorderCharge) {
+        const platformFee = (preorderCharge as any).application_fee_amount ||
+          (preorderCharge.metadata?.platform_fee_cents ? parseInt(preorderCharge.metadata.platform_fee_cents) : 0);
+        const stripeFeePercent = 0.029;
+        const stripeFeeFixed = 30;
+        const stripeFee = Math.round(preorderCharge.amount * stripeFeePercent) + stripeFeeFixed;
+        const processingFee = stripeFee + platformFee;
+        preorderFees = { processingFee, netAmount: preorderCharge.amount - processingFee - preorderCharge.amount_refunded };
+      }
+
+      return c.json({
+        id: preorder.id,
+        amount: preorderTotal,
+        amountRefunded: preorderCharge?.amount_refunded || 0,
+        currency: preorderCharge?.currency || 'usd',
+        status: preorderStatus,
+        description: `Preorder #${preorder.order_number}${preorder.daily_number ? ` (#${preorder.daily_number})` : ''}`,
+        customerEmail: preorder.customer_email || null,
+        customerName: preorder.customer_name || null,
+        billingAddress: null,
+        paymentMethod: preorderCharge?.payment_method_details?.card
+          ? { type: 'card', brand: preorderCharge.payment_method_details.card.brand, last4: preorderCharge.payment_method_details.card.last4 }
+          : { type: preorder.payment_type === 'pay_now' ? 'online' : 'pay_at_pickup', brand: null, last4: null },
+        receiptUrl: preorderCharge?.receipt_url || null,
+        created: Math.floor(new Date(preorder.created_at).getTime() / 1000),
+        metadata: {},
+        refunds: preorderRefunds,
+        fees: preorderFees,
+        orderItems: preorderItems,
+        isQuickCharge: false,
+        tipAmount: preorderTip,
+        taxAmount: preorderTax,
+        sourceType: 'preorder',
+        catalogName: catalogRows.length > 0 ? catalogRows[0].name : null,
+        dailyNumber: preorder.daily_number || null,
+      });
     }
 
     const order = orderRows[0];
@@ -1692,7 +1923,9 @@ app.openapi(getTransactionRoute, async (c) => {
 
     // Determine status
     let status: string = 'succeeded';
-    if (order.status === 'refunded') {
+    if (order.status === 'failed') {
+      status = 'failed';
+    } else if (order.status === 'refunded') {
       status = 'refunded';
     } else if (charge) {
       if (charge.refunded) {
@@ -1849,6 +2082,7 @@ app.openapi(getTransactionRoute, async (c) => {
       cashTendered,
       cashChange,
       orderPayments,
+      sourceType: 'order',
     });
   } catch (error: any) {
     logger.error('Error getting transaction', { error, transactionId });
@@ -1943,8 +2177,261 @@ app.openapi(refundTransactionRoute, async (c) => {
       [transactionId, payload.organizationId]
     );
 
+    // If not found in orders, check preorders
     if (orderLookup.length === 0) {
-      return c.json({ error: 'Transaction not found' }, 404);
+      const preorderLookup = await query<{
+        id: string; order_number: string; daily_number: number | null; stripe_charge_id: string | null;
+        payment_type: string; total_amount: string; status: string;
+        customer_name: string; customer_email: string; catalog_id: string;
+      }>(
+        'SELECT id, order_number, daily_number, stripe_charge_id, payment_type, total_amount, status, customer_name, customer_email, catalog_id FROM preorders WHERE id = $1 AND organization_id = $2',
+        [transactionId, payload.organizationId]
+      );
+
+      if (preorderLookup.length === 0) {
+        // If not found in preorders, check tickets
+        const ticketLookup = await query<{
+          id: string; event_id: string; ticket_tier_id: string;
+          stripe_charge_id: string | null; amount_paid: string;
+          status: string; customer_email: string; customer_name: string;
+          tier_name: string; event_name: string; starts_at: string; timezone: string;
+        }>(
+          `SELECT t.id, t.event_id, t.ticket_tier_id, t.stripe_charge_id,
+                  t.amount_paid, t.status, t.customer_email, t.customer_name,
+                  tt.name as tier_name, e.name as event_name, e.starts_at, e.timezone
+           FROM tickets t
+           JOIN ticket_tiers tt ON t.ticket_tier_id = tt.id
+           JOIN events e ON t.event_id = e.id
+           WHERE t.id = $1 AND t.organization_id = $2`,
+          [transactionId, payload.organizationId]
+        );
+
+        if (ticketLookup.length === 0) {
+          return c.json({ error: 'Transaction not found' }, 404);
+        }
+
+        const ticket = ticketLookup[0];
+
+        if (ticket.status === 'refunded') {
+          return c.json({ error: 'Ticket has already been refunded' }, 400);
+        }
+
+        if (ticket.status === 'cancelled') {
+          return c.json({ error: 'Cannot refund a cancelled ticket' }, 400);
+        }
+
+        const amountPaid = parseFloat(ticket.amount_paid);
+        const refundAmountDollars = body.amount ? body.amount / 100 : amountPaid;
+
+        if (refundAmountDollars > amountPaid) {
+          return c.json({ error: `Refund amount cannot exceed amount paid ($${amountPaid.toFixed(2)})` }, 400);
+        }
+
+        // Stripe refund if charge exists
+        let stripeRefundId: string | null = null;
+        let refundAmountCents = Math.round(refundAmountDollars * 100);
+
+        if (ticket.stripe_charge_id) {
+          const refund = await stripeService.createConnectedAccountRefund(
+            connectedAccount.stripe_account_id,
+            {
+              charge: ticket.stripe_charge_id,
+              amount: body.amount || undefined,
+              reason: body.reason,
+              metadata: {
+                organization_id: payload.organizationId,
+                user_id: payload.userId,
+                initiated_by: 'dashboard',
+                ticket_id: ticket.id,
+                event_id: ticket.event_id,
+              },
+            }
+          );
+          stripeRefundId = refund.id;
+          refundAmountCents = refund.amount;
+        }
+
+        // Update ticket status
+        const isFullRefund = refundAmountDollars >= amountPaid;
+        if (isFullRefund) {
+          await query(
+            `UPDATE tickets SET status = 'refunded' WHERE id = $1`,
+            [ticket.id]
+          );
+        }
+
+        // Update customer total_spent
+        await query(
+          `UPDATE customers
+           SET total_spent = GREATEST(0, total_spent - $1), updated_at = NOW()
+           WHERE organization_id = $2 AND email = $3`,
+          [refundAmountDollars, payload.organizationId, ticket.customer_email.toLowerCase()]
+        );
+
+        // Emit socket event
+        socketService.emitToOrganization(payload.organizationId, SocketEvents.TICKET_REFUNDED, {
+          eventId: ticket.event_id,
+          ticketId: ticket.id,
+          refundAmount: refundAmountCents / 100,
+          isFullRefund,
+          timestamp: new Date().toISOString(),
+        });
+
+        // Queue refund notification email
+        const eventDate = new Date(ticket.starts_at);
+        const eventTimezone = ticket.timezone || 'America/New_York';
+        await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
+          type: 'ticket_refund',
+          to: ticket.customer_email,
+          data: {
+            customerName: ticket.customer_name || ticket.customer_email,
+            eventName: ticket.event_name,
+            eventDate: eventDate.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', timeZone: eventTimezone }),
+            tierName: ticket.tier_name,
+            refundAmount: refundAmountDollars,
+            isFullRefund,
+            reason: body.reason,
+          },
+        });
+
+        logger.info('Created ticket refund via transactions endpoint', {
+          ticketId: ticket.id,
+          eventId: ticket.event_id,
+          refundAmount: refundAmountCents,
+          isFullRefund,
+          stripeRefundId,
+          organizationId: payload.organizationId,
+        });
+
+        return c.json({
+          id: stripeRefundId || `ticket_refund_${ticket.id}`,
+          amount: refundAmountCents,
+          status: 'succeeded',
+          reason: body.reason || null,
+          created: Math.floor(Date.now() / 1000),
+        });
+      }
+
+      const preorder = preorderLookup[0];
+
+      if (preorder.status === 'cancelled') {
+        return c.json({ error: 'Preorder is already cancelled/refunded' }, 400);
+      }
+
+      // Get catalog name for cancellation email
+      const cancelCatalogs = await query<{ name: string }>(
+        `SELECT name FROM catalogs WHERE id = $1`,
+        [preorder.catalog_id]
+      );
+
+      if (!preorder.stripe_charge_id) {
+        // Pay-at-pickup preorder with no charge — just mark cancelled
+        await query(
+          `UPDATE preorders SET status = 'cancelled', updated_at = NOW() WHERE id = $1`,
+          [preorder.id]
+        );
+
+        socketService.emitToOrganization(payload.organizationId, SocketEvents.PREORDER_CANCELLED, {
+          preorderId: preorder.id,
+          orderNumber: preorder.order_number,
+          timestamp: new Date().toISOString(),
+        });
+
+        socketService.emitToPreorder(preorder.id, SocketEvents.PREORDER_CANCELLED, {
+          preorderId: preorder.id,
+          status: 'cancelled',
+        });
+
+        // Queue cancellation email
+        await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
+          type: 'preorder_cancelled',
+          to: preorder.customer_email,
+          data: {
+            orderNumber: preorder.order_number,
+            dailyNumber: preorder.daily_number,
+            customerName: preorder.customer_name,
+            catalogName: cancelCatalogs[0]?.name || 'Your order',
+            cancellationReason: body.reason || 'Order cancelled by vendor',
+            paymentType: preorder.payment_type,
+            refundIssued: false,
+            totalAmount: parseFloat(preorder.total_amount),
+          },
+        });
+
+        const totalCents = Math.round(parseFloat(preorder.total_amount) * 100);
+        return c.json({
+          id: `preorder_refund_${preorder.id}`,
+          amount: totalCents,
+          status: 'succeeded',
+          reason: body.reason || null,
+          created: Math.floor(Date.now() / 1000),
+        });
+      }
+
+      // Stripe refund for pay_now preorder
+      const refund = await stripeService.createConnectedAccountRefund(
+        connectedAccount.stripe_account_id,
+        {
+          charge: preorder.stripe_charge_id,
+          amount: body.amount || undefined,
+          reason: body.reason,
+          metadata: {
+            organization_id: payload.organizationId,
+            user_id: payload.userId,
+            initiated_by: 'app',
+            preorder_id: preorder.id,
+          },
+        }
+      );
+
+      await query(
+        `UPDATE preorders SET status = 'cancelled', updated_at = NOW() WHERE id = $1`,
+        [preorder.id]
+      );
+
+      socketService.emitToOrganization(payload.organizationId, SocketEvents.PREORDER_CANCELLED, {
+        preorderId: preorder.id,
+        orderNumber: preorder.order_number,
+        refundAmount: refund.amount / 100,
+        timestamp: new Date().toISOString(),
+      });
+
+      socketService.emitToPreorder(preorder.id, SocketEvents.PREORDER_CANCELLED, {
+        preorderId: preorder.id,
+        status: 'cancelled',
+      });
+
+      // Queue cancellation email
+      await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
+        type: 'preorder_cancelled',
+        to: preorder.customer_email,
+        data: {
+          orderNumber: preorder.order_number,
+          dailyNumber: preorder.daily_number,
+          customerName: preorder.customer_name,
+          catalogName: cancelCatalogs[0]?.name || 'Your order',
+          cancellationReason: body.reason || 'Order cancelled by vendor',
+          paymentType: preorder.payment_type,
+          refundIssued: true,
+          totalAmount: parseFloat(preorder.total_amount),
+        },
+      });
+
+      logger.info('Created preorder refund', {
+        refundId: refund.id,
+        preorderId: preorder.id,
+        chargeId: preorder.stripe_charge_id,
+        amount: refund.amount,
+        organizationId: payload.organizationId,
+      });
+
+      return c.json({
+        id: refund.id,
+        amount: refund.amount,
+        status: refund.status || 'succeeded',
+        reason: refund.reason,
+        created: refund.created,
+      });
     }
 
     const order = orderLookup[0];
@@ -2134,12 +2621,6 @@ app.openapi(sendReceiptRoute, async (c) => {
       [transactionId, payload.organizationId]
     );
 
-    if (orderRows.length === 0) {
-      return c.json({ error: 'Transaction not found' }, 404);
-    }
-
-    const order = orderRows[0];
-
     // Get organization name for merchant name
     const orgRows = await query<{ name: string }>(
       'SELECT name FROM organizations WHERE id = $1',
@@ -2147,27 +2628,20 @@ app.openapi(sendReceiptRoute, async (c) => {
     );
     const merchantName = orgRows[0]?.name || undefined;
 
-    let receiptUrl: string | null = null;
-    let cardBrand: string | undefined;
-    let cardLast4: string | undefined;
-    let amount = Math.round(parseFloat(order.total_amount) * 100);
-    let amountRefunded = 0;
-
-    // If this order has a Stripe charge, get details from Stripe
-    if (order.stripe_charge_id) {
+    // Helper to get card details from a Stripe charge
+    const getChargeDetails = async (chargeId: string) => {
       const charge = await stripe.charges.retrieve(
-        order.stripe_charge_id,
+        chargeId,
         { expand: ['payment_intent'] },
         { stripeAccount: connectedAccount.stripe_account_id }
       );
 
       if (charge.status !== 'succeeded') {
-        return c.json({ error: 'Transaction must be completed before sending receipt' }, 400);
+        return null;
       }
 
-      receiptUrl = charge.receipt_url || null;
-      amountRefunded = charge.amount_refunded || 0;
-
+      let cardBrand: string | undefined;
+      let cardLast4: string | undefined;
       const paymentMethodDetails = charge.payment_method_details;
       if (paymentMethodDetails?.type === 'card_present' && paymentMethodDetails.card_present) {
         cardBrand = paymentMethodDetails.card_present.brand || undefined;
@@ -2176,39 +2650,173 @@ app.openapi(sendReceiptRoute, async (c) => {
         cardBrand = paymentMethodDetails.card.brand || undefined;
         cardLast4 = paymentMethodDetails.card.last4 || undefined;
       }
+
+      return {
+        receiptUrl: charge.receipt_url || null,
+        amountRefunded: charge.amount_refunded || 0,
+        cardBrand,
+        cardLast4,
+      };
+    };
+
+    if (orderRows.length > 0) {
+      const order = orderRows[0];
+
+      let receiptUrl: string | null = null;
+      let cardBrand: string | undefined;
+      let cardLast4: string | undefined;
+      let amount = Math.round(parseFloat(order.total_amount) * 100);
+      let amountRefunded = 0;
+
+      if (order.stripe_charge_id) {
+        const details = await getChargeDetails(order.stripe_charge_id);
+        if (!details) {
+          return c.json({ error: 'Transaction must be completed before sending receipt' }, 400);
+        }
+        receiptUrl = details.receiptUrl;
+        amountRefunded = details.amountRefunded;
+        cardBrand = details.cardBrand;
+        cardLast4 = details.cardLast4;
+      }
+
+      logger.info('Sending receipt email for order', {
+        transactionId, email, amount, orderNumber: order.order_number,
+        cardBrand, cardLast4, merchantName, paymentMethod: order.payment_method,
+      });
+
+      await emailService.sendReceipt(email, {
+        amount,
+        amountRefunded: amountRefunded || undefined,
+        orderNumber: order.order_number,
+        cardBrand,
+        cardLast4,
+        date: new Date(order.created_at),
+        receiptUrl: receiptUrl || undefined,
+        merchantName,
+      });
+
+      logger.info('Receipt email sent successfully', {
+        transactionId, email, organizationId: payload.organizationId,
+        amount, amountRefunded, paymentMethod: order.payment_method,
+      });
+
+      return c.json({
+        success: true,
+        message: `Receipt sent to ${email}`,
+      });
     }
 
-    // Send receipt via our email service
-    logger.info('Sending receipt email', {
-      transactionId,
-      email,
-      amount,
-      orderNumber: order.order_number,
-      cardBrand,
-      cardLast4,
-      merchantName,
-      paymentMethod: order.payment_method,
-      hasReceiptUrl: !!receiptUrl,
+    // Check preorders
+    const preorderRows = await query<{
+      id: string; order_number: string; status: string; payment_type: string;
+      total_amount: string; stripe_charge_id: string | null; created_at: Date;
+    }>(
+      'SELECT id, order_number, status, payment_type, total_amount, stripe_charge_id, created_at FROM preorders WHERE id = $1 AND organization_id = $2',
+      [transactionId, payload.organizationId]
+    );
+
+    if (preorderRows.length > 0) {
+      const preorder = preorderRows[0];
+
+      let receiptUrl: string | null = null;
+      let cardBrand: string | undefined;
+      let cardLast4: string | undefined;
+      let amount = Math.round(parseFloat(preorder.total_amount) * 100);
+      let amountRefunded = 0;
+
+      if (preorder.stripe_charge_id) {
+        const details = await getChargeDetails(preorder.stripe_charge_id);
+        if (!details) {
+          return c.json({ error: 'Transaction must be completed before sending receipt' }, 400);
+        }
+        receiptUrl = details.receiptUrl;
+        amountRefunded = details.amountRefunded;
+        cardBrand = details.cardBrand;
+        cardLast4 = details.cardLast4;
+      }
+
+      logger.info('Sending receipt email for preorder', {
+        transactionId, email, amount, orderNumber: preorder.order_number, merchantName,
+      });
+
+      await emailService.sendReceipt(email, {
+        amount,
+        amountRefunded: amountRefunded || undefined,
+        orderNumber: preorder.order_number,
+        cardBrand,
+        cardLast4,
+        date: new Date(preorder.created_at),
+        receiptUrl: receiptUrl || undefined,
+        merchantName,
+      });
+
+      logger.info('Preorder receipt email sent successfully', {
+        transactionId, email, organizationId: payload.organizationId, amount,
+      });
+
+      return c.json({
+        success: true,
+        message: `Receipt sent to ${email}`,
+      });
+    }
+
+    // Check tickets
+    const ticketRows = await query<{
+      id: string; event_id: string; stripe_charge_id: string | null;
+      amount_paid: string; status: string; customer_name: string;
+      purchased_at: Date; tier_name: string; event_name: string;
+    }>(
+      `SELECT t.id, t.event_id, t.stripe_charge_id, t.amount_paid, t.status,
+              t.customer_name, t.purchased_at, tt.name as tier_name, e.name as event_name
+       FROM tickets t
+       JOIN ticket_tiers tt ON t.ticket_tier_id = tt.id
+       JOIN events e ON t.event_id = e.id
+       WHERE t.id = $1 AND t.organization_id = $2`,
+      [transactionId, payload.organizationId]
+    );
+
+    if (ticketRows.length === 0) {
+      return c.json({ error: 'Transaction not found' }, 404);
+    }
+
+    const ticket = ticketRows[0];
+
+    let receiptUrl: string | null = null;
+    let cardBrand: string | undefined;
+    let cardLast4: string | undefined;
+    let amount = Math.round(parseFloat(ticket.amount_paid) * 100);
+    let amountRefunded = 0;
+
+    if (ticket.stripe_charge_id) {
+      const details = await getChargeDetails(ticket.stripe_charge_id);
+      if (!details) {
+        return c.json({ error: 'Transaction must be completed before sending receipt' }, 400);
+      }
+      receiptUrl = details.receiptUrl;
+      amountRefunded = details.amountRefunded;
+      cardBrand = details.cardBrand;
+      cardLast4 = details.cardLast4;
+    }
+
+    const ticketOrderNumber = `${ticket.event_name} - ${ticket.tier_name}`;
+
+    logger.info('Sending receipt email for ticket', {
+      transactionId, email, amount, ticketId: ticket.id, eventName: ticket.event_name, merchantName,
     });
 
     await emailService.sendReceipt(email, {
       amount,
       amountRefunded: amountRefunded || undefined,
-      orderNumber: order.order_number,
+      orderNumber: ticketOrderNumber,
       cardBrand,
       cardLast4,
-      date: new Date(order.created_at),
+      date: new Date(ticket.purchased_at),
       receiptUrl: receiptUrl || undefined,
       merchantName,
     });
 
-    logger.info('Receipt email sent successfully', {
-      transactionId,
-      email,
-      organizationId: payload.organizationId,
-      amount,
-      amountRefunded,
-      paymentMethod: order.payment_method,
+    logger.info('Ticket receipt email sent successfully', {
+      transactionId, email, organizationId: payload.organizationId, amount,
     });
 
     return c.json({
@@ -2272,6 +2880,7 @@ const dashboardRoute = createRoute({
               amount: z.number(),
               currency: z.string(),
               status: z.string(),
+              type: z.enum(['order', 'preorder', 'ticket']),
               customerName: z.string().nullable(),
               customerEmail: z.string().nullable(),
               created: z.number(),
@@ -2338,7 +2947,51 @@ app.openapi(dashboardRoute, async (c) => {
       [payload.organizationId, yesterdayStart.toISOString(), todayStart.toISOString()]
     );
 
-    // Query recent orders (last 5)
+    // Query today's preorders
+    const todayPreorderRows = await query<{
+      total_amount: string;
+      customer_email: string | null;
+    }>(
+      `SELECT total_amount, customer_email FROM preorders
+       WHERE organization_id = $1 AND status NOT IN ('cancelled', 'pending')
+       AND created_at >= $2`,
+      [payload.organizationId, todayStart.toISOString()]
+    );
+
+    // Query yesterday's preorders
+    const yesterdayPreorderRows = await query<{
+      total_amount: string;
+      customer_email: string | null;
+    }>(
+      `SELECT total_amount, customer_email FROM preorders
+       WHERE organization_id = $1 AND status NOT IN ('cancelled', 'pending')
+       AND created_at >= $2 AND created_at < $3`,
+      [payload.organizationId, yesterdayStart.toISOString(), todayStart.toISOString()]
+    );
+
+    // Query today's ticket sales
+    const todayTicketRows = await query<{
+      amount_paid: string;
+      customer_email: string | null;
+    }>(
+      `SELECT amount_paid, customer_email FROM tickets
+       WHERE organization_id = $1 AND status != 'refunded'
+       AND purchased_at >= $2`,
+      [payload.organizationId, todayStart.toISOString()]
+    );
+
+    // Query yesterday's ticket sales
+    const yesterdayTicketRows = await query<{
+      amount_paid: string;
+      customer_email: string | null;
+    }>(
+      `SELECT amount_paid, customer_email FROM tickets
+       WHERE organization_id = $1 AND status != 'refunded'
+       AND purchased_at >= $2 AND purchased_at < $3`,
+      [payload.organizationId, yesterdayStart.toISOString(), todayStart.toISOString()]
+    );
+
+    // Query recent orders (last 10 to merge with preorders/tickets, then take top 10)
     const recentRows = await query<{
       id: string;
       order_number: string | null;
@@ -2350,7 +3003,40 @@ app.openapi(dashboardRoute, async (c) => {
     }>(
       `SELECT id, order_number, total_amount, status, payment_method, customer_email, created_at FROM orders
        WHERE organization_id = $1 AND status IN ('completed', 'refunded')
-       ORDER BY created_at DESC LIMIT 5`,
+       ORDER BY created_at DESC LIMIT 10`,
+      [payload.organizationId]
+    );
+
+    // Query recent preorders
+    const recentPreorderRows = await query<{
+      id: string;
+      order_number: string | null;
+      total_amount: string;
+      status: string;
+      customer_name: string | null;
+      customer_email: string | null;
+      created_at: Date;
+    }>(
+      `SELECT id, order_number, total_amount, status, customer_name, customer_email, created_at FROM preorders
+       WHERE organization_id = $1 AND status NOT IN ('cancelled', 'pending')
+       ORDER BY created_at DESC LIMIT 10`,
+      [payload.organizationId]
+    );
+
+    // Query recent ticket sales
+    const recentTicketRows = await query<{
+      id: string;
+      amount_paid: string;
+      status: string;
+      customer_name: string | null;
+      customer_email: string | null;
+      event_id: string;
+      purchased_at: Date;
+    }>(
+      `SELECT t.id, t.amount_paid, t.status, t.customer_name, t.customer_email, t.event_id, t.purchased_at
+       FROM tickets t
+       WHERE t.organization_id = $1 AND t.status != 'refunded'
+       ORDER BY t.purchased_at DESC LIMIT 10`,
       [payload.organizationId]
     );
 
@@ -2359,23 +3045,31 @@ app.openapi(dashboardRoute, async (c) => {
       connectedAccount.stripe_account_id
     );
 
-    // Calculate today's metrics
-    const todaySalesCents = todayRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
-    const todaySales = todaySalesCents / 100;
-    const todayOrders = todayRows.length;
+    // Calculate today's metrics (orders + preorders + tickets)
+    const todayOrderSalesCents = todayRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
+    const todayPreorderSalesCents = todayPreorderRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
+    const todayTicketSalesCents = todayTicketRows.reduce((sum, o) => sum + Math.round(parseFloat(o.amount_paid) * 100), 0);
+    const todaySales = (todayOrderSalesCents + todayPreorderSalesCents + todayTicketSalesCents) / 100;
+    const todayOrders = todayRows.length + todayPreorderRows.length + todayTicketRows.length;
     const todayAvgOrder = todayOrders > 0 ? todaySales / todayOrders : 0;
-    const todayCustomerEmails = new Set(
-      todayRows.map(o => o.customer_email).filter((e): e is string => !!e)
-    );
+    const todayCustomerEmails = new Set([
+      ...todayRows.map(o => o.customer_email).filter((e): e is string => !!e),
+      ...todayPreorderRows.map(o => o.customer_email).filter((e): e is string => !!e),
+      ...todayTicketRows.map(o => o.customer_email).filter((e): e is string => !!e),
+    ]);
     const todayCustomers = todayCustomerEmails.size;
 
-    // Calculate yesterday's metrics
-    const yesterdaySalesCents = yesterdayRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
-    const yesterdaySales = yesterdaySalesCents / 100;
-    const yesterdayOrders = yesterdayRows.length;
-    const yesterdayCustomerEmails = new Set(
-      yesterdayRows.map(o => o.customer_email).filter((e): e is string => !!e)
-    );
+    // Calculate yesterday's metrics (orders + preorders + tickets)
+    const yesterdayOrderSalesCents = yesterdayRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
+    const yesterdayPreorderSalesCents = yesterdayPreorderRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
+    const yesterdayTicketSalesCents = yesterdayTicketRows.reduce((sum, o) => sum + Math.round(parseFloat(o.amount_paid) * 100), 0);
+    const yesterdaySales = (yesterdayOrderSalesCents + yesterdayPreorderSalesCents + yesterdayTicketSalesCents) / 100;
+    const yesterdayOrders = yesterdayRows.length + yesterdayPreorderRows.length + yesterdayTicketRows.length;
+    const yesterdayCustomerEmails = new Set([
+      ...yesterdayRows.map(o => o.customer_email).filter((e): e is string => !!e),
+      ...yesterdayPreorderRows.map(o => o.customer_email).filter((e): e is string => !!e),
+      ...yesterdayTicketRows.map(o => o.customer_email).filter((e): e is string => !!e),
+    ]);
     const yesterdayCustomers = yesterdayCustomerEmails.size;
 
     // Get balance amounts (default to USD)
@@ -2386,17 +3080,44 @@ app.openapi(dashboardRoute, async (c) => {
       ? (balance.pending.find(b => b.currency === 'usd') || balance.pending[0])
       : null;
 
-    // Format recent transactions
-    const recentTransactions = recentRows.map(order => ({
-      id: order.id,
-      orderNumber: order.order_number || null,
-      amount: Math.round(parseFloat(order.total_amount) * 100) / 100,
-      currency: 'usd',
-      status: order.status === 'completed' ? 'succeeded' : order.status,
-      customerName: null,
-      customerEmail: order.customer_email || null,
-      created: Math.floor(new Date(order.created_at).getTime() / 1000),
-    }));
+    // Format and merge recent transactions from all sources
+    const recentTransactions = [
+      ...recentRows.map(order => ({
+        id: order.id,
+        orderNumber: order.order_number || null,
+        amount: Math.round(parseFloat(order.total_amount) * 100) / 100,
+        currency: 'usd',
+        status: order.status === 'completed' ? 'succeeded' : order.status,
+        type: 'order' as const,
+        customerName: null as string | null,
+        customerEmail: order.customer_email || null,
+        created: Math.floor(new Date(order.created_at).getTime() / 1000),
+      })),
+      ...recentPreorderRows.map(preorder => ({
+        id: preorder.id,
+        orderNumber: preorder.order_number || null,
+        amount: Math.round(parseFloat(preorder.total_amount) * 100) / 100,
+        currency: 'usd',
+        status: preorder.status === 'picked_up' ? 'succeeded' : preorder.status,
+        type: 'preorder' as const,
+        customerName: preorder.customer_name || null,
+        customerEmail: preorder.customer_email || null,
+        created: Math.floor(new Date(preorder.created_at).getTime() / 1000),
+      })),
+      ...recentTicketRows.map(ticket => ({
+        id: ticket.id,
+        orderNumber: null as string | null,
+        amount: Math.round(parseFloat(ticket.amount_paid) * 100) / 100,
+        currency: 'usd',
+        status: 'succeeded' as string,
+        type: 'ticket' as const,
+        customerName: ticket.customer_name || null,
+        customerEmail: ticket.customer_email || null,
+        created: Math.floor(new Date(ticket.purchased_at).getTime() / 1000),
+      })),
+    ]
+      .sort((a, b) => b.created - a.created)
+      .slice(0, 10);
 
     return c.json({
       today: {
@@ -2601,7 +3322,7 @@ app.openapi(analyticsRoute, async (c) => {
         previousStart = new Date(currentStart.getTime() - 24 * 60 * 60 * 1000);
         previousEnd = new Date(currentStart.getTime() - 1);
         break;
-      case 'week':
+      case 'week': {
         // Start of current week (Monday)
         const dayOfWeek = now.getDay(); // 0=Sunday, 1=Monday, ..., 6=Saturday
         const daysFromMonday = dayOfWeek === 0 ? 6 : dayOfWeek - 1; // Convert to days since Monday
@@ -2612,6 +3333,7 @@ app.openapi(analyticsRoute, async (c) => {
         previousStart = new Date(currentStart.getTime() - 7 * 24 * 60 * 60 * 1000);
         previousEnd = new Date(currentStart.getTime() - 1);
         break;
+      }
       case 'month':
         // Single month with offset
         currentStart = new Date(now.getFullYear(), now.getMonth() + offset, 1);
@@ -2619,7 +3341,7 @@ app.openapi(analyticsRoute, async (c) => {
         previousStart = new Date(now.getFullYear(), now.getMonth() + offset - 1, 1);
         previousEnd = new Date(currentStart.getTime() - 1);
         break;
-      case 'custom':
+      case 'custom': {
         // Custom date range from query parameters
         if (!customStartDate || !customEndDate) {
           return c.json({ error: 'startDate and endDate required for custom range' }, 400);
@@ -2633,7 +3355,8 @@ app.openapi(analyticsRoute, async (c) => {
         previousEnd = new Date(currentStart.getTime() - 1);
         previousStart = new Date(currentStart.getTime() - customDuration - 1);
         break;
-      default:
+      }
+      default: {
         // Default to week
         const defaultDayOfWeek = now.getDay();
         const defaultDaysFromMonday = defaultDayOfWeek === 0 ? 6 : defaultDayOfWeek - 1;
@@ -2642,6 +3365,7 @@ app.openapi(analyticsRoute, async (c) => {
         previousStart = new Date(currentStart.getTime() - 7 * 24 * 60 * 60 * 1000);
         previousEnd = new Date(currentStart.getTime() - 1);
         break;
+      }
     }
 
     // Use bounded query when viewing past periods (offset != 0) or custom date range
@@ -2675,7 +3399,7 @@ app.openapi(analyticsRoute, async (c) => {
 
     const currentRevenue = parseFloat(currentMetricsQuery[0]?.revenue || '0');
     const currentTransactions = parseInt(currentMetricsQuery[0]?.transactions || '0');
-    const currentAvgTransaction = currentTransactions > 0 ? currentRevenue / currentTransactions : 0;
+    // (currentAvgTransaction now computed in merge section as mergedCurrentAvg)
 
     // Query previous period metrics
     const previousMetricsQuery = await query<{
@@ -2699,8 +3423,10 @@ app.openapi(analyticsRoute, async (c) => {
     // Calculate revenue data by time period using database aggregation
     let revenueData: Array<{ label: string; revenue: number }> = [];
     let transactionData: Array<{ label: string; count: number }> = [];
+    let timeSeriesBucketType: 'hourly' | 'daily' | 'monthly' = 'daily'; // Track bucketing for preorder/ticket merge
 
     if (range === 'today') {
+      timeSeriesBucketType = 'hourly';
       // Group by hour
       const hourlyQuery = await query<{ hour: string; revenue: string; order_count: string }>(
         `SELECT
@@ -2828,6 +3554,7 @@ app.openapi(analyticsRoute, async (c) => {
       const daysDiff = Math.ceil((currentEnd.getTime() - currentStart.getTime()) / (1000 * 60 * 60 * 24));
 
       if (daysDiff <= 1) {
+        timeSeriesBucketType = 'hourly';
         // Same day or next day - group by hour (similar to 'today')
         const hourlyQuery = await query<{ hour: string; revenue: string; order_count: string }>(
           `SELECT
@@ -2899,6 +3626,7 @@ app.openapi(analyticsRoute, async (c) => {
           current.setDate(current.getDate() + 1);
         }
       } else {
+        timeSeriesBucketType = 'monthly';
         // More than 3 months - group by month
         const monthlyQuery = await query<{ year_month: string; revenue: string; order_count: string }>(
           `SELECT
@@ -2948,6 +3676,260 @@ app.openapi(analyticsRoute, async (c) => {
     const dateParams = useBoundedQuery
       ? [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
       : [payload.organizationId, currentStart.toISOString()];
+
+    // ── Preorder & Ticket queries (run in parallel with remaining order queries) ──
+    const preorderDateCondition = useBoundedQuery
+      ? 'AND created_at >= $2 AND created_at <= $3'
+      : 'AND created_at >= $2';
+    const preorderJoinDateCondition = useBoundedQuery
+      ? 'AND po.created_at >= $2 AND po.created_at <= $3'
+      : 'AND po.created_at >= $2';
+    const ticketDateCondition = useBoundedQuery
+      ? 'AND purchased_at >= $2 AND purchased_at <= $3'
+      : 'AND purchased_at >= $2';
+
+    // Fire all preorder/ticket queries in parallel (they run concurrently with the sequential order queries below)
+    const preorderTicketPromise = Promise.all([
+      // [0] Preorder current period aggregate
+      query<{ revenue: string; count: string; tips: string; tipped_count: string }>(
+        `SELECT
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as count,
+          COALESCE(SUM(tip_amount), 0)::text as tips,
+          COUNT(CASE WHEN tip_amount > 0 THEN 1 END)::text as tipped_count
+        FROM preorders
+        WHERE organization_id = $1 AND status = 'picked_up'
+          ${preorderDateCondition}`,
+        dateParams
+      ),
+      // [1] Ticket current period aggregate
+      query<{ revenue: string; count: string }>(
+        `SELECT
+          COALESCE(SUM(amount_paid), 0)::text as revenue,
+          COUNT(*)::text as count
+        FROM tickets
+        WHERE organization_id = $1 AND status IN ('valid', 'used')
+          ${ticketDateCondition}`,
+        dateParams
+      ),
+      // [2] Preorder previous period aggregate
+      query<{ revenue: string; count: string; tips: string; tipped_count: string }>(
+        `SELECT
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as count,
+          COALESCE(SUM(tip_amount), 0)::text as tips,
+          COUNT(CASE WHEN tip_amount > 0 THEN 1 END)::text as tipped_count
+        FROM preorders
+        WHERE organization_id = $1 AND status = 'picked_up'
+          AND created_at >= $2 AND created_at <= $3`,
+        [payload.organizationId, previousStart.toISOString(), previousEnd.toISOString()]
+      ),
+      // [3] Ticket previous period aggregate
+      query<{ revenue: string; count: string }>(
+        `SELECT
+          COALESCE(SUM(amount_paid), 0)::text as revenue,
+          COUNT(*)::text as count
+        FROM tickets
+        WHERE organization_id = $1 AND status IN ('valid', 'used')
+          AND purchased_at >= $2 AND purchased_at <= $3`,
+        [payload.organizationId, previousStart.toISOString(), previousEnd.toISOString()]
+      ),
+      // [4] Preorder time series (hourly)
+      query<{ bucket: string; revenue: string; order_count: string }>(
+        `SELECT
+          EXTRACT(HOUR FROM created_at)::text as bucket,
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as order_count
+        FROM preorders
+        WHERE organization_id = $1 AND status = 'picked_up'
+          ${preorderDateCondition}
+        GROUP BY EXTRACT(HOUR FROM created_at)
+        ORDER BY EXTRACT(HOUR FROM created_at)`,
+        dateParams
+      ),
+      // [5] Ticket time series (hourly)
+      query<{ bucket: string; revenue: string; order_count: string }>(
+        `SELECT
+          EXTRACT(HOUR FROM purchased_at)::text as bucket,
+          COALESCE(SUM(amount_paid), 0)::text as revenue,
+          COUNT(*)::text as order_count
+        FROM tickets
+        WHERE organization_id = $1 AND status IN ('valid', 'used')
+          ${ticketDateCondition}
+        GROUP BY EXTRACT(HOUR FROM purchased_at)
+        ORDER BY EXTRACT(HOUR FROM purchased_at)`,
+        dateParams
+      ),
+      // [6] Preorder time series (daily)
+      query<{ bucket: string; revenue: string; order_count: string }>(
+        `SELECT
+          DATE(created_at)::text as bucket,
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as order_count
+        FROM preorders
+        WHERE organization_id = $1 AND status = 'picked_up'
+          ${preorderDateCondition}
+        GROUP BY DATE(created_at)
+        ORDER BY DATE(created_at)`,
+        dateParams
+      ),
+      // [7] Ticket time series (daily)
+      query<{ bucket: string; revenue: string; order_count: string }>(
+        `SELECT
+          DATE(purchased_at)::text as bucket,
+          COALESCE(SUM(amount_paid), 0)::text as revenue,
+          COUNT(*)::text as order_count
+        FROM tickets
+        WHERE organization_id = $1 AND status IN ('valid', 'used')
+          ${ticketDateCondition}
+        GROUP BY DATE(purchased_at)
+        ORDER BY DATE(purchased_at)`,
+        dateParams
+      ),
+      // [8] Preorder time series (monthly) - for custom ranges > 90 days
+      query<{ bucket: string; revenue: string; order_count: string }>(
+        `SELECT
+          TO_CHAR(created_at, 'YYYY-MM') as bucket,
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as order_count
+        FROM preorders
+        WHERE organization_id = $1 AND status = 'picked_up'
+          ${preorderDateCondition}
+        GROUP BY TO_CHAR(created_at, 'YYYY-MM')
+        ORDER BY TO_CHAR(created_at, 'YYYY-MM')`,
+        dateParams
+      ),
+      // [9] Ticket time series (monthly) - for custom ranges > 90 days
+      query<{ bucket: string; revenue: string; order_count: string }>(
+        `SELECT
+          TO_CHAR(purchased_at, 'YYYY-MM') as bucket,
+          COALESCE(SUM(amount_paid), 0)::text as revenue,
+          COUNT(*)::text as order_count
+        FROM tickets
+        WHERE organization_id = $1 AND status IN ('valid', 'used')
+          ${ticketDateCondition}
+        GROUP BY TO_CHAR(purchased_at, 'YYYY-MM')
+        ORDER BY TO_CHAR(purchased_at, 'YYYY-MM')`,
+        dateParams
+      ),
+      // [10] Top products from preorder_items
+      query<{ product_id: string | null; name: string; description: string | null; image_url: string | null; quantity: string; revenue: string }>(
+        `SELECT
+          pi.product_id,
+          pi.name,
+          p.description,
+          p.image_url,
+          SUM(pi.quantity)::text as quantity,
+          SUM(pi.quantity * pi.unit_price)::text as revenue
+        FROM preorder_items pi
+        JOIN preorders po ON pi.preorder_id = po.id
+        LEFT JOIN products p ON pi.product_id = p.id
+        WHERE po.organization_id = $1 AND po.status = 'picked_up'
+          ${preorderJoinDateCondition}
+        GROUP BY pi.product_id, pi.name, p.description, p.image_url
+        ORDER BY SUM(pi.quantity) DESC
+        LIMIT 20`,
+        dateParams
+      ),
+      // [11] Preorder catalog breakdown
+      query<{ catalog_id: string | null; catalog_name: string | null; order_count: string; revenue: string }>(
+        `SELECT
+          p.catalog_id,
+          c.name as catalog_name,
+          COUNT(*)::text as order_count,
+          COALESCE(SUM(p.total_amount), 0)::text as revenue
+        FROM preorders p
+        LEFT JOIN catalogs c ON p.catalog_id = c.id
+        WHERE p.organization_id = $1 AND p.status = 'picked_up'
+          ${preorderJoinDateCondition.replace(/po\./g, 'p.')}
+        GROUP BY p.catalog_id, c.name`,
+        dateParams
+      ),
+      // [12] Preorder peak hours
+      query<{ hour: string; count: string }>(
+        `SELECT
+          EXTRACT(HOUR FROM created_at)::text as hour,
+          COUNT(*)::text as count
+        FROM preorders
+        WHERE organization_id = $1 AND status = 'picked_up'
+          ${preorderDateCondition}
+        GROUP BY EXTRACT(HOUR FROM created_at)`,
+        dateParams
+      ),
+      // [13] Ticket peak hours
+      query<{ hour: string; count: string }>(
+        `SELECT
+          EXTRACT(HOUR FROM purchased_at)::text as hour,
+          COUNT(*)::text as count
+        FROM tickets
+        WHERE organization_id = $1 AND status IN ('valid', 'used')
+          ${ticketDateCondition}
+        GROUP BY EXTRACT(HOUR FROM purchased_at)`,
+        dateParams
+      ),
+      // [14] Preorder heatmap
+      query<{ day_of_week: string; hour: string; order_count: string; revenue: string }>(
+        `SELECT
+          EXTRACT(DOW FROM created_at)::text as day_of_week,
+          EXTRACT(HOUR FROM created_at)::text as hour,
+          COUNT(*)::text as order_count,
+          COALESCE(SUM(total_amount), 0)::text as revenue
+        FROM preorders
+        WHERE organization_id = $1 AND status = 'picked_up'
+          ${preorderDateCondition}
+        GROUP BY EXTRACT(DOW FROM created_at), EXTRACT(HOUR FROM created_at)`,
+        dateParams
+      ),
+      // [15] Ticket heatmap
+      query<{ day_of_week: string; hour: string; order_count: string; revenue: string }>(
+        `SELECT
+          EXTRACT(DOW FROM purchased_at)::text as day_of_week,
+          EXTRACT(HOUR FROM purchased_at)::text as hour,
+          COUNT(*)::text as order_count,
+          COALESCE(SUM(amount_paid), 0)::text as revenue
+        FROM tickets
+        WHERE organization_id = $1 AND status IN ('valid', 'used')
+          ${ticketDateCondition}
+        GROUP BY EXTRACT(DOW FROM purchased_at), EXTRACT(HOUR FROM purchased_at)`,
+        dateParams
+      ),
+      // [16] Cancelled preorders (pay_now) for refund stats
+      query<{ count: string; amount: string }>(
+        `SELECT
+          COUNT(*)::text as count,
+          COALESCE(SUM(total_amount), 0)::text as amount
+        FROM preorders
+        WHERE organization_id = $1 AND status = 'cancelled' AND payment_type = 'pay_now'
+          ${preorderDateCondition}`,
+        dateParams
+      ),
+      // [17] Refunded tickets for refund stats
+      query<{ count: string; amount: string }>(
+        `SELECT
+          COUNT(*)::text as count,
+          COALESCE(SUM(amount_paid), 0)::text as amount
+        FROM tickets
+        WHERE organization_id = $1 AND status = 'refunded'
+          ${ticketDateCondition.replace(/purchased_at/g, 'purchased_at')}`,
+        dateParams
+      ),
+      // [18] Preorder count for payment methods
+      query<{ count: string }>(
+        `SELECT COUNT(*)::text as count
+        FROM preorders
+        WHERE organization_id = $1 AND status = 'picked_up'
+          ${preorderDateCondition}`,
+        dateParams
+      ),
+      // [19] Ticket count for payment methods
+      query<{ count: string }>(
+        `SELECT COUNT(*)::text as count
+        FROM tickets
+        WHERE organization_id = $1 AND status IN ('valid', 'used')
+          ${ticketDateCondition}`,
+        dateParams
+      ),
+    ]);
 
     // Query payment method breakdown from database
     const paymentMethodQuery = await query<{ method: string | null; count: string; revenue: string }>(
@@ -3169,9 +4151,7 @@ app.openapi(analyticsRoute, async (c) => {
 
     const quickChargeOrders = parseInt(quickChargeQuery[0]?.order_count || '0');
     const quickChargeRevenue = parseFloat(quickChargeQuery[0]?.revenue || '0');
-    const quickChargePercentage = currentTransactions > 0
-      ? Math.round((quickChargeOrders / currentTransactions) * 100)
-      : 0;
+    // (quickChargePercentage now computed in merge section as mergedQuickChargePercentage)
 
     // Query day-of-week × hour heatmap
     const heatmapQuery = await query<{
@@ -3201,14 +4181,7 @@ app.openapi(analyticsRoute, async (c) => {
       revenue: Math.round(parseFloat(row.revenue) * 100) / 100,
     }));
 
-    // Compute average order value from revenue and transaction data (same time buckets)
-    const avgOrderDataFinal = revenueData.map((rd, i) => {
-      const count = transactionData[i]?.count || 0;
-      return {
-        label: rd.label,
-        value: count > 0 ? Math.round((rd.revenue / count) * 100) / 100 : 0,
-      };
-    });
+    // (avgOrderData now computed in merge section as mergedAvgOrderData)
 
     // Query refund stats
     const refundQuery = await query<{ refund_count: string; refund_amount: string }>(
@@ -3224,27 +4197,19 @@ app.openapi(analyticsRoute, async (c) => {
 
     const refundCount = parseInt(refundQuery[0]?.refund_count || '0');
     const refundAmount = Math.round(parseFloat(refundQuery[0]?.refund_amount || '0') * 100) / 100;
-    const totalOrdersForRate = currentTransactions + refundCount;
-    const refundRate = totalOrdersForRate > 0 ? Math.round((refundCount / totalOrdersForRate) * 1000) / 10 : 0;
+    // (refundRate now computed in merge section as mergedRefundRate)
 
-    // Query customer metrics (new vs returning)
+    // Query customer metrics (new vs returning) from the customers table
+    // which is populated from orders, preorders, AND ticket purchases
     const customerQuery = await query<{ new_customers: string; returning_customers: string }>(
-      `WITH first_orders AS (
-        SELECT customer_id, MIN(created_at) as first_order_at
-        FROM orders
-        WHERE organization_id = $1 AND status = 'completed' AND customer_id IS NOT NULL
-        GROUP BY customer_id
-      )
-      SELECT
-        COUNT(CASE WHEN fo.first_order_at >= $2 ${useBoundedQuery ? 'AND fo.first_order_at <= $3' : ''} THEN 1 END)::text as new_customers,
-        COUNT(CASE WHEN fo.first_order_at < $2 THEN 1 END)::text as returning_customers
-      FROM (
-        SELECT DISTINCT customer_id FROM orders
-        WHERE organization_id = $1 AND status = 'completed'
-          ${dateCondition}
-          AND customer_id IS NOT NULL
-      ) pc
-      JOIN first_orders fo ON pc.customer_id = fo.customer_id`,
+      `SELECT
+        COUNT(CASE WHEN created_at >= $2 ${useBoundedQuery ? 'AND created_at <= $3' : ''} THEN 1 END)::text as new_customers,
+        COUNT(CASE WHEN created_at < $2 THEN 1 END)::text as returning_customers
+      FROM customers
+      WHERE organization_id = $1
+        AND total_orders > 0
+        AND last_order_at >= $2
+        ${useBoundedQuery ? 'AND last_order_at <= $3' : ''}`,
       dateParams
     );
 
@@ -3253,12 +4218,7 @@ app.openapi(analyticsRoute, async (c) => {
     const totalCustomers = newCustomers + returningCustomers;
     const repeatRate = totalCustomers > 0 ? Math.round((returningCustomers / totalCustomers) * 1000) / 10 : 0;
 
-    // Compute revenue velocity (cumulative) from revenueData
-    let cumulativeSum = 0;
-    const revenueVelocity = revenueData.map(rd => {
-      cumulativeSum += rd.revenue;
-      return { label: rd.label, cumulative: Math.round(cumulativeSum * 100) / 100 };
-    });
+    // (revenueVelocity now computed in merge section as mergedRevenueVelocity)
 
     // Query tip stats
     const tipQuery = await query<{
@@ -3281,9 +4241,8 @@ app.openapi(analyticsRoute, async (c) => {
     );
 
     const totalTips = Math.round(parseFloat(tipQuery[0]?.total_tips || '0') * 100) / 100;
-    const avgTip = Math.round(parseFloat(tipQuery[0]?.avg_tip || '0') * 100) / 100;
+    // (avgTip and tipRate now computed in merge section)
     const tippedOrders = parseInt(tipQuery[0]?.tipped_orders || '0');
-    const tipRate = currentTransactions > 0 ? Math.round((tippedOrders / currentTransactions) * 1000) / 10 : 0;
 
     // Query staff (user) breakdown
     const staffQuery = await query<{
@@ -3379,44 +4338,417 @@ app.openapi(analyticsRoute, async (c) => {
       };
     });
 
+    // ── Await and merge preorder & ticket data ──
+    const ptResults = await preorderTicketPromise;
+
+    const preorderCurrentAgg = ptResults[0][0];
+    const ticketCurrentAgg = ptResults[1][0];
+    const preorderPreviousAgg = ptResults[2][0];
+    const ticketPreviousAgg = ptResults[3][0];
+    const preorderHourlyTS = ptResults[4];
+    const ticketHourlyTS = ptResults[5];
+    const preorderDailyTS = ptResults[6];
+    const ticketDailyTS = ptResults[7];
+    const preorderMonthlyTS = ptResults[8];
+    const ticketMonthlyTS = ptResults[9];
+    const preorderTopProducts = ptResults[10];
+    const preorderCatalogBreakdown = ptResults[11];
+    const preorderPeakHours = ptResults[12];
+    const ticketPeakHours = ptResults[13];
+    const preorderHeatmap = ptResults[14];
+    const ticketHeatmap = ptResults[15];
+    const cancelledPreorders = ptResults[16][0];
+    const refundedTickets = ptResults[17][0];
+    const preorderPaymentCount = parseInt(ptResults[18][0]?.count || '0');
+    const ticketPaymentCount = parseInt(ptResults[19][0]?.count || '0');
+
+    // 1. Core metrics — add preorder + ticket revenue/count
+    const preorderRevenue = parseFloat(preorderCurrentAgg?.revenue || '0');
+    const preorderCount = parseInt(preorderCurrentAgg?.count || '0');
+    const ticketRevenue = parseFloat(ticketCurrentAgg?.revenue || '0');
+    const ticketCount = parseInt(ticketCurrentAgg?.count || '0');
+
+    const mergedCurrentRevenue = currentRevenue + preorderRevenue + ticketRevenue;
+    const mergedCurrentTransactions = currentTransactions + preorderCount + ticketCount;
+    const mergedCurrentAvg = mergedCurrentTransactions > 0 ? mergedCurrentRevenue / mergedCurrentTransactions : 0;
+
+    // 2. Previous period metrics
+    const prevPreorderRevenue = parseFloat(preorderPreviousAgg?.revenue || '0');
+    const prevPreorderCount = parseInt(preorderPreviousAgg?.count || '0');
+    const prevTicketRevenue = parseFloat(ticketPreviousAgg?.revenue || '0');
+    const prevTicketCount = parseInt(ticketPreviousAgg?.count || '0');
+
+    const mergedPreviousRevenue = previousRevenue + prevPreorderRevenue + prevTicketRevenue;
+    const mergedPreviousTransactions = previousTransactions + prevPreorderCount + prevTicketCount;
+
+    // 3. Merge time series — add preorder/ticket values into each time bucket
+    // Determine which time series results to use based on bucket type
+    let preorderTSData: Array<{ bucket: string; revenue: string; order_count: string }>;
+    let ticketTSData: Array<{ bucket: string; revenue: string; order_count: string }>;
+
+    if (timeSeriesBucketType === 'hourly') {
+      preorderTSData = preorderHourlyTS;
+      ticketTSData = ticketHourlyTS;
+    } else if (timeSeriesBucketType === 'monthly') {
+      preorderTSData = preorderMonthlyTS;
+      ticketTSData = ticketMonthlyTS;
+    } else {
+      preorderTSData = preorderDailyTS;
+      ticketTSData = ticketDailyTS;
+    }
+
+    // Build maps from preorder/ticket time series
+    const preorderTSMap: Record<string, { revenue: number; count: number }> = {};
+    preorderTSData.forEach(row => {
+      preorderTSMap[row.bucket] = {
+        revenue: parseFloat(row.revenue || '0'),
+        count: parseInt(row.order_count || '0'),
+      };
+    });
+    const ticketTSMap: Record<string, { revenue: number; count: number }> = {};
+    ticketTSData.forEach(row => {
+      ticketTSMap[row.bucket] = {
+        revenue: parseFloat(row.revenue || '0'),
+        count: parseInt(row.order_count || '0'),
+      };
+    });
+
+    // Map labels back to bucket keys for merging
+    // For hourly: label is "12AM", "1PM", etc. — we need to match by hour number
+    // For daily (week): label is "Mon", "Tue" — we need date key
+    // For daily (month/custom): label is day number or "Jan 5" — we need date key
+    // For monthly: label is "Jan '25" — we need YYYY-MM key
+    // We'll iterate revenueData/transactionData and merge based on bucket type + index
+
+    if (timeSeriesBucketType === 'hourly') {
+      // For hourly bucketing, the bucket key is the hour number (0-23)
+      // We need to match revenueData labels back to hours
+      // revenueData labels are like "9AM", "12PM", "1PM" etc.
+      // We'll reconstruct the hour from the label or iterate the range directly
+      const hourLabels: Record<string, number> = {};
+      // Build reverse map from label to hour
+      for (let h = 0; h <= 23; h++) {
+        const hour12 = h === 0 ? 12 : (h > 12 ? h - 12 : h);
+        const ampm = h >= 12 ? 'PM' : 'AM';
+        hourLabels[`${hour12}${ampm}`] = h;
+        hourLabels[`${hour12} ${ampm}`] = h; // Handle possible space variant
+      }
+      revenueData = revenueData.map(rd => {
+        const h = hourLabels[rd.label];
+        if (h !== undefined) {
+          const hStr = String(h);
+          const preorderVal = preorderTSMap[hStr]?.revenue || 0;
+          const ticketVal = ticketTSMap[hStr]?.revenue || 0;
+          return { label: rd.label, revenue: Math.round((rd.revenue + preorderVal + ticketVal) * 100) / 100 };
+        }
+        return rd;
+      });
+      transactionData = transactionData.map(td => {
+        const h = hourLabels[td.label];
+        if (h !== undefined) {
+          const hStr = String(h);
+          const preorderVal = preorderTSMap[hStr]?.count || 0;
+          const ticketVal = ticketTSMap[hStr]?.count || 0;
+          return { label: td.label, count: td.count + preorderVal + ticketVal };
+        }
+        return td;
+      });
+    } else if (timeSeriesBucketType === 'daily') {
+      // For daily bucketing, bucket keys are YYYY-MM-DD dates
+      // We need to match revenueData indices to dates
+      // For 'week': labels are Mon-Sun, we can rebuild dates from currentStart + index
+      // For 'month': labels are day numbers, we can rebuild dates
+      // For 'custom' daily: labels are "Jan 5" etc, rebuild from currentStart + index
+      // Easiest approach: iterate by index and reconstruct the date
+      for (let i = 0; i < revenueData.length; i++) {
+        const date = new Date(currentStart.getTime() + i * 24 * 60 * 60 * 1000);
+        const dateStr = date.toISOString().split('T')[0];
+        const preorderVal = preorderTSMap[dateStr];
+        const ticketVal = ticketTSMap[dateStr];
+        if (preorderVal || ticketVal) {
+          revenueData[i] = {
+            label: revenueData[i].label,
+            revenue: Math.round((revenueData[i].revenue + (preorderVal?.revenue || 0) + (ticketVal?.revenue || 0)) * 100) / 100,
+          };
+          transactionData[i] = {
+            label: transactionData[i].label,
+            count: transactionData[i].count + (preorderVal?.count || 0) + (ticketVal?.count || 0),
+          };
+        }
+      }
+    } else {
+      // Monthly bucketing — bucket keys are YYYY-MM
+      // Labels are like "Jan '25" — iterate by index from currentStart month
+      for (let i = 0; i < revenueData.length; i++) {
+        const monthDate = new Date(currentStart.getFullYear(), currentStart.getMonth() + i, 1);
+        const yearMonth = `${monthDate.getFullYear()}-${String(monthDate.getMonth() + 1).padStart(2, '0')}`;
+        const preorderVal = preorderTSMap[yearMonth];
+        const ticketVal = ticketTSMap[yearMonth];
+        if (preorderVal || ticketVal) {
+          revenueData[i] = {
+            label: revenueData[i].label,
+            revenue: Math.round((revenueData[i].revenue + (preorderVal?.revenue || 0) + (ticketVal?.revenue || 0)) * 100) / 100,
+          };
+          transactionData[i] = {
+            label: transactionData[i].label,
+            count: transactionData[i].count + (preorderVal?.count || 0) + (ticketVal?.count || 0),
+          };
+        }
+      }
+    }
+
+    // 4. Payment methods — add "Preorder" and "Ticket Sale" entries
+    const mergedPaymentMethods = [...paymentMethods];
+    if (preorderPaymentCount > 0) {
+      mergedPaymentMethods.push({
+        method: 'Preorder',
+        count: preorderPaymentCount,
+        revenue: Math.round(preorderRevenue * 100) / 100,
+        percentage: 0, // Recalculated below
+      });
+    }
+    if (ticketPaymentCount > 0) {
+      mergedPaymentMethods.push({
+        method: 'Ticket Sale',
+        count: ticketPaymentCount,
+        revenue: Math.round(ticketRevenue * 100) / 100,
+        percentage: 0, // Recalculated below
+      });
+    }
+    // Recalculate percentages for all payment methods
+    const mergedTotalPayments = mergedPaymentMethods.reduce((sum, p) => sum + p.count, 0);
+    mergedPaymentMethods.forEach(p => {
+      p.percentage = mergedTotalPayments > 0 ? Math.round((p.count / mergedTotalPayments) * 100) : 0;
+    });
+
+    // 5. Peak hours — merge preorder/ticket hourly data
+    // Build maps from preorder/ticket peak hours
+    const preorderPeakMap: Record<number, number> = {};
+    preorderPeakHours.forEach(row => {
+      preorderPeakMap[parseInt(row.hour)] = parseInt(row.count);
+    });
+    const ticketPeakMap: Record<number, number> = {};
+    ticketPeakHours.forEach(row => {
+      ticketPeakMap[parseInt(row.hour)] = parseInt(row.count);
+    });
+
+    // Merge into hourCountMap and rebuild peakHours
+    const allPeakHoursWithData = new Set([
+      ...Object.keys(hourCountMap).map(Number),
+      ...Object.keys(preorderPeakMap).map(Number),
+      ...Object.keys(ticketPeakMap).map(Number),
+    ]);
+
+    // Expand min/max range if preorder/ticket data has hours outside current range
+    let mergedMinHour = minHour;
+    let mergedMaxHour = maxHour;
+    if (allPeakHoursWithData.size > 0) {
+      const allHoursArr = [...allPeakHoursWithData];
+      mergedMinHour = Math.max(0, Math.min(mergedMinHour, Math.min(...allHoursArr) - 1));
+      mergedMaxHour = Math.min(23, Math.max(mergedMaxHour, Math.max(...allHoursArr) + 1));
+      if (mergedMaxHour - mergedMinHour < 4) {
+        mergedMinHour = Math.max(0, mergedMinHour - 2);
+        mergedMaxHour = Math.min(23, mergedMaxHour + 2);
+      }
+    }
+
+    // Build merged peak hours
+    let mergedTotalHourTransactions = 0;
+    const mergedPeakHoursData: Array<{ hour: string; count: number; percentage: number }> = [];
+    for (let h = mergedMinHour; h <= mergedMaxHour; h++) {
+      const count = (hourCountMap[h] || 0) + (preorderPeakMap[h] || 0) + (ticketPeakMap[h] || 0);
+      mergedTotalHourTransactions += count;
+      const hour12 = h > 12 ? h - 12 : (h === 0 ? 12 : h);
+      const ampm = h >= 12 ? 'PM' : 'AM';
+      mergedPeakHoursData.push({
+        hour: `${hour12} ${ampm}`,
+        count,
+        percentage: 0, // Recalculated below
+      });
+    }
+    mergedPeakHoursData.forEach(ph => {
+      ph.percentage = mergedTotalHourTransactions > 0 ? Math.round((ph.count / mergedTotalHourTransactions) * 100) : 0;
+    });
+
+    // 6. Heatmap — merge preorder/ticket data into same day/hour grid
+    const heatmapMergeMap: Record<string, { orderCount: number; revenue: number }> = {};
+    dayOfWeekHeatmap.forEach(entry => {
+      const key = `${entry.day}-${entry.hour}`;
+      heatmapMergeMap[key] = { orderCount: entry.orderCount, revenue: entry.revenue };
+    });
+    preorderHeatmap.forEach(row => {
+      const key = `${parseInt(row.day_of_week)}-${parseInt(row.hour)}`;
+      if (!heatmapMergeMap[key]) {
+        heatmapMergeMap[key] = { orderCount: 0, revenue: 0 };
+      }
+      heatmapMergeMap[key].orderCount += parseInt(row.order_count);
+      heatmapMergeMap[key].revenue += parseFloat(row.revenue);
+    });
+    ticketHeatmap.forEach(row => {
+      const key = `${parseInt(row.day_of_week)}-${parseInt(row.hour)}`;
+      if (!heatmapMergeMap[key]) {
+        heatmapMergeMap[key] = { orderCount: 0, revenue: 0 };
+      }
+      heatmapMergeMap[key].orderCount += parseInt(row.order_count);
+      heatmapMergeMap[key].revenue += parseFloat(row.revenue);
+    });
+    const mergedHeatmap = Object.entries(heatmapMergeMap).map(([key, val]) => {
+      const [day, hour] = key.split('-').map(Number);
+      return {
+        day,
+        hour,
+        orderCount: val.orderCount,
+        revenue: Math.round(val.revenue * 100) / 100,
+      };
+    }).sort((a, b) => a.day !== b.day ? a.day - b.day : a.hour - b.hour);
+
+    // 7. Top products — merge preorder items into top products, re-sort, take top 10
+    const productMergeMap: Record<string, { productId: string | null; name: string; description: string | null; imageUrl: string | null; quantity: number; revenue: number }> = {};
+    topProducts.forEach(p => {
+      const key = p.productId || `unnamed:${p.name}`;
+      productMergeMap[key] = { ...p };
+    });
+    preorderTopProducts.forEach(p => {
+      const key = p.product_id || `unnamed:${p.name}`;
+      if (productMergeMap[key]) {
+        productMergeMap[key].quantity += parseInt(p.quantity || '0');
+        productMergeMap[key].revenue += parseFloat(p.revenue || '0');
+      } else {
+        productMergeMap[key] = {
+          productId: p.product_id,
+          name: p.name,
+          description: p.description,
+          imageUrl: p.image_url,
+          quantity: parseInt(p.quantity || '0'),
+          revenue: parseFloat(p.revenue || '0'),
+        };
+      }
+    });
+    const mergedTopProductsList = Object.values(productMergeMap)
+      .sort((a, b) => b.quantity - a.quantity)
+      .slice(0, 10);
+    const mergedTotalProductQty = mergedTopProductsList.reduce((sum, p) => sum + p.quantity, 0);
+    const mergedTopProducts = mergedTopProductsList.map(p => ({
+      ...p,
+      percentage: mergedTotalProductQty > 0 ? Math.round((p.quantity / mergedTotalProductQty) * 100) : 0,
+    }));
+
+    // 8. Catalog breakdown — merge preorder catalog counts into existing
+    const catalogMergeMap: Record<string, typeof catalogBreakdown[0]> = {};
+    catalogBreakdown.forEach(c => {
+      catalogMergeMap[c.catalogId || 'null'] = { ...c };
+    });
+    preorderCatalogBreakdown.forEach(pc => {
+      const key = pc.catalog_id || 'null';
+      if (catalogMergeMap[key]) {
+        catalogMergeMap[key].orderCount += parseInt(pc.order_count || '0');
+        catalogMergeMap[key].revenue += parseFloat(pc.revenue || '0');
+      } else {
+        catalogMergeMap[key] = {
+          catalogId: pc.catalog_id,
+          catalogName: pc.catalog_name || 'Unknown Catalog',
+          description: null,
+          location: null,
+          date: null,
+          createdAt: null,
+          productCount: 0,
+          orderCount: parseInt(pc.order_count || '0'),
+          revenue: parseFloat(pc.revenue || '0'),
+          percentage: 0,
+        };
+      }
+    });
+    const mergedCatalogList = Object.values(catalogMergeMap).sort((a, b) => b.orderCount - a.orderCount);
+    const mergedTotalCatalogOrders = mergedCatalogList.reduce((sum, c) => sum + c.orderCount, 0);
+    const mergedCatalogBreakdown = mergedCatalogList.map(c => ({
+      ...c,
+      percentage: mergedTotalCatalogOrders > 0 ? Math.round((c.orderCount / mergedTotalCatalogOrders) * 100) : 0,
+    }));
+
+    // 9. Tip stats — add preorder tips
+    const preorderTips = parseFloat(preorderCurrentAgg?.tips || '0');
+    const preorderTippedCount = parseInt(preorderCurrentAgg?.tipped_count || '0');
+    const mergedTotalTips = Math.round((totalTips + preorderTips) * 100) / 100;
+    const mergedTippedOrders = tippedOrders + preorderTippedCount;
+    const mergedAvgTip = mergedTippedOrders > 0
+      ? Math.round(((totalTips + preorderTips) / mergedTippedOrders) * 100) / 100
+      : 0;
+    const mergedTipRate = mergedCurrentTransactions > 0
+      ? Math.round((mergedTippedOrders / mergedCurrentTransactions) * 1000) / 10
+      : 0;
+
+    // 10. Refund stats — add cancelled preorders + refunded tickets
+    const cancelledPreorderCount = parseInt(cancelledPreorders?.count || '0');
+    const cancelledPreorderAmount = Math.round(parseFloat(cancelledPreorders?.amount || '0') * 100) / 100;
+    const refundedTicketCount = parseInt(refundedTickets?.count || '0');
+    const refundedTicketAmount = Math.round(parseFloat(refundedTickets?.amount || '0') * 100) / 100;
+
+    const mergedRefundCount = refundCount + cancelledPreorderCount + refundedTicketCount;
+    const mergedRefundAmount = Math.round((refundAmount + cancelledPreorderAmount + refundedTicketAmount) * 100) / 100;
+    const mergedTotalOrdersForRate = mergedCurrentTransactions + mergedRefundCount;
+    const mergedRefundRate = mergedTotalOrdersForRate > 0
+      ? Math.round((mergedRefundCount / mergedTotalOrdersForRate) * 1000) / 10
+      : 0;
+
+    // Recompute average order data from merged revenue/transaction data
+    const mergedAvgOrderData = revenueData.map((rd, i) => {
+      const count = transactionData[i]?.count || 0;
+      return {
+        label: rd.label,
+        value: count > 0 ? Math.round((rd.revenue / count) * 100) / 100 : 0,
+      };
+    });
+
+    // Recompute revenue velocity from merged revenueData
+    let mergedCumulativeSum = 0;
+    const mergedRevenueVelocity = revenueData.map(rd => {
+      mergedCumulativeSum += rd.revenue;
+      return { label: rd.label, cumulative: Math.round(mergedCumulativeSum * 100) / 100 };
+    });
+
+    // Recompute quick charge percentage against merged total
+    const mergedQuickChargePercentage = mergedCurrentTransactions > 0
+      ? Math.round((quickChargeOrders / mergedCurrentTransactions) * 100)
+      : 0;
+
     return c.json({
       metrics: {
-        revenue: Math.round(currentRevenue * 100) / 100,
-        transactions: currentTransactions,
-        averageTransaction: Math.round(currentAvgTransaction * 100) / 100,
-        previousRevenue: Math.round(previousRevenue * 100) / 100,
-        previousTransactions,
+        revenue: Math.round(mergedCurrentRevenue * 100) / 100,
+        transactions: mergedCurrentTransactions,
+        averageTransaction: Math.round(mergedCurrentAvg * 100) / 100,
+        previousRevenue: Math.round(mergedPreviousRevenue * 100) / 100,
+        previousTransactions: mergedPreviousTransactions,
       },
       revenueData,
       transactionData,
-      paymentMethods,
-      peakHours,
-      topProducts,
-      catalogBreakdown,
+      paymentMethods: mergedPaymentMethods,
+      peakHours: mergedPeakHoursData,
+      topProducts: mergedTopProducts,
+      catalogBreakdown: mergedCatalogBreakdown,
       categoryBreakdown,
       quickCharge: {
         orders: quickChargeOrders,
         revenue: Math.round(quickChargeRevenue * 100) / 100,
-        percentage: quickChargePercentage,
+        percentage: mergedQuickChargePercentage,
       },
-      dayOfWeekHeatmap,
-      avgOrderData: avgOrderDataFinal,
+      dayOfWeekHeatmap: mergedHeatmap,
+      avgOrderData: mergedAvgOrderData,
       refunds: {
-        count: refundCount,
-        amount: refundAmount,
-        rate: refundRate,
+        count: mergedRefundCount,
+        amount: mergedRefundAmount,
+        rate: mergedRefundRate,
       },
       customerMetrics: {
         newCustomers,
         returningCustomers,
         repeatRate,
       },
-      revenueVelocity,
+      revenueVelocity: mergedRevenueVelocity,
       tipStats: {
-        totalTips,
-        avgTip,
-        tippedOrders,
-        tipRate,
+        totalTips: mergedTotalTips,
+        avgTip: mergedAvgTip,
+        tippedOrders: mergedTippedOrders,
+        tipRate: mergedTipRate,
       },
       staffBreakdown,
       deviceBreakdown,

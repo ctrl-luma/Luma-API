@@ -40,9 +40,9 @@ app.route('/', signupRoutes);
 
 const DeviceInfoSchema = z.object({
   name: z.string().max(255).optional(),
-  model: z.string().max(100).optional(),
-  os: z.string().max(50).optional(),
-  osVersion: z.string().max(50).optional(),
+  model: z.string().max(255).optional(),
+  os: z.string().max(255).optional(),
+  osVersion: z.string().max(255).optional(),
   appVersion: z.string().max(50).optional(),
 });
 
@@ -430,7 +430,7 @@ app.openapi(checkPasswordRoute, async (c) => {
   }
 
   // Check for special character
-  if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password)) {
+  if (!/[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]/.test(password)) {
     errors.push('Password must contain at least 1 special character');
   }
 
@@ -547,7 +547,7 @@ app.openapi(logoutRoute, async (c) => {
 
 const ChangePasswordRequestSchema = z.object({
   newPassword: z.string().min(8).regex(
-    /^(?=.*[0-9])(?=.*[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?])(?=.*[a-z])(?=.*[A-Z]).+$/,
+    /^(?=.*[0-9])(?=.*[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?])(?=.*[a-z])(?=.*[A-Z]).+$/,
     'Password must contain at least 1 number, 1 special character, 1 uppercase letter, and 1 lowercase letter'
   ),
 });
@@ -1047,7 +1047,7 @@ app.openapi(forgotPasswordRoute, async (c) => {
 const ResetPasswordRequestSchema = z.object({
   token: z.string().uuid(),
   password: z.string().min(8).regex(
-    /^(?=.*[0-9])(?=.*[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?])(?=.*[a-z])(?=.*[A-Z]).+$/,
+    /^(?=.*[0-9])(?=.*[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?])(?=.*[a-z])(?=.*[A-Z]).+$/,
     'Password must contain at least 1 number, 1 special character, 1 uppercase letter, and 1 lowercase letter'
   ),
 });
@@ -1231,7 +1231,7 @@ app.openapi(validateInviteRoute, async (c) => {
 const AcceptInviteRequestSchema = z.object({
   token: z.string(),
   password: z.string().min(8).regex(
-    /^(?=.*[0-9])(?=.*[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?])(?=.*[a-z])(?=.*[A-Z]).+$/,
+    /^(?=.*[0-9])(?=.*[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?])(?=.*[a-z])(?=.*[A-Z]).+$/,
     'Password must contain at least 1 number, 1 special character, 1 uppercase letter, and 1 lowercase letter'
   ),
 });
@@ -1617,7 +1617,7 @@ app.openapi(uploadAvatarRoute, async (c) => {
     if (existingAvatarId) {
       try {
         await imageService.delete(existingAvatarId);
-      } catch (e) {
+      } catch {
         logger.warn('Failed to delete old avatar', { userId: payload.userId, existingAvatarId });
       }
     }

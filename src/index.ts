@@ -36,6 +36,8 @@ import tipsRoutes from './routes/tips';
 import staffRoutes from './routes/staff';
 import splitsRoutes from './routes/splits';
 import eventRoutes from './routes/events';
+import menuRoutes from './routes/menu';
+import preorderRoutes from './routes/preorders';
 import adminErrorRoutes from './routes/admin/errors';
 
 const app = new OpenAPIHono({
@@ -141,6 +143,8 @@ app.route('/', tipsRoutes);
 app.route('/', staffRoutes);
 app.route('/', splitsRoutes);
 app.route('/', eventRoutes);
+app.route('/', menuRoutes);
+app.route('/', preorderRoutes);
 app.route('/admin/errors', adminErrorRoutes);
 
 app.onError(errorHandler);

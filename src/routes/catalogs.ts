@@ -10,6 +10,7 @@ const app = new OpenAPIHono();
 
 // Schema definitions
 const layoutTypeSchema = z.enum(['grid', 'list', 'large-grid', 'compact']);
+const preorderPaymentModeSchema = z.enum(['pay_now', 'pay_at_pickup', 'both']);
 
 const catalogSchema = z.object({
   id: z.string(),
@@ -24,6 +25,12 @@ const catalogSchema = z.object({
   allowCustomTip: z.boolean(),
   taxRate: z.number(),
   layoutType: layoutTypeSchema,
+  // Preorder settings
+  preorderEnabled: z.boolean(),
+  slug: z.string().nullable(),
+  preorderPaymentMode: preorderPaymentModeSchema,
+  pickupInstructions: z.string().nullable(),
+  estimatedPrepTime: z.number(),
   productCount: z.number(),
   isLocked: z.boolean().optional(),
   createdAt: z.string(),
@@ -42,6 +49,12 @@ const createCatalogSchema = z.object({
   allowCustomTip: z.boolean().optional().default(true),
   taxRate: z.number().min(0).max(100).optional().default(0),
   layoutType: layoutTypeSchema.optional().default('grid'),
+  // Preorder settings
+  preorderEnabled: z.boolean().optional().default(false),
+  slug: z.string().max(200).nullable().optional(),
+  preorderPaymentMode: preorderPaymentModeSchema.optional().default('both'),
+  pickupInstructions: z.string().max(1000).nullable().optional(),
+  estimatedPrepTime: z.number().int().min(1).max(180).optional().default(10),
 });
 
 const updateCatalogSchema = z.object({
@@ -56,6 +69,12 @@ const updateCatalogSchema = z.object({
   allowCustomTip: z.boolean().optional(),
   taxRate: z.number().min(0).max(100).optional(),
   layoutType: layoutTypeSchema.optional(),
+  // Preorder settings
+  preorderEnabled: z.boolean().optional(),
+  slug: z.string().max(200).nullable().optional(),
+  preorderPaymentMode: preorderPaymentModeSchema.optional(),
+  pickupInstructions: z.string().max(1000).nullable().optional(),
+  estimatedPrepTime: z.number().int().min(1).max(180).optional(),
 });
 
 // Helper to verify token and get user info
@@ -216,6 +235,12 @@ app.openapi(listCatalogsRoute, async (c) => {
       allowCustomTip: (row as any).allow_custom_tip ?? true,
       taxRate: parseFloat((row as any).tax_rate) || 0,
       layoutType: (row as any).layout_type || 'grid',
+      // Preorder settings
+      preorderEnabled: (row as any).preorder_enabled ?? false,
+      slug: (row as any).slug ?? null,
+      preorderPaymentMode: (row as any).preorder_payment_mode ?? 'both',
+      pickupInstructions: (row as any).pickup_instructions ?? null,
+      estimatedPrepTime: (row as any).estimated_prep_time ?? 10,
       productCount: row.product_count || 0,
       isLocked: lockedCatalogIds.has(row.id),
       createdAt: row.created_at.toISOString(),
@@ -297,6 +322,12 @@ app.openapi(getCatalogRoute, async (c) => {
       allowCustomTip: (row as any).allow_custom_tip ?? true,
       taxRate: parseFloat((row as any).tax_rate) || 0,
       layoutType: (row as any).layout_type || 'grid',
+      // Preorder settings
+      preorderEnabled: (row as any).preorder_enabled ?? false,
+      slug: (row as any).slug ?? null,
+      preorderPaymentMode: (row as any).preorder_payment_mode ?? 'both',
+      pickupInstructions: (row as any).pickup_instructions ?? null,
+      estimatedPrepTime: (row as any).estimated_prep_time ?? 10,
       productCount: row.product_count || 0,
       createdAt: row.created_at.toISOString(),
       updatedAt: row.updated_at.toISOString(),
@@ -370,8 +401,12 @@ app.openapi(createCatalogRoute, async (c) => {
     }
 
     const rows = await query<Catalog>(
-      `INSERT INTO catalogs (organization_id, name, description, location, date, is_active, show_tip_screen, prompt_for_email, tip_percentages, allow_custom_tip, tax_rate, layout_type)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+      `INSERT INTO catalogs (
+        organization_id, name, description, location, date, is_active, show_tip_screen,
+        prompt_for_email, tip_percentages, allow_custom_tip, tax_rate, layout_type,
+        preorder_enabled, slug, preorder_payment_mode, pickup_instructions, estimated_prep_time
+      )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
        RETURNING *`,
       [
         payload.organizationId,
@@ -386,6 +421,11 @@ app.openapi(createCatalogRoute, async (c) => {
         body.allowCustomTip ?? true,
         body.taxRate ?? 0,
         body.layoutType || 'grid',
+        body.preorderEnabled ?? false,
+        body.slug || null,
+        body.preorderPaymentMode || 'both',
+        body.pickupInstructions || null,
+        body.estimatedPrepTime ?? 10,
       ]
     );
 
@@ -411,6 +451,12 @@ app.openapi(createCatalogRoute, async (c) => {
       allowCustomTip: (row as any).allow_custom_tip ?? true,
       taxRate: parseFloat((row as any).tax_rate) || 0,
       layoutType: (row as any).layout_type || 'grid',
+      // Preorder settings
+      preorderEnabled: (row as any).preorder_enabled ?? false,
+      slug: (row as any).slug ?? null,
+      preorderPaymentMode: (row as any).preorder_payment_mode ?? 'both',
+      pickupInstructions: (row as any).pickup_instructions ?? null,
+      estimatedPrepTime: (row as any).estimated_prep_time ?? 10,
       productCount: 0,
       createdAt: row.created_at.toISOString(),
       updatedAt: row.updated_at.toISOString(),
@@ -534,6 +580,32 @@ app.openapi(updateCatalogRoute, async (c) => {
       values.push(body.layoutType);
       paramCount++;
     }
+    // Preorder settings
+    if (body.preorderEnabled !== undefined) {
+      updates.push(`preorder_enabled = $${paramCount}`);
+      values.push(body.preorderEnabled);
+      paramCount++;
+    }
+    if (body.slug !== undefined) {
+      updates.push(`slug = $${paramCount}`);
+      values.push(body.slug);
+      paramCount++;
+    }
+    if (body.preorderPaymentMode !== undefined) {
+      updates.push(`preorder_payment_mode = $${paramCount}`);
+      values.push(body.preorderPaymentMode);
+      paramCount++;
+    }
+    if (body.pickupInstructions !== undefined) {
+      updates.push(`pickup_instructions = $${paramCount}`);
+      values.push(body.pickupInstructions);
+      paramCount++;
+    }
+    if (body.estimatedPrepTime !== undefined) {
+      updates.push(`estimated_prep_time = $${paramCount}`);
+      values.push(body.estimatedPrepTime);
+      paramCount++;
+    }
 
     if (updates.length === 0) {
       return c.json({ error: 'No fields to update' }, 400);
@@ -562,6 +634,10 @@ app.openapi(updateCatalogRoute, async (c) => {
       catalogId: row.id,
       name: row.name,
     });
+    // Emit to public namespace for marketing site menu pages
+    socketService.emitToCatalog(row.id, SocketEvents.CATALOG_UPDATED, {
+      catalogId: row.id,
+    });
 
     return c.json({
       id: row.id,
@@ -576,6 +652,12 @@ app.openapi(updateCatalogRoute, async (c) => {
       allowCustomTip: (row as any).allow_custom_tip ?? true,
       taxRate: parseFloat((row as any).tax_rate) || 0,
       layoutType: (row as any).layout_type || 'grid',
+      // Preorder settings
+      preorderEnabled: (row as any).preorder_enabled ?? false,
+      slug: (row as any).slug ?? null,
+      preorderPaymentMode: (row as any).preorder_payment_mode ?? 'both',
+      pickupInstructions: (row as any).pickup_instructions ?? null,
+      estimatedPrepTime: (row as any).estimated_prep_time ?? 10,
       productCount: row.product_count || 0,
       createdAt: row.created_at.toISOString(),
       updatedAt: row.updated_at.toISOString(),
@@ -632,6 +714,10 @@ app.openapi(deleteCatalogRoute, async (c) => {
 
     // Emit socket event for real-time updates
     socketService.emitToOrganization(payload.organizationId, SocketEvents.CATALOG_DELETED, {
+      catalogId: id,
+    });
+    // Emit to public namespace for marketing site menu pages
+    socketService.emitToCatalog(id, SocketEvents.CATALOG_DELETED, {
       catalogId: id,
     });
 
@@ -866,6 +952,12 @@ app.openapi(duplicateCatalogRoute, async (c) => {
         allowCustomTip: (newCatalog as any).allow_custom_tip ?? true,
         taxRate: parseFloat((newCatalog as any).tax_rate) || 0,
         layoutType: (newCatalog as any).layout_type || 'grid',
+        // Preorder settings - defaults for duplicated catalog (not copied from original)
+        preorderEnabled: false,
+        slug: null,
+        preorderPaymentMode: 'both',
+        pickupInstructions: null,
+        estimatedPrepTime: 10,
         productCount: parseInt(productCountResult.rows[0].count) || 0,
         createdAt: newCatalog.created_at.toISOString(),
         updatedAt: newCatalog.updated_at.toISOString(),

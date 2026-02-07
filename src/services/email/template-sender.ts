@@ -430,3 +430,162 @@ ${qrSection}`;
     cta_text: 'View Event Details',
   });
 }
+
+// Helper to format ready time nicely
+function formatReadyTime(isoString: string): string {
+  const date = new Date(isoString);
+  const now = new Date();
+  const isToday = date.toDateString() === now.toDateString();
+
+  const timeOptions: Intl.DateTimeFormatOptions = {
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  };
+
+  const timeStr = date.toLocaleTimeString('en-US', timeOptions);
+
+  if (isToday) {
+    // Calculate minutes from now
+    const diffMs = date.getTime() - now.getTime();
+    const diffMins = Math.round(diffMs / 60000);
+
+    if (diffMins > 0 && diffMins <= 60) {
+      return `~${diffMins} minutes (${timeStr})`;
+    }
+    return `Today at ${timeStr}`;
+  }
+
+  // For other days, include the date
+  const dateOptions: Intl.DateTimeFormatOptions = {
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+  };
+  const dateStr = date.toLocaleDateString('en-US', dateOptions);
+  return `${dateStr} at ${timeStr}`;
+}
+
+// Preorder email functions
+export async function sendPreorderConfirmationEmail(to: string, preorderData: {
+  customerName: string;
+  orderNumber: string;
+  dailyNumber?: number;
+  catalogName: string;
+  items: { name: string; quantity: number; unitPrice: number }[];
+  subtotal: number;
+  taxAmount: number;
+  tipAmount: number;
+  totalAmount: number;
+  paymentType: 'pay_now' | 'pay_at_pickup';
+  estimatedReadyAt: string | null;
+  pickupInstructions: string | null;
+  trackingUrl: string;
+}): Promise<void> {
+  const itemsList = preorderData.items.map(item =>
+    `${item.quantity} × ${item.name} — $${item.unitPrice.toFixed(2)}`
+  ).join('<br>');
+
+  const tipLine = preorderData.tipAmount > 0
+    ? `<br>Tip: $${preorderData.tipAmount.toFixed(2)}`
+    : '';
+
+  const paymentStatusLine = preorderData.paymentType === 'pay_now'
+    ? '<br><span style="color: #10B981;">✓ Paid</span>'
+    : '<br><span style="color: #F59E0B;">Payment due at pickup</span>';
+
+  const estimatedTime = preorderData.estimatedReadyAt
+    ? `<br><strong>Estimated Ready:</strong> ${formatReadyTime(preorderData.estimatedReadyAt)}`
+    : '';
+
+  const pickupInfo = preorderData.pickupInstructions
+    ? `<br><br><strong>Pickup Instructions:</strong><br>${preorderData.pickupInstructions}`
+    : '';
+
+  const emailContent = `Hi ${preorderData.customerName},<br><br>
+Your pre-order has been received! Here are your order details:<br><br>
+<strong>Order #:</strong> ${preorderData.dailyNumber ? `#${preorderData.dailyNumber}` : preorderData.orderNumber}<br>
+<strong>Menu:</strong> ${preorderData.catalogName}${estimatedTime}<br><br>
+<strong>Items:</strong><br>
+${itemsList}<br><br>
+Subtotal: $${preorderData.subtotal.toFixed(2)}<br>
+Tax: $${preorderData.taxAmount.toFixed(2)}${tipLine}<br>
+<strong>Total: $${preorderData.totalAmount.toFixed(2)}</strong>${paymentStatusLine}${pickupInfo}<br><br>
+Track your order status in real-time using the button below. We'll also email you when your order is ready!`;
+
+  await sendTemplatedEmail(to, {
+    subject: `Pre-Order Confirmed - #${preorderData.dailyNumber || preorderData.orderNumber}`,
+    preheader_text: `Your pre-order #${preorderData.dailyNumber || preorderData.orderNumber} has been received`,
+    email_title: 'Pre-Order Confirmed!',
+    email_content: emailContent,
+    cta_url: preorderData.trackingUrl,
+    cta_text: 'Track Your Order',
+  });
+}
+
+export async function sendPreorderReadyEmail(to: string, preorderData: {
+  customerName: string;
+  orderNumber: string;
+  dailyNumber?: number;
+  catalogName: string;
+  totalAmount: number;
+  paymentType: 'pay_now' | 'pay_at_pickup';
+  pickupInstructions: string | null;
+  trackingUrl: string;
+}): Promise<void> {
+  const paymentReminder = preorderData.paymentType === 'pay_at_pickup'
+    ? `<br><br><strong>Payment:</strong> $${preorderData.totalAmount.toFixed(2)} due at pickup`
+    : '';
+
+  const pickupInfo = preorderData.pickupInstructions
+    ? `<br><br><strong>Pickup Instructions:</strong><br>${preorderData.pickupInstructions}`
+    : '';
+
+  const emailContent = `Hi ${preorderData.customerName},<br><br>
+Great news! Your pre-order is <strong>ready for pickup</strong>!<br><br>
+<strong>Order #:</strong> ${preorderData.dailyNumber ? `#${preorderData.dailyNumber}` : preorderData.orderNumber}<br>
+<strong>Menu:</strong> ${preorderData.catalogName}${paymentReminder}${pickupInfo}<br><br>
+Please come pick up your order at your earliest convenience. Show your order number or this email when you arrive.`;
+
+  await sendTemplatedEmail(to, {
+    subject: `Your Order #${preorderData.dailyNumber || preorderData.orderNumber} is Ready! 🎉`,
+    preheader_text: `Your pre-order is ready for pickup`,
+    email_title: 'Your Order is Ready!',
+    email_content: emailContent,
+    cta_url: preorderData.trackingUrl,
+    cta_text: 'View Order',
+  });
+}
+
+export async function sendPreorderCancelledEmail(to: string, preorderData: {
+  customerName: string;
+  orderNumber: string;
+  dailyNumber?: number;
+  catalogName: string;
+  totalAmount: number;
+  paymentType: 'pay_now' | 'pay_at_pickup';
+  refundIssued: boolean;
+  cancellationReason?: string;
+}): Promise<void> {
+  const reasonLine = preorderData.cancellationReason
+    ? `<br><strong>Reason:</strong> ${preorderData.cancellationReason}`
+    : '';
+
+  const refundInfo = preorderData.paymentType === 'pay_now' && preorderData.refundIssued
+    ? `<br><br>A refund of <strong>$${preorderData.totalAmount.toFixed(2)}</strong> has been issued to your original payment method. Please allow 5-10 business days for the refund to appear on your statement.`
+    : '';
+
+  const emailContent = `Hi ${preorderData.customerName},<br><br>
+Your pre-order has been cancelled.<br><br>
+<strong>Order #:</strong> ${preorderData.dailyNumber ? `#${preorderData.dailyNumber}` : preorderData.orderNumber}<br>
+<strong>Menu:</strong> ${preorderData.catalogName}${reasonLine}${refundInfo}<br><br>
+If you have any questions about this cancellation, please contact the vendor directly.<br><br>
+We hope to serve you again soon!`;
+
+  await sendTemplatedEmail(to, {
+    subject: `Pre-Order #${preorderData.dailyNumber || preorderData.orderNumber} Cancelled`,
+    preheader_text: `Your pre-order has been cancelled`,
+    email_title: 'Order Cancelled',
+    email_content: emailContent,
+  });
+}

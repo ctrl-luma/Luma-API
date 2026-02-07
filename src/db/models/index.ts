@@ -109,6 +109,7 @@ export interface AuditLog {
 }
 
 export type CatalogLayoutType = 'grid' | 'list' | 'large-grid' | 'compact';
+export type PreorderPaymentMode = 'pay_now' | 'pay_at_pickup' | 'both';
 
 export interface Catalog {
   id: string;
@@ -120,6 +121,12 @@ export interface Catalog {
   is_active: boolean;
   show_tip_screen: boolean;
   layout_type: CatalogLayoutType; // Controls product display layout in mobile app
+  // Preorder settings
+  preorder_enabled: boolean;
+  slug: string | null;
+  preorder_payment_mode: PreorderPaymentMode;
+  pickup_instructions: string | null;
+  estimated_prep_time: number;
   created_at: Date;
   updated_at: Date;
 }
@@ -361,6 +368,58 @@ export interface TicketLock {
   quantity: number;
   session_id: string;
   expires_at: Date;
+  created_at: Date;
+}
+
+// Preorders (skip-the-line ordering from public menu)
+export type PreorderStatus = 'pending' | 'preparing' | 'ready' | 'picked_up' | 'cancelled';
+export type PreorderPaymentType = 'pay_now' | 'pay_at_pickup';
+
+export interface Preorder {
+  id: string;
+  organization_id: string;
+  catalog_id: string;
+  order_number: string;
+  // Customer info
+  customer_name: string;
+  customer_email: string;
+  customer_phone: string | null;
+  // Payment
+  payment_type: PreorderPaymentType;
+  subtotal: number; // In dollars (DECIMAL)
+  tax_amount: number;
+  tip_amount: number;
+  total_amount: number;
+  // Stripe (for pay_now)
+  stripe_payment_intent_id: string | null;
+  stripe_charge_id: string | null;
+  platform_fee_cents: number;
+  // Status
+  status: PreorderStatus;
+  estimated_ready_at: Date | null;
+  ready_at: Date | null;
+  picked_up_at: Date | null;
+  picked_up_by: string | null;
+  // Notes
+  order_notes: string | null;
+  internal_notes: string | null;
+  // Tracking
+  session_id: string | null;
+  customer_ip: string | null;
+  // Timestamps
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface PreorderItem {
+  id: string;
+  preorder_id: string;
+  catalog_product_id: string;
+  product_id: string;
+  name: string;
+  unit_price: number; // In dollars (DECIMAL)
+  quantity: number;
+  notes: string | null;
   created_at: Date;
 }
 

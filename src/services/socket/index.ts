@@ -39,8 +39,8 @@ export class SocketService {
       logger.debug('Public socket connected', { socketId: socket.id });
 
       socket.on('join', (room: string) => {
-        // Only allow joining event-specific or public rooms
-        if (room === 'events:public' || room.startsWith('event:')) {
+        // Only allow joining event-specific, preorder-specific, catalog-specific, or public rooms
+        if (room === 'events:public' || room.startsWith('event:') || room.startsWith('preorder:') || room.startsWith('catalog:')) {
           socket.join(room);
           logger.debug('Public socket joined room', { socketId: socket.id, room });
         }
@@ -100,8 +100,17 @@ export class SocketService {
 
       this.connectedUsers.set(socket.id, user);
 
-      socket.join(`org:${user.organizationId}`);
-      socket.join(`user:${user.userId}`);
+      const orgRoom = `org:${user.organizationId}`;
+      const userRoom = `user:${user.userId}`;
+      socket.join(orgRoom);
+      socket.join(userRoom);
+
+      logger.info('[SOCKET DEBUG] User joined rooms', {
+        socketId: socket.id,
+        userId: user.userId,
+        organizationId: user.organizationId,
+        joinedRooms: [orgRoom, userRoom],
+      });
 
       socket.on('join:event', (eventId: string) => {
         socket.join(`event:${eventId}`);
@@ -162,14 +171,28 @@ export class SocketService {
     const socketsInRoom = this.io.sockets.adapter.rooms.get(room);
     const socketCount = socketsInRoom?.size || 0;
 
+    // Log all available rooms for debugging
+    const allRooms = Array.from(this.io.sockets.adapter.rooms.keys()).filter(r => r.startsWith('org:'));
+    logger.info('[SOCKET DEBUG] Available org rooms', { allOrgRooms: allRooms });
+
     this.io.to(room).emit(event, data);
     logger.info('Emitted to organization', {
       organizationId,
       event,
       room,
       connectedSockets: socketCount,
+      roomExists: socketsInRoom !== undefined,
       data
     });
+
+    // If no sockets in room, log this as a warning
+    if (socketCount === 0) {
+      logger.warn('[SOCKET DEBUG] No connected sockets in target room!', {
+        targetRoom: room,
+        availableOrgRooms: allRooms,
+        totalConnectedUsers: this.connectedUsers.size,
+      });
+    }
   }
 
   emitToEvent(eventId: string, event: string, data: any) {
@@ -180,6 +203,20 @@ export class SocketService {
     this.io.of('/public').to(`event:${eventId}`).emit(event, data);
     this.io.of('/public').to('events:public').emit(event, data);
     logger.debug('Emitted to event', { eventId, event });
+  }
+
+  emitToPreorder(preorderId: string, event: string, data: any) {
+    if (!this.io) return;
+    // Emit to public namespace for customer tracking their preorder
+    this.io.of('/public').to(`preorder:${preorderId}`).emit(event, data);
+    logger.debug('Emitted to preorder', { preorderId, event });
+  }
+
+  emitToCatalog(catalogId: string, event: string, data: any) {
+    if (!this.io) return;
+    // Emit to public namespace for marketing site menu pages
+    this.io.of('/public').to(`catalog:${catalogId}`).emit(event, data);
+    logger.debug('Emitted to catalog (public)', { catalogId, event });
   }
 
   emitToUser(userId: string, event: string, data: any) {
@@ -279,4 +316,10 @@ export const SocketEvents = {
   TICKET_PURCHASED: 'ticket:purchased',
   TICKET_SCANNED: 'ticket:scanned',
   TICKET_REFUNDED: 'ticket:refunded',
+  // Preorder events
+  PREORDER_CREATED: 'preorder:created',
+  PREORDER_UPDATED: 'preorder:updated',
+  PREORDER_READY: 'preorder:ready',
+  PREORDER_COMPLETED: 'preorder:completed',
+  PREORDER_CANCELLED: 'preorder:cancelled',
 } as const;

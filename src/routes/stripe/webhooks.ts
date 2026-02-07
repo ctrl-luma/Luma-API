@@ -172,6 +172,13 @@ async function handlePaymentIntentSucceeded(paymentIntent: any) {
     applicationFeeAmount: paymentIntent.application_fee_amount,
   });
 
+  // Check if this is a preorder payment
+  if (paymentIntent.metadata?.type === 'preorder') {
+    logger.info('[WEBHOOK DEBUG] Detected preorder payment, handling as preorder');
+    await handlePreorderPaymentSucceeded(paymentIntent);
+    return;
+  }
+
   await transaction(async (client) => {
     logger.info('[WEBHOOK DEBUG] Looking for order with stripe_payment_intent_id', {
       paymentIntentId: paymentIntent.id,
@@ -256,7 +263,113 @@ async function handlePaymentIntentSucceeded(paymentIntent: any) {
   logger.info('[WEBHOOK DEBUG] ========== handlePaymentIntentSucceeded END ==========');
 }
 
+async function handlePreorderPaymentSucceeded(paymentIntent: any) {
+  logger.info('[WEBHOOK DEBUG] ========== handlePreorderPaymentSucceeded START ==========');
+
+  const preorderId = paymentIntent.metadata?.preorder_id;
+  const preorderNumber = paymentIntent.metadata?.preorder_number;
+
+  logger.info('[WEBHOOK DEBUG] Preorder payment details', {
+    preorderId,
+    preorderNumber,
+    paymentIntentId: paymentIntent.id,
+    chargeId: paymentIntent.latest_charge,
+  });
+
+  await transaction(async (client) => {
+    // Update preorder with charge ID (payment already confirmed at creation)
+    const result = await client.query(
+      `UPDATE preorders
+       SET stripe_charge_id = $1,
+           updated_at = NOW()
+       WHERE stripe_payment_intent_id = $2
+       RETURNING id, organization_id, order_number, total_amount, status, customer_name, customer_email`,
+      [paymentIntent.latest_charge, paymentIntent.id]
+    );
+
+    logger.info('[WEBHOOK DEBUG] Preorder update result', {
+      rowsUpdated: result.rowCount,
+      updatedPreorder: result.rows[0] || null,
+    });
+
+    if (result.rows.length > 0) {
+      const preorder = result.rows[0];
+      logger.info('[WEBHOOK DEBUG] Preorder updated successfully, emitting socket events', {
+        preorderId: preorder.id,
+        organizationId: preorder.organization_id,
+        orderNumber: preorder.order_number,
+        totalAmount: preorder.total_amount,
+        newStatus: preorder.status,
+      });
+
+      // Emit socket event for real-time updates
+      socketService.emitToOrganization(preorder.organization_id, SocketEvents.PREORDER_UPDATED, {
+        preorderId: preorder.id,
+        orderNumber: preorder.order_number,
+        status: preorder.status,
+        totalAmount: parseFloat(preorder.total_amount),
+        customerName: preorder.customer_name,
+        timestamp: new Date(),
+      });
+
+      logger.info('[WEBHOOK DEBUG] Preorder socket events emitted successfully');
+    } else {
+      // Try to find by preorder_id from metadata if payment_intent lookup failed
+      if (preorderId) {
+        logger.info('[WEBHOOK DEBUG] Trying to find preorder by ID from metadata', { preorderId });
+
+        const fallbackResult = await client.query(
+          `UPDATE preorders
+           SET stripe_charge_id = $1,
+               stripe_payment_intent_id = $2,
+               updated_at = NOW()
+           WHERE id = $3
+           RETURNING id, organization_id, order_number, total_amount, status, customer_name`,
+          [paymentIntent.latest_charge, paymentIntent.id, preorderId]
+        );
+
+        if (fallbackResult.rows.length > 0) {
+          const preorder = fallbackResult.rows[0];
+          logger.info('[WEBHOOK DEBUG] Preorder found and updated via fallback', {
+            preorderId: preorder.id,
+            orderNumber: preorder.order_number,
+          });
+
+          socketService.emitToOrganization(preorder.organization_id, SocketEvents.PREORDER_UPDATED, {
+            preorderId: preorder.id,
+            orderNumber: preorder.order_number,
+            status: preorder.status,
+            totalAmount: parseFloat(preorder.total_amount),
+            customerName: preorder.customer_name,
+            timestamp: new Date(),
+          });
+        } else {
+          logger.warn('[WEBHOOK DEBUG] Preorder not found even with fallback!', {
+            preorderId,
+            preorderNumber,
+            paymentIntentId: paymentIntent.id,
+          });
+        }
+      } else {
+        logger.warn('[WEBHOOK DEBUG] No preorder found and no preorder_id in metadata', {
+          paymentIntentId: paymentIntent.id,
+          metadata: paymentIntent.metadata,
+        });
+      }
+    }
+  });
+
+  logger.info('[WEBHOOK DEBUG] ========== handlePreorderPaymentSucceeded END ==========');
+}
+
 async function handlePaymentIntentFailed(paymentIntent: any) {
+  // Check if this is a preorder payment
+  if (paymentIntent.metadata?.type === 'preorder') {
+    logger.info('[WEBHOOK DEBUG] Detected failed preorder payment');
+    await handlePreorderPaymentFailed(paymentIntent);
+    return;
+  }
+
   await transaction(async (client) => {
     const result = await client.query(
       `UPDATE orders
@@ -285,11 +398,49 @@ async function handlePaymentIntentFailed(paymentIntent: any) {
   });
 }
 
+async function handlePreorderPaymentFailed(paymentIntent: any) {
+  logger.info('[WEBHOOK DEBUG] ========== handlePreorderPaymentFailed START ==========');
+
+  await transaction(async (client) => {
+    const result = await client.query(
+      `UPDATE preorders
+       SET status = 'cancelled',
+           updated_at = NOW()
+       WHERE stripe_payment_intent_id = $1
+       RETURNING id, organization_id, order_number, customer_name`,
+      [paymentIntent.id]
+    );
+
+    if (result.rows.length > 0) {
+      const preorder = result.rows[0];
+      logger.info('[WEBHOOK DEBUG] Preorder marked as cancelled due to payment failure', {
+        preorderId: preorder.id,
+        orderNumber: preorder.order_number,
+      });
+
+      socketService.emitToOrganization(preorder.organization_id, SocketEvents.PREORDER_CANCELLED, {
+        preorderId: preorder.id,
+        orderNumber: preorder.order_number,
+        reason: paymentIntent.last_payment_error?.message || 'Payment failed',
+        timestamp: new Date(),
+      });
+    }
+
+    logger.info('[WEBHOOK DEBUG] Preorder payment failed', {
+      paymentIntentId: paymentIntent.id,
+      error: paymentIntent.last_payment_error,
+    });
+  });
+
+  logger.info('[WEBHOOK DEBUG] ========== handlePreorderPaymentFailed END ==========');
+}
+
 async function handleChargeRefunded(charge: any) {
   const refundAmount = charge.amount_refunded / 100;
 
   await transaction(async (client) => {
-    const result = await client.query(
+    // First try to find in orders table
+    const orderResult = await client.query(
       `UPDATE orders
        SET status = 'refunded',
            updated_at = NOW()
@@ -298,8 +449,8 @@ async function handleChargeRefunded(charge: any) {
       [charge.id]
     );
 
-    if (result.rows.length > 0) {
-      const order = result.rows[0];
+    if (orderResult.rows.length > 0) {
+      const order = orderResult.rows[0];
 
       // Emit socket event for real-time updates
       socketService.emitToOrganization(order.organization_id, SocketEvents.ORDER_REFUNDED, {
@@ -309,11 +460,46 @@ async function handleChargeRefunded(charge: any) {
         timestamp: new Date(),
       });
 
-      logger.info('Charge refunded', {
+      logger.info('Charge refunded (order)', {
         chargeId: charge.id,
         orderId: order.id,
         refundAmount,
         partialRefund: refundAmount < order.total_amount,
+      });
+      return;
+    }
+
+    // If not found in orders, try preorders
+    const preorderResult = await client.query(
+      `UPDATE preorders
+       SET status = 'cancelled',
+           updated_at = NOW()
+       WHERE stripe_charge_id = $1
+       RETURNING id, organization_id, order_number, total_amount, customer_name`,
+      [charge.id]
+    );
+
+    if (preorderResult.rows.length > 0) {
+      const preorder = preorderResult.rows[0];
+
+      socketService.emitToOrganization(preorder.organization_id, SocketEvents.PREORDER_CANCELLED, {
+        preorderId: preorder.id,
+        orderNumber: preorder.order_number,
+        reason: 'Payment refunded',
+        refundAmount,
+        timestamp: new Date(),
+      });
+
+      logger.info('Charge refunded (preorder)', {
+        chargeId: charge.id,
+        preorderId: preorder.id,
+        orderNumber: preorder.order_number,
+        refundAmount,
+      });
+    } else {
+      logger.warn('Charge refunded but no matching order or preorder found', {
+        chargeId: charge.id,
+        refundAmount,
       });
     }
   });
