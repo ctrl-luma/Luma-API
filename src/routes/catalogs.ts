@@ -397,6 +397,13 @@ app.openapi(createCatalogRoute, async (c) => {
             code: 'CATALOG_LIMIT_REACHED'
           }, 403);
         }
+        // Starter tier cannot enable preorders
+        if (body.preorderEnabled) {
+          return c.json({
+            error: 'Preorders require a Pro subscription',
+            code: 'PRO_REQUIRED'
+          }, 403);
+        }
       }
     }
 
@@ -580,7 +587,20 @@ app.openapi(updateCatalogRoute, async (c) => {
       values.push(body.layoutType);
       paramCount++;
     }
-    // Preorder settings
+    // Preorder settings — Pro subscription required to enable
+    if (body.preorderEnabled === true) {
+      const subRows = await query<{ tier: string }>(
+        `SELECT tier FROM subscriptions WHERE organization_id = $1 AND status IN ('active', 'trialing') LIMIT 1`,
+        [payload.organizationId]
+      );
+      const tier = subRows[0]?.tier || 'starter';
+      if (tier === 'starter' || tier === 'free') {
+        return c.json({
+          error: 'Preorders require a Pro subscription',
+          code: 'PRO_REQUIRED'
+        }, 403);
+      }
+    }
     if (body.preorderEnabled !== undefined) {
       updates.push(`preorder_enabled = $${paramCount}`);
       values.push(body.preorderEnabled);

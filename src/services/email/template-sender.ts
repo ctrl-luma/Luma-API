@@ -571,21 +571,27 @@ export async function sendPreorderCancelledEmail(to: string, preorderData: {
     ? `<br><strong>Reason:</strong> ${preorderData.cancellationReason}`
     : '';
 
-  const refundInfo = preorderData.paymentType === 'pay_now' && preorderData.refundIssued
+  const isRefund = preorderData.refundIssued;
+
+  const refundInfo = isRefund
     ? `<br><br>A refund of <strong>$${preorderData.totalAmount.toFixed(2)}</strong> has been issued to your original payment method. Please allow 5-10 business days for the refund to appear on your statement.`
     : '';
 
+  const titleText = isRefund ? 'Order Refunded' : 'Order Cancelled';
+  const bodyText = isRefund ? 'Your pre-order has been refunded.' : 'Your pre-order has been cancelled.';
+  const contactText = isRefund ? 'this refund' : 'this cancellation';
+
   const emailContent = `Hi ${preorderData.customerName},<br><br>
-Your pre-order has been cancelled.<br><br>
+${bodyText}<br><br>
 <strong>Order #:</strong> ${preorderData.dailyNumber ? `#${preorderData.dailyNumber}` : preorderData.orderNumber}<br>
 <strong>Menu:</strong> ${preorderData.catalogName}${reasonLine}${refundInfo}<br><br>
-If you have any questions about this cancellation, please contact the vendor directly.<br><br>
+If you have any questions about ${contactText}, please contact the vendor directly.<br><br>
 We hope to serve you again soon!`;
 
   await sendTemplatedEmail(to, {
-    subject: `Pre-Order #${preorderData.dailyNumber || preorderData.orderNumber} Cancelled`,
-    preheader_text: `Your pre-order has been cancelled`,
-    email_title: 'Order Cancelled',
+    subject: `Pre-Order #${preorderData.dailyNumber || preorderData.orderNumber} ${isRefund ? 'Refunded' : 'Cancelled'}`,
+    preheader_text: bodyText,
+    email_title: titleText,
     email_content: emailContent,
   });
 }

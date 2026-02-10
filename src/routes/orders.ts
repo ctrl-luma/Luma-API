@@ -242,10 +242,6 @@ app.openapi(createOrderRoute, async (c) => {
       deviceId: result.order.device_id,
     };
     socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_CREATED, orderEventData);
-    // Also emit to device if specified
-    if (result.order.device_id) {
-      socketService.emitToDevice(result.order.device_id, SocketEvents.ORDER_CREATED, orderEventData);
-    }
 
     return c.json({
       id: result.order.id,
@@ -869,9 +865,6 @@ app.openapi(holdOrderRoute, async (c) => {
       data: holdEventData,
     });
     socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_UPDATED, holdEventData);
-    if (order.device_id) {
-      socketService.emitToDevice(order.device_id, SocketEvents.ORDER_UPDATED, holdEventData);
-    }
 
     return c.json({
       id: order.id,
@@ -1043,9 +1036,6 @@ app.openapi(resumeOrderRoute, async (c) => {
       data: resumeEventData,
     });
     socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_UPDATED, resumeEventData);
-    if (order.device_id) {
-      socketService.emitToDevice(order.device_id, SocketEvents.ORDER_UPDATED, resumeEventData);
-    }
 
     return c.json({
       id: order.id,
@@ -1209,9 +1199,6 @@ app.openapi(completeCashPaymentRoute, async (c) => {
       deviceId: updatedOrder.device_id,
     };
     socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_COMPLETED, cashCompleteEventData);
-    if (updatedOrder.device_id) {
-      socketService.emitToDevice(updatedOrder.device_id, SocketEvents.ORDER_COMPLETED, cashCompleteEventData);
-    }
 
     return c.json({
       order: {
@@ -1395,9 +1382,6 @@ app.openapi(addPaymentRoute, async (c) => {
         deviceId: order.device_id,
       };
       socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_COMPLETED, splitCompleteEventData);
-      if (order.device_id) {
-        socketService.emitToDevice(order.device_id, SocketEvents.ORDER_COMPLETED, splitCompleteEventData);
-      }
     }
 
     logger.info('Payment added to order', {
@@ -1592,9 +1576,6 @@ app.openapi(cancelOrderRoute, async (c) => {
       data: deleteEventData,
     });
     socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_DELETED, deleteEventData);
-    if (order.device_id) {
-      socketService.emitToDevice(order.device_id, SocketEvents.ORDER_DELETED, deleteEventData);
-    }
 
     return c.json({ success: true, message: 'Order cancelled' });
   } catch (error: any) {

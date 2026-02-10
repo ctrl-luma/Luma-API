@@ -1110,7 +1110,7 @@ const listTransactionsRoute = createRoute({
               amount: z.number(),
               amountRefunded: z.number(),
               currency: z.string(),
-              status: z.enum(['succeeded', 'pending', 'failed', 'refunded', 'partially_refunded']),
+              status: z.enum(['succeeded', 'pending', 'failed', 'refunded', 'partially_refunded', 'cancelled']),
               description: z.string().nullable(),
               customerEmail: z.string().nullable(),
               customerName: z.string().nullable(),
@@ -1158,13 +1158,6 @@ app.openapi(listTransactionsRoute, async (c) => {
     const { authService } = await import('../../services/auth');
     const payload = await authService.verifyToken(token);
 
-    // Get connected account (optional — needed for Stripe charge enrichment only)
-    const accountRows = await query<StripeConnectedAccount>(
-      'SELECT * FROM stripe_connected_accounts WHERE organization_id = $1',
-      [payload.organizationId]
-    );
-    const connectedAccount = accountRows.length > 0 ? accountRows[0] : null;
-
     const queryParams = c.req.query();
     const source = (queryParams.source || 'all') as string;
     const catalogIdFilter = queryParams.catalog_id || null;
@@ -1181,23 +1174,28 @@ app.openapi(listTransactionsRoute, async (c) => {
     const statusFilter = queryParams.status || 'all';
     const startingAfter = queryParams.starting_after || null;
 
-    // Resolve cursor for keyset pagination (used by mobile app's infinite scroll)
-    let cursorCreatedAt: Date | null = null;
-    if (startingAfter && !queryParams.offset) {
-      const cursorResult = await query<{ created_at: Date }>(
-        `SELECT created_at FROM (
-          SELECT id, created_at FROM orders WHERE organization_id = $1 AND id = $2
-          UNION ALL
-          SELECT id, created_at FROM preorders WHERE organization_id = $1 AND id = $2
-          UNION ALL
-          SELECT id, purchased_at as created_at FROM tickets WHERE organization_id = $1 AND id = $2
-        ) as cursor_lookup LIMIT 1`,
-        [payload.organizationId, startingAfter]
-      );
-      if (cursorResult.length > 0) {
-        cursorCreatedAt = cursorResult[0].created_at;
-      }
-    }
+    // Run connected account fetch + cursor resolution in parallel
+    const needsCursor = !!(startingAfter && !queryParams.offset);
+    const [accountRows, cursorResult] = await Promise.all([
+      query<StripeConnectedAccount>(
+        'SELECT * FROM stripe_connected_accounts WHERE organization_id = $1',
+        [payload.organizationId]
+      ),
+      needsCursor
+        ? query<{ created_at: Date }>(
+            `SELECT created_at FROM (
+              SELECT id, created_at FROM orders WHERE organization_id = $1 AND id = $2
+              UNION ALL
+              SELECT id, created_at FROM preorders WHERE organization_id = $1 AND id = $2
+              UNION ALL
+              SELECT id, purchased_at as created_at FROM tickets WHERE organization_id = $1 AND id = $2
+            ) as cursor_lookup LIMIT 1`,
+            [payload.organizationId, startingAfter]
+          )
+        : Promise.resolve([]),
+    ]);
+    const connectedAccount = accountRows.length > 0 ? accountRows[0] : null;
+    const cursorCreatedAt: Date | null = cursorResult.length > 0 ? cursorResult[0].created_at : null;
 
     // Build UNION ALL query across orders, preorders, and tickets
     const includeOrders = source === 'all' || source === 'orders';
@@ -1256,9 +1254,9 @@ app.openapi(listTransactionsRoute, async (c) => {
     if (includePreorders && statusFilter !== 'failed') {
       const conds: string[] = ['p.organization_id = $1'];
       if (statusFilter === 'succeeded') conds.push("p.status = 'picked_up'");
-      else if (statusFilter === 'refunded') conds.push("p.status = 'cancelled' AND p.payment_type = 'pay_now'");
+      else if (statusFilter === 'refunded') conds.push("p.status = 'cancelled' AND p.stripe_charge_id IS NOT NULL");
       else if (statusFilter === 'pending') conds.push("p.status IN ('pending', 'preparing', 'ready')");
-      else if (statusFilter === 'cancelled') conds.push("p.status = 'cancelled'");
+      else if (statusFilter === 'cancelled') conds.push("p.status = 'cancelled' AND p.stripe_charge_id IS NULL");
       if (catalogIdFilter) conds.push(`p.catalog_id = ${addParam(catalogIdFilter)}`);
       if (customerEmailFilter) conds.push(`LOWER(p.customer_email) LIKE ${addParam(`%${customerEmailFilter}%`)}`);
       if (dateFrom) conds.push(`p.created_at >= to_timestamp(${addParam(dateFrom)})`);
@@ -1372,78 +1370,81 @@ app.openapi(listTransactionsRoute, async (c) => {
     const hasMore = requestedOffset + unifiedRows.length < total;
     const orders = unifiedRows;
 
-    // Batch-fetch Stripe charge details for rows that have stripe_charge_id
+    // Batch-fetch Stripe charge details and order_payments lookups in parallel
     const chargeIds = [...new Set(
       orders.map(o => o.stripe_charge_id).filter((id): id is string => id !== null)
     )];
+    const ordersNeedingPaymentLookup = connectedAccount
+      ? orders.filter(o => o.source_type === 'order' && !o.stripe_charge_id && (o.payment_method === 'split' || o.payment_method === 'card'))
+      : [];
 
     const chargeMap = new Map<string, Stripe.Charge>();
-    // Also map order ID → charge for POS orders where charge comes from order_payments
     const orderChargeMap = new Map<string, Stripe.Charge>();
 
-    if (chargeIds.length > 0 && connectedAccount) {
-      try {
-        const chargePromises = chargeIds.map(id =>
-          stripeService.retrieveConnectedAccountCharge(
-            connectedAccount.stripe_account_id,
-            id
-          ).catch(err => {
-            logger.warn('Failed to fetch Stripe charge', { chargeId: id, error: err.message });
-            return null;
-          })
-        );
-        const charges = await Promise.all(chargePromises);
-        charges.forEach((charge) => {
-          if (charge) chargeMap.set(charge.id, charge);
-        });
-      } catch (err) {
-        logger.warn('Failed to batch-fetch Stripe charges', { error: err });
-      }
-    }
-
-    // For POS order rows without stripe_charge_id (split/card), look up from order_payments
-    if (connectedAccount) {
-      const ordersNeedingPaymentLookup = orders.filter(
-        o => o.source_type === 'order' && !o.stripe_charge_id && (o.payment_method === 'split' || o.payment_method === 'card')
-      );
-
-      if (ordersNeedingPaymentLookup.length > 0) {
-        try {
-          const orderIds = ordersNeedingPaymentLookup.map(o => o.id);
-          const paymentRows = await query<{
-            order_id: string;
-            stripe_payment_intent_id: string;
-          }>(
-            `SELECT order_id, stripe_payment_intent_id FROM order_payments
-             WHERE order_id = ANY($1) AND stripe_payment_intent_id IS NOT NULL
-             AND payment_method IN ('card', 'tap_to_pay')`,
-            [orderIds]
-          );
-
-          const piPromises = paymentRows.map(async (row) => {
-            try {
-              const pi = await stripe.paymentIntents.retrieve(
-                row.stripe_payment_intent_id,
-                { stripeAccount: connectedAccount!.stripe_account_id }
-              );
-              if (pi.latest_charge) {
-                const chargeId = typeof pi.latest_charge === 'string' ? pi.latest_charge : pi.latest_charge.id;
-                const charge = await stripeService.retrieveConnectedAccountCharge(
-                  connectedAccount!.stripe_account_id,
-                  chargeId
-                );
-                if (charge) orderChargeMap.set(row.order_id, charge);
-              }
-            } catch (err: any) {
-              logger.warn('Failed to fetch charge from order_payment', { orderId: row.order_id, error: err.message });
-            }
-          });
-          await Promise.all(piPromises);
-        } catch (err) {
-          logger.warn('Failed to lookup order_payments charges', { error: err });
+    // Run both enrichment paths in parallel (they're independent)
+    await Promise.all([
+      // Path 1: Direct charge lookups
+      (async () => {
+        if (chargeIds.length > 0 && connectedAccount) {
+          try {
+            const charges = await Promise.all(
+              chargeIds.map(id =>
+                stripeService.retrieveConnectedAccountCharge(
+                  connectedAccount.stripe_account_id,
+                  id
+                ).catch(err => {
+                  logger.warn('Failed to fetch Stripe charge', { chargeId: id, error: err.message });
+                  return null;
+                })
+              )
+            );
+            charges.forEach((charge) => {
+              if (charge) chargeMap.set(charge.id, charge);
+            });
+          } catch (err) {
+            logger.warn('Failed to batch-fetch Stripe charges', { error: err });
+          }
         }
-      }
-    }
+      })(),
+      // Path 2: Order payments → PaymentIntent → Charge lookups
+      (async () => {
+        if (ordersNeedingPaymentLookup.length > 0 && connectedAccount) {
+          try {
+            const orderIds = ordersNeedingPaymentLookup.map(o => o.id);
+            const paymentRows = await query<{
+              order_id: string;
+              stripe_payment_intent_id: string;
+            }>(
+              `SELECT order_id, stripe_payment_intent_id FROM order_payments
+               WHERE order_id = ANY($1) AND stripe_payment_intent_id IS NOT NULL
+               AND payment_method IN ('card', 'tap_to_pay')`,
+              [orderIds]
+            );
+
+            await Promise.all(paymentRows.map(async (row) => {
+              try {
+                const pi = await stripe.paymentIntents.retrieve(
+                  row.stripe_payment_intent_id,
+                  { stripeAccount: connectedAccount!.stripe_account_id }
+                );
+                if (pi.latest_charge) {
+                  const chargeId = typeof pi.latest_charge === 'string' ? pi.latest_charge : pi.latest_charge.id;
+                  const charge = await stripeService.retrieveConnectedAccountCharge(
+                    connectedAccount!.stripe_account_id,
+                    chargeId
+                  );
+                  if (charge) orderChargeMap.set(row.order_id, charge);
+                }
+              } catch (err: any) {
+                logger.warn('Failed to fetch charge from order_payment', { orderId: row.order_id, error: err.message });
+              }
+            }));
+          } catch (err) {
+            logger.warn('Failed to lookup order_payments charges', { error: err });
+          }
+        }
+      })(),
+    ]);
 
     // Format response: merge DB data with Stripe charge details
     const formattedTransactions = orders.map((order) => {
@@ -1453,7 +1454,7 @@ app.openapi(listTransactionsRoute, async (c) => {
       const totalAmount = Math.round(parseFloat(order.total_amount) * 100);
 
       // Determine status based on source type
-      let status: 'succeeded' | 'pending' | 'failed' | 'refunded' | 'partially_refunded' = 'succeeded';
+      let status: 'succeeded' | 'pending' | 'failed' | 'refunded' | 'partially_refunded' | 'cancelled' = 'succeeded';
       if (order.source_type === 'order') {
         if (order.raw_status === 'failed') status = 'failed';
         else if (order.raw_status === 'refunded') status = 'refunded';
@@ -1464,7 +1465,10 @@ app.openapi(listTransactionsRoute, async (c) => {
         }
       } else if (order.source_type === 'preorder') {
         if (order.raw_status === 'picked_up') status = 'succeeded';
-        else if (order.raw_status === 'cancelled') status = 'refunded';
+        else if (order.raw_status === 'cancelled') {
+          // 'refunded' if payment was collected (has a stripe charge), regardless of payment type
+          status = order.stripe_charge_id ? 'refunded' : 'cancelled';
+        }
         else status = 'pending';
       } else {
         // ticket
@@ -1781,7 +1785,10 @@ app.openapi(getTransactionRoute, async (c) => {
 
       let preorderStatus: string = 'succeeded';
       if (preorder.status === 'picked_up') preorderStatus = 'succeeded';
-      else if (preorder.status === 'cancelled') preorderStatus = 'refunded';
+      else if (preorder.status === 'cancelled') {
+        // 'refunded' if payment was collected (has a stripe charge), regardless of payment type
+        preorderStatus = preorder.stripe_charge_id ? 'refunded' : 'cancelled';
+      }
       else preorderStatus = 'pending';
 
       // Fetch Stripe charge if available
@@ -2181,10 +2188,10 @@ app.openapi(refundTransactionRoute, async (c) => {
     if (orderLookup.length === 0) {
       const preorderLookup = await query<{
         id: string; order_number: string; daily_number: number | null; stripe_charge_id: string | null;
-        payment_type: string; total_amount: string; status: string;
+        stripe_payment_intent_id: string | null; payment_type: string; total_amount: string; status: string;
         customer_name: string; customer_email: string; catalog_id: string;
       }>(
-        'SELECT id, order_number, daily_number, stripe_charge_id, payment_type, total_amount, status, customer_name, customer_email, catalog_id FROM preorders WHERE id = $1 AND organization_id = $2',
+        'SELECT id, order_number, daily_number, stripe_charge_id, stripe_payment_intent_id, payment_type, total_amount, status, customer_name, customer_email, catalog_id FROM preorders WHERE id = $1 AND organization_id = $2',
         [transactionId, payload.organizationId]
       );
 
@@ -2324,8 +2331,33 @@ app.openapi(refundTransactionRoute, async (c) => {
         [preorder.catalog_id]
       );
 
-      if (!preorder.stripe_charge_id) {
-        // Pay-at-pickup preorder with no charge — just mark cancelled
+      // Resolve the charge ID — may need to look up from payment intent
+      let chargeId = preorder.stripe_charge_id;
+      if (!chargeId && preorder.stripe_payment_intent_id) {
+        try {
+          const pi = await stripe.paymentIntents.retrieve(
+            preorder.stripe_payment_intent_id,
+            { stripeAccount: connectedAccount.stripe_account_id }
+          );
+          if (pi.latest_charge) {
+            chargeId = typeof pi.latest_charge === 'string' ? pi.latest_charge : pi.latest_charge.id;
+            // Backfill stripe_charge_id for future lookups
+            await query(
+              `UPDATE preorders SET stripe_charge_id = $1 WHERE id = $2`,
+              [chargeId, preorder.id]
+            );
+          }
+        } catch (err) {
+          logger.warn('Failed to retrieve charge from payment intent for preorder refund', {
+            preorderId: preorder.id,
+            paymentIntentId: preorder.stripe_payment_intent_id,
+            error: (err as Error).message,
+          });
+        }
+      }
+
+      if (!chargeId) {
+        // Pay-at-pickup preorder with no payment collected — just mark cancelled
         await query(
           `UPDATE preorders SET status = 'cancelled', updated_at = NOW() WHERE id = $1`,
           [preorder.id]
@@ -2368,11 +2400,11 @@ app.openapi(refundTransactionRoute, async (c) => {
         });
       }
 
-      // Stripe refund for pay_now preorder
+      // Stripe refund — charge exists (pay_now or completed pay_at_pickup)
       const refund = await stripeService.createConnectedAccountRefund(
         connectedAccount.stripe_account_id,
         {
-          charge: preorder.stripe_charge_id,
+          charge: chargeId,
           amount: body.amount || undefined,
           reason: body.reason,
           metadata: {
@@ -2923,127 +2955,86 @@ app.openapi(dashboardRoute, async (c) => {
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const yesterdayStart = new Date(todayStart.getTime() - 24 * 60 * 60 * 1000);
 
-    // Query today's orders from DB (all payment types)
-    const todayRows = await query<{
-      total_amount: string;
-      customer_email: string | null;
-      status: string;
-    }>(
-      `SELECT total_amount, customer_email, status FROM orders
-       WHERE organization_id = $1 AND status IN ('completed', 'refunded')
-       AND created_at >= $2`,
-      [payload.organizationId, todayStart.toISOString()]
-    );
-
-    // Query yesterday's orders from DB
-    const yesterdayRows = await query<{
-      total_amount: string;
-      customer_email: string | null;
-      status: string;
-    }>(
-      `SELECT total_amount, customer_email, status FROM orders
-       WHERE organization_id = $1 AND status IN ('completed', 'refunded')
-       AND created_at >= $2 AND created_at < $3`,
-      [payload.organizationId, yesterdayStart.toISOString(), todayStart.toISOString()]
-    );
-
-    // Query today's preorders
-    const todayPreorderRows = await query<{
-      total_amount: string;
-      customer_email: string | null;
-    }>(
-      `SELECT total_amount, customer_email FROM preorders
-       WHERE organization_id = $1 AND status NOT IN ('cancelled', 'pending')
-       AND created_at >= $2`,
-      [payload.organizationId, todayStart.toISOString()]
-    );
-
-    // Query yesterday's preorders
-    const yesterdayPreorderRows = await query<{
-      total_amount: string;
-      customer_email: string | null;
-    }>(
-      `SELECT total_amount, customer_email FROM preorders
-       WHERE organization_id = $1 AND status NOT IN ('cancelled', 'pending')
-       AND created_at >= $2 AND created_at < $3`,
-      [payload.organizationId, yesterdayStart.toISOString(), todayStart.toISOString()]
-    );
-
-    // Query today's ticket sales
-    const todayTicketRows = await query<{
-      amount_paid: string;
-      customer_email: string | null;
-    }>(
-      `SELECT amount_paid, customer_email FROM tickets
-       WHERE organization_id = $1 AND status != 'refunded'
-       AND purchased_at >= $2`,
-      [payload.organizationId, todayStart.toISOString()]
-    );
-
-    // Query yesterday's ticket sales
-    const yesterdayTicketRows = await query<{
-      amount_paid: string;
-      customer_email: string | null;
-    }>(
-      `SELECT amount_paid, customer_email FROM tickets
-       WHERE organization_id = $1 AND status != 'refunded'
-       AND purchased_at >= $2 AND purchased_at < $3`,
-      [payload.organizationId, yesterdayStart.toISOString(), todayStart.toISOString()]
-    );
-
-    // Query recent orders (last 10 to merge with preorders/tickets, then take top 10)
-    const recentRows = await query<{
-      id: string;
-      order_number: string | null;
-      total_amount: string;
-      status: string;
-      payment_method: string | null;
-      customer_email: string | null;
-      created_at: Date;
-    }>(
-      `SELECT id, order_number, total_amount, status, payment_method, customer_email, created_at FROM orders
-       WHERE organization_id = $1 AND status IN ('completed', 'refunded')
-       ORDER BY created_at DESC LIMIT 10`,
-      [payload.organizationId]
-    );
-
-    // Query recent preorders
-    const recentPreorderRows = await query<{
-      id: string;
-      order_number: string | null;
-      total_amount: string;
-      status: string;
-      customer_name: string | null;
-      customer_email: string | null;
-      created_at: Date;
-    }>(
-      `SELECT id, order_number, total_amount, status, customer_name, customer_email, created_at FROM preorders
-       WHERE organization_id = $1 AND status NOT IN ('cancelled', 'pending')
-       ORDER BY created_at DESC LIMIT 10`,
-      [payload.organizationId]
-    );
-
-    // Query recent ticket sales
-    const recentTicketRows = await query<{
-      id: string;
-      amount_paid: string;
-      status: string;
-      customer_name: string | null;
-      customer_email: string | null;
-      event_id: string;
-      purchased_at: Date;
-    }>(
-      `SELECT t.id, t.amount_paid, t.status, t.customer_name, t.customer_email, t.event_id, t.purchased_at
-       FROM tickets t
-       WHERE t.organization_id = $1 AND t.status != 'refunded'
-       ORDER BY t.purchased_at DESC LIMIT 10`,
-      [payload.organizationId]
-    );
-
-    // Fetch balance from Stripe (must come from Stripe)
-    const balance = await stripeService.getConnectedAccountBalance(
-      connectedAccount.stripe_account_id
-    );
+    // Run all 10 independent queries in parallel
+    const [
+      todayRows,
+      yesterdayRows,
+      todayPreorderRows,
+      yesterdayPreorderRows,
+      todayTicketRows,
+      yesterdayTicketRows,
+      recentRows,
+      recentPreorderRows,
+      recentTicketRows,
+      balance,
+    ] = await Promise.all([
+      // Today's orders
+      query<{ total_amount: string; customer_email: string | null; status: string }>(
+        `SELECT total_amount, customer_email, status FROM orders
+         WHERE organization_id = $1 AND status IN ('completed', 'refunded')
+         AND created_at >= $2`,
+        [payload.organizationId, todayStart.toISOString()]
+      ),
+      // Yesterday's orders
+      query<{ total_amount: string; customer_email: string | null; status: string }>(
+        `SELECT total_amount, customer_email, status FROM orders
+         WHERE organization_id = $1 AND status IN ('completed', 'refunded')
+         AND created_at >= $2 AND created_at < $3`,
+        [payload.organizationId, yesterdayStart.toISOString(), todayStart.toISOString()]
+      ),
+      // Today's preorders
+      query<{ total_amount: string; customer_email: string | null }>(
+        `SELECT total_amount, customer_email FROM preorders
+         WHERE organization_id = $1 AND status NOT IN ('cancelled', 'pending')
+         AND created_at >= $2`,
+        [payload.organizationId, todayStart.toISOString()]
+      ),
+      // Yesterday's preorders
+      query<{ total_amount: string; customer_email: string | null }>(
+        `SELECT total_amount, customer_email FROM preorders
+         WHERE organization_id = $1 AND status NOT IN ('cancelled', 'pending')
+         AND created_at >= $2 AND created_at < $3`,
+        [payload.organizationId, yesterdayStart.toISOString(), todayStart.toISOString()]
+      ),
+      // Today's ticket sales
+      query<{ amount_paid: string; customer_email: string | null }>(
+        `SELECT amount_paid, customer_email FROM tickets
+         WHERE organization_id = $1 AND status != 'refunded'
+         AND purchased_at >= $2`,
+        [payload.organizationId, todayStart.toISOString()]
+      ),
+      // Yesterday's ticket sales
+      query<{ amount_paid: string; customer_email: string | null }>(
+        `SELECT amount_paid, customer_email FROM tickets
+         WHERE organization_id = $1 AND status != 'refunded'
+         AND purchased_at >= $2 AND purchased_at < $3`,
+        [payload.organizationId, yesterdayStart.toISOString(), todayStart.toISOString()]
+      ),
+      // Recent orders (last 6)
+      query<{ id: string; order_number: string | null; total_amount: string; status: string; payment_method: string | null; customer_email: string | null; created_at: Date }>(
+        `SELECT id, order_number, total_amount, status, payment_method, customer_email, created_at FROM orders
+         WHERE organization_id = $1 AND status IN ('completed', 'refunded')
+         ORDER BY created_at DESC LIMIT 6`,
+        [payload.organizationId]
+      ),
+      // Recent preorders (last 6)
+      query<{ id: string; order_number: string | null; total_amount: string; status: string; customer_name: string | null; customer_email: string | null; created_at: Date }>(
+        `SELECT id, order_number, total_amount, status, customer_name, customer_email, created_at FROM preorders
+         WHERE organization_id = $1 AND status NOT IN ('cancelled', 'pending')
+         ORDER BY created_at DESC LIMIT 6`,
+        [payload.organizationId]
+      ),
+      // Recent ticket sales (last 6)
+      query<{ id: string; amount_paid: string; status: string; customer_name: string | null; customer_email: string | null; event_id: string; purchased_at: Date }>(
+        `SELECT t.id, t.amount_paid, t.status, t.customer_name, t.customer_email, t.event_id, t.purchased_at
+         FROM tickets t
+         WHERE t.organization_id = $1 AND t.status != 'refunded'
+         ORDER BY t.purchased_at DESC LIMIT 6`,
+        [payload.organizationId]
+      ),
+      // Stripe balance
+      stripeService.getConnectedAccountBalance(connectedAccount.stripe_account_id),
+    ]);
 
     // Calculate today's metrics (orders + preorders + tickets)
     const todayOrderSalesCents = todayRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
@@ -3117,7 +3108,7 @@ app.openapi(dashboardRoute, async (c) => {
       })),
     ]
       .sort((a, b) => b.created - a.created)
-      .slice(0, 10);
+      .slice(0, 6);
 
     return c.json({
       today: {
@@ -3371,313 +3362,45 @@ app.openapi(analyticsRoute, async (c) => {
     // Use bounded query when viewing past periods (offset != 0) or custom date range
     const useBoundedQuery = offset !== 0 || range === 'custom';
 
-    // Query current period metrics from database
-    const currentMetricsQuery = await query<{
-      revenue: string;
-      transactions: string;
-    }>(
-      useBoundedQuery
-        ? `SELECT
-            COALESCE(SUM(total_amount), 0)::text as revenue,
-            COUNT(*)::text as transactions
-          FROM orders
-          WHERE organization_id = $1
-            AND status = 'completed'
-            AND created_at >= $2
-            AND created_at <= $3`
-        : `SELECT
-            COALESCE(SUM(total_amount), 0)::text as revenue,
-            COUNT(*)::text as transactions
-          FROM orders
-          WHERE organization_id = $1
-            AND status = 'completed'
-            AND created_at >= $2`,
-      useBoundedQuery
-        ? [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
-        : [payload.organizationId, currentStart.toISOString()]
-    );
-
-    const currentRevenue = parseFloat(currentMetricsQuery[0]?.revenue || '0');
-    const currentTransactions = parseInt(currentMetricsQuery[0]?.transactions || '0');
-    // (currentAvgTransaction now computed in merge section as mergedCurrentAvg)
-
-    // Query previous period metrics
-    const previousMetricsQuery = await query<{
-      revenue: string;
-      transactions: string;
-    }>(
-      `SELECT
-        COALESCE(SUM(total_amount), 0)::text as revenue,
-        COUNT(*)::text as transactions
-      FROM orders
-      WHERE organization_id = $1
-        AND status = 'completed'
-        AND created_at >= $2
-        AND created_at <= $3`,
-      [payload.organizationId, previousStart.toISOString(), previousEnd.toISOString()]
-    );
-
-    const previousRevenue = parseFloat(previousMetricsQuery[0]?.revenue || '0');
-    const previousTransactions = parseInt(previousMetricsQuery[0]?.transactions || '0');
-
-    // Calculate revenue data by time period using database aggregation
-    let revenueData: Array<{ label: string; revenue: number }> = [];
-    let transactionData: Array<{ label: string; count: number }> = [];
-    let timeSeriesBucketType: 'hourly' | 'daily' | 'monthly' = 'daily'; // Track bucketing for preorder/ticket merge
-
-    if (range === 'today') {
-      timeSeriesBucketType = 'hourly';
-      // Group by hour
-      const hourlyQuery = await query<{ hour: string; revenue: string; order_count: string }>(
-        `SELECT
-          EXTRACT(HOUR FROM created_at)::text as hour,
-          COALESCE(SUM(total_amount), 0)::text as revenue,
-          COUNT(*)::text as order_count
-        FROM orders
-        WHERE organization_id = $1
-          AND status = 'completed'
-          AND created_at >= $2
-        GROUP BY EXTRACT(HOUR FROM created_at)
-        ORDER BY EXTRACT(HOUR FROM created_at)`,
-        [payload.organizationId, currentStart.toISOString()]
-      );
-
-      const hourlyMap: Record<number, number> = {};
-      const hourlyCountMap: Record<number, number> = {};
-      hourlyQuery.forEach(row => {
-        hourlyMap[parseInt(row.hour)] = parseFloat(row.revenue);
-        hourlyCountMap[parseInt(row.hour)] = parseInt(row.order_count);
-      });
-
-      // Determine hour range - default 9 AM to 9 PM, but expand if transactions exist outside
-      const hoursWithData = Object.keys(hourlyMap).map(Number);
-      let minHour = 9;
-      let maxHour = 21;
-
-      if (hoursWithData.length > 0) {
-        const dataMin = Math.min(...hoursWithData);
-        const dataMax = Math.max(...hoursWithData);
-        minHour = Math.min(minHour, dataMin);
-        maxHour = Math.max(maxHour, dataMax);
-      }
-
-      // Generate hours for the determined range
-      for (let h = minHour; h <= maxHour; h++) {
-        const hour12 = h === 0 ? 12 : (h > 12 ? h - 12 : h);
-        const ampm = h >= 12 ? 'PM' : 'AM';
-        const label = `${hour12}${ampm}`;
-        revenueData.push({ label, revenue: Math.round((hourlyMap[h] || 0) * 100) / 100 });
-        transactionData.push({ label, count: hourlyCountMap[h] || 0 });
-      }
-    } else if (range === 'week') {
-      // Group by date for current week
-      const dailyQuery = await query<{ day_date: string; revenue: string; order_count: string }>(
-        `SELECT
-          DATE(created_at)::text as day_date,
-          COALESCE(SUM(total_amount), 0)::text as revenue,
-          COUNT(*)::text as order_count
-        FROM orders
-        WHERE organization_id = $1
-          AND status = 'completed'
-          AND created_at >= $2
-        GROUP BY DATE(created_at)
-        ORDER BY DATE(created_at)`,
-        [payload.organizationId, currentStart.toISOString()]
-      );
-
-      // Map dates to revenue and counts
-      const dailyMap: Record<string, number> = {};
-      const dailyCountMap: Record<string, number> = {};
-      dailyQuery.forEach(row => {
-        dailyMap[row.day_date] = parseFloat(row.revenue);
-        dailyCountMap[row.day_date] = parseInt(row.order_count);
-      });
-
-      // Generate each day of the current week (Mon-Sun)
-      const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
-      for (let i = 0; i < 7; i++) {
-        const date = new Date(currentStart.getTime() + i * 24 * 60 * 60 * 1000);
-        const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD format
-        revenueData.push({
-          label: dayNames[i],
-          revenue: Math.round((dailyMap[dateStr] || 0) * 100) / 100
-        });
-        transactionData.push({
-          label: dayNames[i],
-          count: dailyCountMap[dateStr] || 0
-        });
-      }
-    } else if (range === 'month') {
-      // Group by day for the selected month
-      const dailyQuery = await query<{ day_date: string; revenue: string; order_count: string }>(
-        `SELECT
-          DATE(created_at)::text as day_date,
-          COALESCE(SUM(total_amount), 0)::text as revenue,
-          COUNT(*)::text as order_count
-        FROM orders
-        WHERE organization_id = $1
-          AND status = 'completed'
-          AND created_at >= $2
-          AND created_at <= $3
-        GROUP BY DATE(created_at)
-        ORDER BY DATE(created_at)`,
-        [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
-      );
-
-      // Map dates to revenue and counts
-      const dailyMap: Record<string, number> = {};
-      const dailyCountMap: Record<string, number> = {};
-      dailyQuery.forEach(row => {
-        dailyMap[row.day_date] = parseFloat(row.revenue);
-        dailyCountMap[row.day_date] = parseInt(row.order_count);
-      });
-
-      // Get number of days in the month
-      const daysInMonth = new Date(currentStart.getFullYear(), currentStart.getMonth() + 1, 0).getDate();
-
-      // Generate each day of the month
-      for (let i = 0; i < daysInMonth; i++) {
-        const date = new Date(currentStart.getFullYear(), currentStart.getMonth(), i + 1);
-        const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD format
-        const label = (i + 1).toString();
-        revenueData.push({
-          label,
-          revenue: Math.round((dailyMap[dateStr] || 0) * 100) / 100
-        });
-        transactionData.push({
-          label,
-          count: dailyCountMap[dateStr] || 0
-        });
-      }
-    } else if (range === 'custom') {
-      // Custom date range - determine appropriate bucketing based on range length
-      const daysDiff = Math.ceil((currentEnd.getTime() - currentStart.getTime()) / (1000 * 60 * 60 * 24));
-
-      if (daysDiff <= 1) {
-        timeSeriesBucketType = 'hourly';
-        // Same day or next day - group by hour (similar to 'today')
-        const hourlyQuery = await query<{ hour: string; revenue: string; order_count: string }>(
-          `SELECT
-            EXTRACT(HOUR FROM created_at)::text as hour,
-            COALESCE(SUM(total_amount), 0)::text as revenue,
-            COUNT(*)::text as order_count
-          FROM orders
-          WHERE organization_id = $1
-            AND status = 'completed'
-            AND created_at >= $2
-            AND created_at <= $3
-          GROUP BY EXTRACT(HOUR FROM created_at)
-          ORDER BY EXTRACT(HOUR FROM created_at)`,
-          [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
-        );
-
-        const hourlyMap: Record<number, number> = {};
-        const hourlyCountMap: Record<number, number> = {};
-        hourlyQuery.forEach(row => {
-          const h = parseInt(row.hour);
-          hourlyMap[h] = parseFloat(row.revenue);
-          hourlyCountMap[h] = parseInt(row.order_count);
-        });
-
-        for (let h = 0; h < 24; h++) {
-          const hour12 = h === 0 ? 12 : (h > 12 ? h - 12 : h);
-          const ampm = h >= 12 ? 'PM' : 'AM';
-          const label = `${hour12}${ampm}`;
-          revenueData.push({ label, revenue: Math.round((hourlyMap[h] || 0) * 100) / 100 });
-          transactionData.push({ label, count: hourlyCountMap[h] || 0 });
-        }
-      } else if (daysDiff <= 90) {
-        // Up to 3 months - group by day
-        const dailyQuery = await query<{ day_date: string; revenue: string; order_count: string }>(
-          `SELECT
-            DATE(created_at)::text as day_date,
-            COALESCE(SUM(total_amount), 0)::text as revenue,
-            COUNT(*)::text as order_count
-          FROM orders
-          WHERE organization_id = $1
-            AND status = 'completed'
-            AND created_at >= $2
-            AND created_at <= $3
-          GROUP BY DATE(created_at)
-          ORDER BY DATE(created_at)`,
-          [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
-        );
-
-        const dailyMap: Record<string, number> = {};
-        const dailyCountMap: Record<string, number> = {};
-        dailyQuery.forEach(row => {
-          dailyMap[row.day_date] = parseFloat(row.revenue);
-          dailyCountMap[row.day_date] = parseInt(row.order_count);
-        });
-
-        // Generate each day in the range
-        const current = new Date(currentStart);
-        while (current <= currentEnd) {
-          const dateStr = current.toISOString().split('T')[0];
-          const label = current.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-          revenueData.push({
-            label,
-            revenue: Math.round((dailyMap[dateStr] || 0) * 100) / 100
-          });
-          transactionData.push({
-            label,
-            count: dailyCountMap[dateStr] || 0
-          });
-          current.setDate(current.getDate() + 1);
-        }
-      } else {
-        timeSeriesBucketType = 'monthly';
-        // More than 3 months - group by month
-        const monthlyQuery = await query<{ year_month: string; revenue: string; order_count: string }>(
-          `SELECT
-            TO_CHAR(created_at, 'YYYY-MM') as year_month,
-            COALESCE(SUM(total_amount), 0)::text as revenue,
-            COUNT(*)::text as order_count
-          FROM orders
-          WHERE organization_id = $1
-            AND status = 'completed'
-            AND created_at >= $2
-            AND created_at <= $3
-          GROUP BY TO_CHAR(created_at, 'YYYY-MM')
-          ORDER BY TO_CHAR(created_at, 'YYYY-MM')`,
-          [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
-        );
-
-        const monthlyMap: Record<string, number> = {};
-        const monthlyCountMap: Record<string, number> = {};
-        monthlyQuery.forEach(row => {
-          monthlyMap[row.year_month] = parseFloat(row.revenue);
-          monthlyCountMap[row.year_month] = parseInt(row.order_count);
-        });
-
-        // Generate each month in the range
-        const current = new Date(currentStart.getFullYear(), currentStart.getMonth(), 1);
-        const endMonth = new Date(currentEnd.getFullYear(), currentEnd.getMonth(), 1);
-        while (current <= endMonth) {
-          const yearMonth = `${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, '0')}`;
-          const label = current.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
-          revenueData.push({
-            label,
-            revenue: Math.round((monthlyMap[yearMonth] || 0) * 100) / 100
-          });
-          transactionData.push({
-            label,
-            count: monthlyCountMap[yearMonth] || 0
-          });
-          current.setMonth(current.getMonth() + 1);
-        }
-      }
-    }
-
-    // Helper for date-bounded queries
+    // ── Pre-compute conditions used by all queries ──
     const dateCondition = useBoundedQuery
       ? 'AND created_at >= $2 AND created_at <= $3'
       : 'AND created_at >= $2';
     const dateParams = useBoundedQuery
       ? [payload.organizationId, currentStart.toISOString(), currentEnd.toISOString()]
       : [payload.organizationId, currentStart.toISOString()];
+    const orderDateCondition = useBoundedQuery
+      ? 'AND o.created_at >= $2 AND o.created_at <= $3'
+      : 'AND o.created_at >= $2';
 
-    // ── Preorder & Ticket queries (run in parallel with remaining order queries) ──
+    // Determine time series bucketing BEFORE running queries
+    let timeSeriesBucketType: 'hourly' | 'daily' | 'monthly' = 'daily';
+    if (range === 'today') {
+      timeSeriesBucketType = 'hourly';
+    } else if (range === 'custom') {
+      const daysDiff = Math.ceil((currentEnd.getTime() - currentStart.getTime()) / (1000 * 60 * 60 * 24));
+      if (daysDiff <= 1) timeSeriesBucketType = 'hourly';
+      else if (daysDiff > 90) timeSeriesBucketType = 'monthly';
+    }
+
+    // Build time series bucket expressions based on bucket type
+    const orderTsBucket = timeSeriesBucketType === 'hourly'
+      ? 'EXTRACT(HOUR FROM created_at)::text'
+      : timeSeriesBucketType === 'monthly'
+        ? "TO_CHAR(created_at, 'YYYY-MM')"
+        : 'DATE(created_at)::text';
+    const preorderTsBucket = orderTsBucket; // same column
+    const ticketTsBucket = timeSeriesBucketType === 'hourly'
+      ? 'EXTRACT(HOUR FROM purchased_at)::text'
+      : timeSeriesBucketType === 'monthly'
+        ? "TO_CHAR(purchased_at, 'YYYY-MM')"
+        : 'DATE(purchased_at)::text';
+
+    // Preorder/ticket helper conditions
+    const preorderSuccessCond = (alias: string = '') => {
+      const p = alias ? `${alias}.` : '';
+      return `AND ((${p}payment_type = 'pay_now' AND ${p}status NOT IN ('cancelled', 'pending')) OR (${p}status = 'picked_up'))`;
+    };
     const preorderDateCondition = useBoundedQuery
       ? 'AND created_at >= $2 AND created_at <= $3'
       : 'AND created_at >= $2';
@@ -3688,9 +3411,247 @@ app.openapi(analyticsRoute, async (c) => {
       ? 'AND purchased_at >= $2 AND purchased_at <= $3'
       : 'AND purchased_at >= $2';
 
-    // Fire all preorder/ticket queries in parallel (they run concurrently with the sequential order queries below)
-    const preorderTicketPromise = Promise.all([
-      // [0] Preorder current period aggregate
+    // ── Run ALL queries in parallel (23 queries) ──
+    const [
+      combinedMetricsResult,
+      previousMetricsResult,
+      orderTimeSeriesResult,
+      paymentMethodResult,
+      heatmapResult,
+      topProductsResult,
+      catalogBreakdownResult,
+      categoryBreakdownResult,
+      customerResult,
+      staffResult,
+      deviceResult,
+      preorderCurrentAggResult,
+      preorderPreviousAggResult,
+      ticketCurrentAggResult,
+      ticketPreviousAggResult,
+      preorderTSResult,
+      ticketTSResult,
+      preorderTopProductsResult,
+      preorderCatalogResult,
+      preorderHeatmapResult,
+      ticketHeatmapResult,
+      cancelledPreordersResult,
+      refundedTicketsResult,
+    ] = await Promise.all([
+      // 0: Combined current-period order metrics (revenue + transactions + tips + quick charge + refunds)
+      query<{
+        revenue: string; transactions: string;
+        total_tips: string; tipped_orders: string;
+        qc_count: string; qc_revenue: string;
+        refund_count: string; refund_amount: string;
+      }>(
+        `SELECT
+          COALESCE(SUM(CASE WHEN status = 'completed' THEN total_amount END), 0)::text as revenue,
+          COUNT(CASE WHEN status = 'completed' THEN 1 END)::text as transactions,
+          COALESCE(SUM(CASE WHEN status = 'completed' THEN tip_amount END), 0)::text as total_tips,
+          COUNT(CASE WHEN status = 'completed' AND tip_amount > 0 THEN 1 END)::text as tipped_orders,
+          COUNT(CASE WHEN status = 'completed' AND (metadata->>'isQuickCharge')::boolean = true THEN 1 END)::text as qc_count,
+          COALESCE(SUM(CASE WHEN status = 'completed' AND (metadata->>'isQuickCharge')::boolean = true THEN total_amount END), 0)::text as qc_revenue,
+          COUNT(CASE WHEN status = 'refunded' THEN 1 END)::text as refund_count,
+          COALESCE(SUM(CASE WHEN status = 'refunded' THEN total_amount END), 0)::text as refund_amount
+        FROM orders
+        WHERE organization_id = $1
+          AND status IN ('completed', 'refunded')
+          ${dateCondition}`,
+        dateParams
+      ),
+
+      // 1: Previous period order metrics
+      query<{ revenue: string; transactions: string }>(
+        `SELECT
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as transactions
+        FROM orders
+        WHERE organization_id = $1
+          AND status = 'completed'
+          AND created_at >= $2
+          AND created_at <= $3`,
+        [payload.organizationId, previousStart.toISOString(), previousEnd.toISOString()]
+      ),
+
+      // 2: Order time series (dynamic bucketing based on range)
+      query<{ bucket: string; revenue: string; order_count: string }>(
+        `SELECT
+          ${orderTsBucket} as bucket,
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as order_count
+        FROM orders
+        WHERE organization_id = $1
+          AND status = 'completed'
+          ${dateCondition}
+        GROUP BY ${orderTsBucket}
+        ORDER BY ${orderTsBucket}`,
+        dateParams
+      ),
+
+      // 3: Payment method breakdown
+      query<{ method: string | null; count: string; revenue: string }>(
+        `SELECT
+          payment_method::text as method,
+          COUNT(*)::text as count,
+          COALESCE(SUM(total_amount), 0)::text as revenue
+        FROM orders
+        WHERE organization_id = $1
+          AND status = 'completed'
+          ${dateCondition}
+        GROUP BY payment_method
+        ORDER BY COUNT(*) DESC`,
+        dateParams
+      ),
+
+      // 4: Order heatmap (day × hour — also used to derive peak hours)
+      query<{ day_of_week: string; hour: string; order_count: string; revenue: string }>(
+        `SELECT
+          EXTRACT(DOW FROM created_at)::text as day_of_week,
+          EXTRACT(HOUR FROM created_at)::text as hour,
+          COUNT(*)::text as order_count,
+          COALESCE(SUM(total_amount), 0)::text as revenue
+        FROM orders
+        WHERE organization_id = $1
+          AND status = 'completed'
+          ${dateCondition}
+        GROUP BY EXTRACT(DOW FROM created_at), EXTRACT(HOUR FROM created_at)
+        ORDER BY EXTRACT(DOW FROM created_at), EXTRACT(HOUR FROM created_at)`,
+        dateParams
+      ),
+
+      // 5: Top products from order_items
+      query<{ product_id: string | null; name: string; description: string | null; image_url: string | null; quantity: string; revenue: string }>(
+        `SELECT
+          oi.product_id,
+          COALESCE(oi.name, p.name, 'Unknown Product') as name,
+          p.description,
+          p.image_url,
+          SUM(oi.quantity)::text as quantity,
+          SUM(oi.quantity * oi.unit_price)::text as revenue
+        FROM order_items oi
+        JOIN orders o ON oi.order_id = o.id
+        LEFT JOIN products p ON oi.product_id = p.id
+        WHERE o.organization_id = $1
+          AND o.status = 'completed'
+          ${orderDateCondition}
+        GROUP BY oi.product_id, COALESCE(oi.name, p.name, 'Unknown Product'), p.description, p.image_url
+        ORDER BY SUM(oi.quantity) DESC
+        LIMIT 10`,
+        dateParams
+      ),
+
+      // 6: Catalog breakdown (uses subquery for product count to avoid GROUP BY interference)
+      query<{
+        catalog_id: string | null; catalog_name: string | null;
+        catalog_description: string | null; catalog_location: string | null;
+        catalog_date: string | null; catalog_created_at: string | null;
+        product_count: string; order_count: string; revenue: string;
+      }>(
+        `SELECT
+          o.catalog_id,
+          c.name as catalog_name,
+          c.description as catalog_description,
+          c.location as catalog_location,
+          c.date as catalog_date,
+          c.created_at::text as catalog_created_at,
+          COALESCE(cp_counts.cnt, 0)::text as product_count,
+          COUNT(o.id)::text as order_count,
+          SUM(o.total_amount)::text as revenue
+        FROM orders o
+        LEFT JOIN catalogs c ON o.catalog_id = c.id
+        LEFT JOIN (
+          SELECT catalog_id, COUNT(*)::bigint as cnt FROM catalog_products GROUP BY catalog_id
+        ) cp_counts ON cp_counts.catalog_id = c.id
+        WHERE o.organization_id = $1
+          AND o.status = 'completed'
+          AND o.catalog_id IS NOT NULL
+          AND (o.metadata->>'isQuickCharge')::boolean IS NOT TRUE
+          ${orderDateCondition}
+        GROUP BY o.catalog_id, c.name, c.description, c.location, c.date, c.created_at, c.id, cp_counts.cnt
+        ORDER BY COUNT(o.id) DESC`,
+        dateParams
+      ),
+
+      // 7: Category breakdown
+      query<{ category_id: string | null; category_name: string | null; quantity: string; revenue: string }>(
+        `SELECT
+          oi.category_id,
+          cat.name as category_name,
+          SUM(oi.quantity)::text as quantity,
+          SUM(oi.quantity * oi.unit_price)::text as revenue
+        FROM order_items oi
+        JOIN orders o ON oi.order_id = o.id
+        LEFT JOIN categories cat ON oi.category_id = cat.id
+        WHERE o.organization_id = $1
+          AND o.status = 'completed'
+          ${orderDateCondition}
+        GROUP BY oi.category_id, cat.name
+        ORDER BY SUM(oi.quantity) DESC
+        LIMIT 10`,
+        dateParams
+      ),
+
+      // 8: Customer metrics
+      query<{ new_customers: string; returning_customers: string }>(
+        `SELECT
+          COUNT(CASE WHEN created_at >= $2 ${useBoundedQuery ? 'AND created_at <= $3' : ''} THEN 1 END)::text as new_customers,
+          COUNT(CASE WHEN created_at < $2 THEN 1 END)::text as returning_customers
+        FROM customers
+        WHERE organization_id = $1
+          AND total_orders > 0
+          AND last_order_at >= $2
+          ${useBoundedQuery ? 'AND last_order_at <= $3' : ''}`,
+        dateParams
+      ),
+
+      // 9: Staff breakdown
+      query<{
+        user_id: string; first_name: string | null; last_name: string | null;
+        avatar_image_id: string | null; order_count: string; revenue: string;
+      }>(
+        `SELECT
+          o.user_id,
+          u.first_name,
+          u.last_name,
+          u.avatar_image_id,
+          COUNT(*)::text as order_count,
+          COALESCE(SUM(o.total_amount), 0)::text as revenue
+        FROM orders o
+        LEFT JOIN users u ON o.user_id = u.id
+        WHERE o.organization_id = $1
+          AND o.status = 'completed'
+          AND o.user_id IS NOT NULL
+          ${orderDateCondition}
+        GROUP BY o.user_id, u.first_name, u.last_name, u.avatar_image_id
+        ORDER BY SUM(o.total_amount) DESC`,
+        dateParams
+      ),
+
+      // 10: Device breakdown
+      query<{
+        device_id: string; device_name: string | null; model_name: string | null;
+        os_name: string | null; order_count: string; revenue: string; last_used: string | null;
+      }>(
+        `SELECT
+          o.device_id,
+          d.device_name,
+          d.model_name,
+          d.os_name,
+          COUNT(*)::text as order_count,
+          COALESCE(SUM(o.total_amount), 0)::text as revenue,
+          MAX(o.created_at)::text as last_used
+        FROM orders o
+        LEFT JOIN devices d ON d.device_id = o.device_id
+        WHERE o.organization_id = $1
+          AND o.status = 'completed'
+          AND o.device_id IS NOT NULL
+          ${orderDateCondition}
+        GROUP BY o.device_id, d.device_name, d.model_name, d.os_name
+        ORDER BY SUM(o.total_amount) DESC`,
+        dateParams
+      ),
+
+      // 11: Preorder current period aggregate
       query<{ revenue: string; count: string; tips: string; tipped_count: string }>(
         `SELECT
           COALESCE(SUM(total_amount), 0)::text as revenue,
@@ -3698,11 +3659,25 @@ app.openapi(analyticsRoute, async (c) => {
           COALESCE(SUM(tip_amount), 0)::text as tips,
           COUNT(CASE WHEN tip_amount > 0 THEN 1 END)::text as tipped_count
         FROM preorders
-        WHERE organization_id = $1 AND status = 'picked_up'
+        WHERE organization_id = $1 ${preorderSuccessCond()}
           ${preorderDateCondition}`,
         dateParams
       ),
-      // [1] Ticket current period aggregate
+
+      // 12: Preorder previous period aggregate
+      query<{ revenue: string; count: string; tips: string; tipped_count: string }>(
+        `SELECT
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as count,
+          COALESCE(SUM(tip_amount), 0)::text as tips,
+          COUNT(CASE WHEN tip_amount > 0 THEN 1 END)::text as tipped_count
+        FROM preorders
+        WHERE organization_id = $1 ${preorderSuccessCond()}
+          AND created_at >= $2 AND created_at <= $3`,
+        [payload.organizationId, previousStart.toISOString(), previousEnd.toISOString()]
+      ),
+
+      // 13: Ticket current period aggregate
       query<{ revenue: string; count: string }>(
         `SELECT
           COALESCE(SUM(amount_paid), 0)::text as revenue,
@@ -3712,19 +3687,8 @@ app.openapi(analyticsRoute, async (c) => {
           ${ticketDateCondition}`,
         dateParams
       ),
-      // [2] Preorder previous period aggregate
-      query<{ revenue: string; count: string; tips: string; tipped_count: string }>(
-        `SELECT
-          COALESCE(SUM(total_amount), 0)::text as revenue,
-          COUNT(*)::text as count,
-          COALESCE(SUM(tip_amount), 0)::text as tips,
-          COUNT(CASE WHEN tip_amount > 0 THEN 1 END)::text as tipped_count
-        FROM preorders
-        WHERE organization_id = $1 AND status = 'picked_up'
-          AND created_at >= $2 AND created_at <= $3`,
-        [payload.organizationId, previousStart.toISOString(), previousEnd.toISOString()]
-      ),
-      // [3] Ticket previous period aggregate
+
+      // 14: Ticket previous period aggregate
       query<{ revenue: string; count: string }>(
         `SELECT
           COALESCE(SUM(amount_paid), 0)::text as revenue,
@@ -3734,85 +3698,36 @@ app.openapi(analyticsRoute, async (c) => {
           AND purchased_at >= $2 AND purchased_at <= $3`,
         [payload.organizationId, previousStart.toISOString(), previousEnd.toISOString()]
       ),
-      // [4] Preorder time series (hourly)
+
+      // 15: Preorder time series (only the needed bucket type)
       query<{ bucket: string; revenue: string; order_count: string }>(
         `SELECT
-          EXTRACT(HOUR FROM created_at)::text as bucket,
+          ${preorderTsBucket} as bucket,
           COALESCE(SUM(total_amount), 0)::text as revenue,
           COUNT(*)::text as order_count
         FROM preorders
-        WHERE organization_id = $1 AND status = 'picked_up'
+        WHERE organization_id = $1 ${preorderSuccessCond()}
           ${preorderDateCondition}
-        GROUP BY EXTRACT(HOUR FROM created_at)
-        ORDER BY EXTRACT(HOUR FROM created_at)`,
+        GROUP BY ${preorderTsBucket}
+        ORDER BY ${preorderTsBucket}`,
         dateParams
       ),
-      // [5] Ticket time series (hourly)
+
+      // 16: Ticket time series (only the needed bucket type)
       query<{ bucket: string; revenue: string; order_count: string }>(
         `SELECT
-          EXTRACT(HOUR FROM purchased_at)::text as bucket,
+          ${ticketTsBucket} as bucket,
           COALESCE(SUM(amount_paid), 0)::text as revenue,
           COUNT(*)::text as order_count
         FROM tickets
         WHERE organization_id = $1 AND status IN ('valid', 'used')
           ${ticketDateCondition}
-        GROUP BY EXTRACT(HOUR FROM purchased_at)
-        ORDER BY EXTRACT(HOUR FROM purchased_at)`,
+        GROUP BY ${ticketTsBucket}
+        ORDER BY ${ticketTsBucket}`,
         dateParams
       ),
-      // [6] Preorder time series (daily)
-      query<{ bucket: string; revenue: string; order_count: string }>(
-        `SELECT
-          DATE(created_at)::text as bucket,
-          COALESCE(SUM(total_amount), 0)::text as revenue,
-          COUNT(*)::text as order_count
-        FROM preorders
-        WHERE organization_id = $1 AND status = 'picked_up'
-          ${preorderDateCondition}
-        GROUP BY DATE(created_at)
-        ORDER BY DATE(created_at)`,
-        dateParams
-      ),
-      // [7] Ticket time series (daily)
-      query<{ bucket: string; revenue: string; order_count: string }>(
-        `SELECT
-          DATE(purchased_at)::text as bucket,
-          COALESCE(SUM(amount_paid), 0)::text as revenue,
-          COUNT(*)::text as order_count
-        FROM tickets
-        WHERE organization_id = $1 AND status IN ('valid', 'used')
-          ${ticketDateCondition}
-        GROUP BY DATE(purchased_at)
-        ORDER BY DATE(purchased_at)`,
-        dateParams
-      ),
-      // [8] Preorder time series (monthly) - for custom ranges > 90 days
-      query<{ bucket: string; revenue: string; order_count: string }>(
-        `SELECT
-          TO_CHAR(created_at, 'YYYY-MM') as bucket,
-          COALESCE(SUM(total_amount), 0)::text as revenue,
-          COUNT(*)::text as order_count
-        FROM preorders
-        WHERE organization_id = $1 AND status = 'picked_up'
-          ${preorderDateCondition}
-        GROUP BY TO_CHAR(created_at, 'YYYY-MM')
-        ORDER BY TO_CHAR(created_at, 'YYYY-MM')`,
-        dateParams
-      ),
-      // [9] Ticket time series (monthly) - for custom ranges > 90 days
-      query<{ bucket: string; revenue: string; order_count: string }>(
-        `SELECT
-          TO_CHAR(purchased_at, 'YYYY-MM') as bucket,
-          COALESCE(SUM(amount_paid), 0)::text as revenue,
-          COUNT(*)::text as order_count
-        FROM tickets
-        WHERE organization_id = $1 AND status IN ('valid', 'used')
-          ${ticketDateCondition}
-        GROUP BY TO_CHAR(purchased_at, 'YYYY-MM')
-        ORDER BY TO_CHAR(purchased_at, 'YYYY-MM')`,
-        dateParams
-      ),
-      // [10] Top products from preorder_items
+
+      // 17: Preorder top products
       query<{ product_id: string | null; name: string; description: string | null; image_url: string | null; quantity: string; revenue: string }>(
         `SELECT
           pi.product_id,
@@ -3824,14 +3739,15 @@ app.openapi(analyticsRoute, async (c) => {
         FROM preorder_items pi
         JOIN preorders po ON pi.preorder_id = po.id
         LEFT JOIN products p ON pi.product_id = p.id
-        WHERE po.organization_id = $1 AND po.status = 'picked_up'
+        WHERE po.organization_id = $1 ${preorderSuccessCond('po')}
           ${preorderJoinDateCondition}
         GROUP BY pi.product_id, pi.name, p.description, p.image_url
         ORDER BY SUM(pi.quantity) DESC
         LIMIT 20`,
         dateParams
       ),
-      // [11] Preorder catalog breakdown
+
+      // 18: Preorder catalog breakdown
       query<{ catalog_id: string | null; catalog_name: string | null; order_count: string; revenue: string }>(
         `SELECT
           p.catalog_id,
@@ -3840,34 +3756,13 @@ app.openapi(analyticsRoute, async (c) => {
           COALESCE(SUM(p.total_amount), 0)::text as revenue
         FROM preorders p
         LEFT JOIN catalogs c ON p.catalog_id = c.id
-        WHERE p.organization_id = $1 AND p.status = 'picked_up'
+        WHERE p.organization_id = $1 ${preorderSuccessCond('p')}
           ${preorderJoinDateCondition.replace(/po\./g, 'p.')}
         GROUP BY p.catalog_id, c.name`,
         dateParams
       ),
-      // [12] Preorder peak hours
-      query<{ hour: string; count: string }>(
-        `SELECT
-          EXTRACT(HOUR FROM created_at)::text as hour,
-          COUNT(*)::text as count
-        FROM preorders
-        WHERE organization_id = $1 AND status = 'picked_up'
-          ${preorderDateCondition}
-        GROUP BY EXTRACT(HOUR FROM created_at)`,
-        dateParams
-      ),
-      // [13] Ticket peak hours
-      query<{ hour: string; count: string }>(
-        `SELECT
-          EXTRACT(HOUR FROM purchased_at)::text as hour,
-          COUNT(*)::text as count
-        FROM tickets
-        WHERE organization_id = $1 AND status IN ('valid', 'used')
-          ${ticketDateCondition}
-        GROUP BY EXTRACT(HOUR FROM purchased_at)`,
-        dateParams
-      ),
-      // [14] Preorder heatmap
+
+      // 19: Preorder heatmap (also used to derive preorder peak hours)
       query<{ day_of_week: string; hour: string; order_count: string; revenue: string }>(
         `SELECT
           EXTRACT(DOW FROM created_at)::text as day_of_week,
@@ -3875,12 +3770,13 @@ app.openapi(analyticsRoute, async (c) => {
           COUNT(*)::text as order_count,
           COALESCE(SUM(total_amount), 0)::text as revenue
         FROM preorders
-        WHERE organization_id = $1 AND status = 'picked_up'
+        WHERE organization_id = $1 ${preorderSuccessCond()}
           ${preorderDateCondition}
         GROUP BY EXTRACT(DOW FROM created_at), EXTRACT(HOUR FROM created_at)`,
         dateParams
       ),
-      // [15] Ticket heatmap
+
+      // 20: Ticket heatmap (also used to derive ticket peak hours)
       query<{ day_of_week: string; hour: string; order_count: string; revenue: string }>(
         `SELECT
           EXTRACT(DOW FROM purchased_at)::text as day_of_week,
@@ -3893,7 +3789,8 @@ app.openapi(analyticsRoute, async (c) => {
         GROUP BY EXTRACT(DOW FROM purchased_at), EXTRACT(HOUR FROM purchased_at)`,
         dateParams
       ),
-      // [16] Cancelled preorders (pay_now) for refund stats
+
+      // 21: Cancelled preorders (for refund stats)
       query<{ count: string; amount: string }>(
         `SELECT
           COUNT(*)::text as count,
@@ -3903,51 +3800,111 @@ app.openapi(analyticsRoute, async (c) => {
           ${preorderDateCondition}`,
         dateParams
       ),
-      // [17] Refunded tickets for refund stats
+
+      // 22: Refunded tickets (for refund stats)
       query<{ count: string; amount: string }>(
         `SELECT
           COUNT(*)::text as count,
           COALESCE(SUM(amount_paid), 0)::text as amount
         FROM tickets
         WHERE organization_id = $1 AND status = 'refunded'
-          ${ticketDateCondition.replace(/purchased_at/g, 'purchased_at')}`,
-        dateParams
-      ),
-      // [18] Preorder count for payment methods
-      query<{ count: string }>(
-        `SELECT COUNT(*)::text as count
-        FROM preorders
-        WHERE organization_id = $1 AND status = 'picked_up'
-          ${preorderDateCondition}`,
-        dateParams
-      ),
-      // [19] Ticket count for payment methods
-      query<{ count: string }>(
-        `SELECT COUNT(*)::text as count
-        FROM tickets
-        WHERE organization_id = $1 AND status IN ('valid', 'used')
           ${ticketDateCondition}`,
         dateParams
       ),
     ]);
 
-    // Query payment method breakdown from database
-    const paymentMethodQuery = await query<{ method: string | null; count: string; revenue: string }>(
-      `SELECT
-        payment_method::text as method,
-        COUNT(*)::text as count,
-        COALESCE(SUM(total_amount), 0)::text as revenue
-      FROM orders
-      WHERE organization_id = $1
-        AND status = 'completed'
-        ${dateCondition}
-      GROUP BY payment_method
-      ORDER BY COUNT(*) DESC`,
-      dateParams
-    );
+    // ── Process combined order metrics ──
+    const cm = combinedMetricsResult[0];
+    const currentRevenue = parseFloat(cm?.revenue || '0');
+    const currentTransactions = parseInt(cm?.transactions || '0');
+    const totalTips = Math.round(parseFloat(cm?.total_tips || '0') * 100) / 100;
+    const tippedOrders = parseInt(cm?.tipped_orders || '0');
+    const quickChargeOrders = parseInt(cm?.qc_count || '0');
+    const quickChargeRevenue = parseFloat(cm?.qc_revenue || '0');
+    const refundCount = parseInt(cm?.refund_count || '0');
+    const refundAmount = Math.round(parseFloat(cm?.refund_amount || '0') * 100) / 100;
 
-    const totalPaymentMethods = paymentMethodQuery.reduce((sum, p) => sum + parseInt(p.count || '0'), 0);
-    const paymentMethods = paymentMethodQuery.map(p => {
+    const previousRevenue = parseFloat(previousMetricsResult[0]?.revenue || '0');
+    const previousTransactions = parseInt(previousMetricsResult[0]?.transactions || '0');
+
+    // ── Process order time series into labeled arrays ──
+    let revenueData: Array<{ label: string; revenue: number }> = [];
+    let transactionData: Array<{ label: string; count: number }> = [];
+
+    const tsMap: Record<string, { revenue: number; count: number }> = {};
+    orderTimeSeriesResult.forEach(row => {
+      tsMap[row.bucket] = {
+        revenue: parseFloat(row.revenue),
+        count: parseInt(row.order_count),
+      };
+    });
+
+    if (timeSeriesBucketType === 'hourly') {
+      // Determine hour range
+      const hoursWithTSData = Object.keys(tsMap).map(k => parseInt(k));
+      let minHourTS = 9, maxHourTS = 21;
+      if (hoursWithTSData.length > 0) {
+        minHourTS = Math.min(minHourTS, Math.min(...hoursWithTSData));
+        maxHourTS = Math.max(maxHourTS, Math.max(...hoursWithTSData));
+      }
+      if (range === 'custom') {
+        // Full 24h for custom single-day
+        minHourTS = 0;
+        maxHourTS = 23;
+      }
+      for (let h = minHourTS; h <= maxHourTS; h++) {
+        const hour12 = h === 0 ? 12 : (h > 12 ? h - 12 : h);
+        const ampm = h >= 12 ? 'PM' : 'AM';
+        const label = `${hour12}${ampm}`;
+        const bucket = String(h);
+        revenueData.push({ label, revenue: Math.round((tsMap[bucket]?.revenue || 0) * 100) / 100 });
+        transactionData.push({ label, count: tsMap[bucket]?.count || 0 });
+      }
+    } else if (timeSeriesBucketType === 'monthly') {
+      // Monthly bucketing (custom > 90 days)
+      const current = new Date(currentStart.getFullYear(), currentStart.getMonth(), 1);
+      const endMonth = new Date(currentEnd.getFullYear(), currentEnd.getMonth(), 1);
+      while (current <= endMonth) {
+        const yearMonth = `${current.getFullYear()}-${String(current.getMonth() + 1).padStart(2, '0')}`;
+        const label = current.toLocaleDateString('en-US', { month: 'short', year: '2-digit' });
+        revenueData.push({ label, revenue: Math.round((tsMap[yearMonth]?.revenue || 0) * 100) / 100 });
+        transactionData.push({ label, count: tsMap[yearMonth]?.count || 0 });
+        current.setMonth(current.getMonth() + 1);
+      }
+    } else {
+      // Daily bucketing
+      if (range === 'week') {
+        const dayNames = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+        for (let i = 0; i < 7; i++) {
+          const date = new Date(currentStart.getTime() + i * 24 * 60 * 60 * 1000);
+          const dateStr = date.toISOString().split('T')[0];
+          revenueData.push({ label: dayNames[i], revenue: Math.round((tsMap[dateStr]?.revenue || 0) * 100) / 100 });
+          transactionData.push({ label: dayNames[i], count: tsMap[dateStr]?.count || 0 });
+        }
+      } else if (range === 'month') {
+        const daysInMonth = new Date(currentStart.getFullYear(), currentStart.getMonth() + 1, 0).getDate();
+        for (let i = 0; i < daysInMonth; i++) {
+          const date = new Date(currentStart.getFullYear(), currentStart.getMonth(), i + 1);
+          const dateStr = date.toISOString().split('T')[0];
+          revenueData.push({ label: (i + 1).toString(), revenue: Math.round((tsMap[dateStr]?.revenue || 0) * 100) / 100 });
+          transactionData.push({ label: (i + 1).toString(), count: tsMap[dateStr]?.count || 0 });
+        }
+      } else {
+        // Custom daily (≤90 days)
+        const current = new Date(currentStart);
+        while (current <= currentEnd) {
+          const dateStr = current.toISOString().split('T')[0];
+          const label = current.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+          revenueData.push({ label, revenue: Math.round((tsMap[dateStr]?.revenue || 0) * 100) / 100 });
+          transactionData.push({ label, count: tsMap[dateStr]?.count || 0 });
+          current.setDate(current.getDate() + 1);
+        }
+      }
+    }
+
+    // ── Process payment methods ──
+    const totalPaymentMethods = paymentMethodResult.reduce((sum, p) => sum + parseInt(p.count || '0'), 0);
+    const paymentMethods = paymentMethodResult.map(p => {
       let displayMethod = 'Other';
       if (p.method === 'tap_to_pay') displayMethod = 'Tap to Pay';
       else if (p.method === 'card') displayMethod = 'Card';
@@ -3963,86 +3920,35 @@ app.openapi(analyticsRoute, async (c) => {
       };
     }).slice(0, 5);
 
-    // Query peak hours from database
-    const peakHoursQuery = await query<{ hour: string; count: string }>(
-      `SELECT
-        EXTRACT(HOUR FROM created_at)::text as hour,
-        COUNT(*)::text as count
-      FROM orders
-      WHERE organization_id = $1
-        AND status = 'completed'
-        ${dateCondition}
-      GROUP BY EXTRACT(HOUR FROM created_at)
-      ORDER BY EXTRACT(HOUR FROM created_at)`,
-      dateParams
-    );
+    // ── Process heatmap & derive peak hours from it ──
+    const dayOfWeekHeatmap = heatmapResult.map(row => ({
+      day: parseInt(row.day_of_week),
+      hour: parseInt(row.hour),
+      orderCount: parseInt(row.order_count),
+      revenue: Math.round(parseFloat(row.revenue) * 100) / 100,
+    }));
 
+    // Derive order peak hours from heatmap (sum across days for each hour)
     const hourCountMap: Record<number, number> = {};
-    peakHoursQuery.forEach(row => {
-      hourCountMap[parseInt(row.hour)] = parseInt(row.count);
+    dayOfWeekHeatmap.forEach(entry => {
+      hourCountMap[entry.hour] = (hourCountMap[entry.hour] || 0) + entry.orderCount;
     });
 
-    // Dynamically determine hour range from actual data, with ±1 hour padding
     const hoursWithData = Object.keys(hourCountMap).map(Number);
     let minHour = 9;
     let maxHour = 21;
     if (hoursWithData.length > 0) {
       minHour = Math.max(0, Math.min(...hoursWithData) - 1);
       maxHour = Math.min(23, Math.max(...hoursWithData) + 1);
-      // Ensure at least a reasonable range
       if (maxHour - minHour < 4) {
         minHour = Math.max(0, minHour - 2);
         maxHour = Math.min(23, maxHour + 2);
       }
     }
 
-    const totalHourTransactions = peakHoursQuery.reduce((sum, p) => sum + parseInt(p.count || '0'), 0);
-    const peakHours: Array<{ hour: string; count: number; percentage: number }> = [];
-    for (let h = minHour; h <= maxHour; h++) {
-      const hour12 = h > 12 ? h - 12 : (h === 0 ? 12 : h);
-      const ampm = h >= 12 ? 'PM' : 'AM';
-      const count = hourCountMap[h] || 0;
-      peakHours.push({
-        hour: `${hour12} ${ampm}`,
-        count,
-        percentage: totalHourTransactions > 0 ? Math.round((count / totalHourTransactions) * 100) : 0,
-      });
-    }
-
-    // Query top products from orders with product details
-    const orderDateCondition = useBoundedQuery
-      ? 'AND o.created_at >= $2 AND o.created_at <= $3'
-      : 'AND o.created_at >= $2';
-
-    const topProductsQuery = await query<{
-      product_id: string | null;
-      name: string;
-      description: string | null;
-      image_url: string | null;
-      quantity: string;
-      revenue: string;
-    }>(
-      `SELECT
-        oi.product_id,
-        COALESCE(oi.name, p.name, 'Unknown Product') as name,
-        p.description,
-        p.image_url,
-        SUM(oi.quantity)::text as quantity,
-        SUM(oi.quantity * oi.unit_price)::text as revenue
-      FROM order_items oi
-      JOIN orders o ON oi.order_id = o.id
-      LEFT JOIN products p ON oi.product_id = p.id
-      WHERE o.organization_id = $1
-        AND o.status = 'completed'
-        ${orderDateCondition}
-      GROUP BY oi.product_id, COALESCE(oi.name, p.name, 'Unknown Product'), p.description, p.image_url
-      ORDER BY SUM(oi.quantity) DESC
-      LIMIT 10`,
-      dateParams
-    );
-
-    const totalProductQuantity = topProductsQuery.reduce((sum, p) => sum + parseInt(p.quantity || '0'), 0);
-    const topProducts = topProductsQuery.map(p => ({
+    // ── Process top products ──
+    const totalProductQuantity = topProductsResult.reduce((sum, p) => sum + parseInt(p.quantity || '0'), 0);
+    const topProducts = topProductsResult.map(p => ({
       productId: p.product_id,
       name: p.name,
       description: p.description,
@@ -4052,42 +3958,9 @@ app.openapi(analyticsRoute, async (c) => {
       percentage: totalProductQuantity > 0 ? Math.round((parseInt(p.quantity || '0') / totalProductQuantity) * 100) : 0,
     }));
 
-    // Query catalog breakdown from orders with catalog details (excluding quick charges)
-    const catalogBreakdownQuery = await query<{
-      catalog_id: string | null;
-      catalog_name: string | null;
-      catalog_description: string | null;
-      catalog_location: string | null;
-      catalog_date: string | null;
-      catalog_created_at: string | null;
-      product_count: string;
-      order_count: string;
-      revenue: string;
-    }>(
-      `SELECT
-        o.catalog_id,
-        c.name as catalog_name,
-        c.description as catalog_description,
-        c.location as catalog_location,
-        c.date as catalog_date,
-        c.created_at::text as catalog_created_at,
-        (SELECT COUNT(*)::text FROM catalog_products WHERE catalog_id = c.id) as product_count,
-        COUNT(o.id)::text as order_count,
-        SUM(o.total_amount)::text as revenue
-      FROM orders o
-      LEFT JOIN catalogs c ON o.catalog_id = c.id
-      WHERE o.organization_id = $1
-        AND o.status = 'completed'
-        AND o.catalog_id IS NOT NULL
-        AND (o.metadata->>'isQuickCharge')::boolean IS NOT TRUE
-        ${orderDateCondition}
-      GROUP BY o.catalog_id, c.name, c.description, c.location, c.date, c.created_at, c.id
-      ORDER BY COUNT(o.id) DESC`,
-      dateParams
-    );
-
-    const totalCatalogOrders = catalogBreakdownQuery.reduce((sum, c) => sum + parseInt(c.order_count || '0'), 0);
-    const catalogBreakdown = catalogBreakdownQuery.map(c => ({
+    // ── Process catalog breakdown ──
+    const totalCatalogOrders = catalogBreakdownResult.reduce((sum, c) => sum + parseInt(c.order_count || '0'), 0);
+    const catalogBreakdown = catalogBreakdownResult.map(c => ({
       catalogId: c.catalog_id,
       catalogName: c.catalog_name || 'Unknown Catalog',
       description: c.catalog_description,
@@ -4100,32 +3973,9 @@ app.openapi(analyticsRoute, async (c) => {
       percentage: totalCatalogOrders > 0 ? Math.round((parseInt(c.order_count || '0') / totalCatalogOrders) * 100) : 0,
     }));
 
-    // Query category breakdown from order_items
-    const categoryBreakdownQuery = await query<{
-      category_id: string | null;
-      category_name: string | null;
-      quantity: string;
-      revenue: string;
-    }>(
-      `SELECT
-        oi.category_id,
-        cat.name as category_name,
-        SUM(oi.quantity)::text as quantity,
-        SUM(oi.quantity * oi.unit_price)::text as revenue
-      FROM order_items oi
-      JOIN orders o ON oi.order_id = o.id
-      LEFT JOIN categories cat ON oi.category_id = cat.id
-      WHERE o.organization_id = $1
-        AND o.status = 'completed'
-        ${orderDateCondition}
-      GROUP BY oi.category_id, cat.name
-      ORDER BY SUM(oi.quantity) DESC
-      LIMIT 10`,
-      dateParams
-    );
-
-    const totalCategoryQuantity = categoryBreakdownQuery.reduce((sum, c) => sum + parseInt(c.quantity || '0'), 0);
-    const categoryBreakdown = categoryBreakdownQuery.map(c => ({
+    // ── Process category breakdown ──
+    const totalCategoryQuantity = categoryBreakdownResult.reduce((sum, c) => sum + parseInt(c.quantity || '0'), 0);
+    const categoryBreakdown = categoryBreakdownResult.map(c => ({
       categoryId: c.category_id,
       categoryName: c.category_name || 'Uncategorized',
       quantity: parseInt(c.quantity || '0'),
@@ -4133,146 +3983,15 @@ app.openapi(analyticsRoute, async (c) => {
       percentage: totalCategoryQuantity > 0 ? Math.round((parseInt(c.quantity || '0') / totalCategoryQuantity) * 100) : 0,
     }));
 
-    // Query Quick Charge stats (orders with isQuickCharge flag in metadata)
-    const quickChargeQuery = await query<{
-      order_count: string;
-      revenue: string;
-    }>(
-      `SELECT
-        COUNT(*)::text as order_count,
-        COALESCE(SUM(total_amount), 0)::text as revenue
-      FROM orders
-      WHERE organization_id = $1
-        AND status = 'completed'
-        ${dateCondition}
-        AND (metadata->>'isQuickCharge')::boolean = true`,
-      dateParams
-    );
-
-    const quickChargeOrders = parseInt(quickChargeQuery[0]?.order_count || '0');
-    const quickChargeRevenue = parseFloat(quickChargeQuery[0]?.revenue || '0');
-    // (quickChargePercentage now computed in merge section as mergedQuickChargePercentage)
-
-    // Query day-of-week × hour heatmap
-    const heatmapQuery = await query<{
-      day_of_week: string;
-      hour: string;
-      order_count: string;
-      revenue: string;
-    }>(
-      `SELECT
-        EXTRACT(DOW FROM created_at)::text as day_of_week,
-        EXTRACT(HOUR FROM created_at)::text as hour,
-        COUNT(*)::text as order_count,
-        COALESCE(SUM(total_amount), 0)::text as revenue
-      FROM orders
-      WHERE organization_id = $1
-        AND status = 'completed'
-        ${dateCondition}
-      GROUP BY EXTRACT(DOW FROM created_at), EXTRACT(HOUR FROM created_at)
-      ORDER BY EXTRACT(DOW FROM created_at), EXTRACT(HOUR FROM created_at)`,
-      dateParams
-    );
-
-    const dayOfWeekHeatmap = heatmapQuery.map(row => ({
-      day: parseInt(row.day_of_week),
-      hour: parseInt(row.hour),
-      orderCount: parseInt(row.order_count),
-      revenue: Math.round(parseFloat(row.revenue) * 100) / 100,
-    }));
-
-    // (avgOrderData now computed in merge section as mergedAvgOrderData)
-
-    // Query refund stats
-    const refundQuery = await query<{ refund_count: string; refund_amount: string }>(
-      `SELECT
-        COUNT(*)::text as refund_count,
-        COALESCE(SUM(total_amount), 0)::text as refund_amount
-      FROM orders
-      WHERE organization_id = $1
-        AND status = 'refunded'
-        ${dateCondition}`,
-      dateParams
-    );
-
-    const refundCount = parseInt(refundQuery[0]?.refund_count || '0');
-    const refundAmount = Math.round(parseFloat(refundQuery[0]?.refund_amount || '0') * 100) / 100;
-    // (refundRate now computed in merge section as mergedRefundRate)
-
-    // Query customer metrics (new vs returning) from the customers table
-    // which is populated from orders, preorders, AND ticket purchases
-    const customerQuery = await query<{ new_customers: string; returning_customers: string }>(
-      `SELECT
-        COUNT(CASE WHEN created_at >= $2 ${useBoundedQuery ? 'AND created_at <= $3' : ''} THEN 1 END)::text as new_customers,
-        COUNT(CASE WHEN created_at < $2 THEN 1 END)::text as returning_customers
-      FROM customers
-      WHERE organization_id = $1
-        AND total_orders > 0
-        AND last_order_at >= $2
-        ${useBoundedQuery ? 'AND last_order_at <= $3' : ''}`,
-      dateParams
-    );
-
-    const newCustomers = parseInt(customerQuery[0]?.new_customers || '0');
-    const returningCustomers = parseInt(customerQuery[0]?.returning_customers || '0');
+    // ── Process customer metrics ──
+    const newCustomers = parseInt(customerResult[0]?.new_customers || '0');
+    const returningCustomers = parseInt(customerResult[0]?.returning_customers || '0');
     const totalCustomers = newCustomers + returningCustomers;
     const repeatRate = totalCustomers > 0 ? Math.round((returningCustomers / totalCustomers) * 1000) / 10 : 0;
 
-    // (revenueVelocity now computed in merge section as mergedRevenueVelocity)
-
-    // Query tip stats
-    const tipQuery = await query<{
-      total_tips: string;
-      avg_tip: string;
-      tipped_orders: string;
-    }>(
-      `SELECT
-        COALESCE(SUM(tip_amount), 0)::text as total_tips,
-        CASE WHEN COUNT(*) > 0
-          THEN (COALESCE(SUM(tip_amount), 0) / COUNT(*))::text
-          ELSE '0'
-        END as avg_tip,
-        COUNT(CASE WHEN tip_amount > 0 THEN 1 END)::text as tipped_orders
-      FROM orders
-      WHERE organization_id = $1
-        AND status = 'completed'
-        ${dateCondition}`,
-      dateParams
-    );
-
-    const totalTips = Math.round(parseFloat(tipQuery[0]?.total_tips || '0') * 100) / 100;
-    // (avgTip and tipRate now computed in merge section)
-    const tippedOrders = parseInt(tipQuery[0]?.tipped_orders || '0');
-
-    // Query staff (user) breakdown
-    const staffQuery = await query<{
-      user_id: string;
-      first_name: string | null;
-      last_name: string | null;
-      avatar_image_id: string | null;
-      order_count: string;
-      revenue: string;
-    }>(
-      `SELECT
-        o.user_id,
-        u.first_name,
-        u.last_name,
-        u.avatar_image_id,
-        COUNT(*)::text as order_count,
-        COALESCE(SUM(o.total_amount), 0)::text as revenue
-      FROM orders o
-      LEFT JOIN users u ON o.user_id = u.id
-      WHERE o.organization_id = $1
-        AND o.status = 'completed'
-        AND o.user_id IS NOT NULL
-        AND o.created_at >= $2${useBoundedQuery ? ' AND o.created_at <= $3' : ''}
-      GROUP BY o.user_id, u.first_name, u.last_name, u.avatar_image_id
-      ORDER BY SUM(o.total_amount) DESC`,
-      dateParams
-    );
-
-    const totalStaffOrders = staffQuery.reduce((sum, s) => sum + parseInt(s.order_count || '0'), 0);
-    const staffBreakdown = staffQuery.map(s => {
+    // ── Process staff breakdown ──
+    const totalStaffOrders = staffResult.reduce((sum, s) => sum + parseInt(s.order_count || '0'), 0);
+    const staffBreakdown = staffResult.map(s => {
       const orderCount = parseInt(s.order_count || '0');
       const revenue = Math.round(parseFloat(s.revenue || '0') * 100) / 100;
       return {
@@ -4288,41 +4007,9 @@ app.openapi(analyticsRoute, async (c) => {
       };
     });
 
-    // Query device breakdown (LEFT JOIN devices table for device info)
-    // Note: Using explicit o.created_at since dateCondition is ambiguous with JOIN
-    const deviceDateCondition = useBoundedQuery
-      ? 'AND o.created_at >= $2 AND o.created_at <= $3'
-      : 'AND o.created_at >= $2';
-    const deviceQuery = await query<{
-      device_id: string;
-      device_name: string | null;
-      model_name: string | null;
-      os_name: string | null;
-      order_count: string;
-      revenue: string;
-      last_used: string | null;
-    }>(
-      `SELECT
-        o.device_id,
-        d.device_name,
-        d.model_name,
-        d.os_name,
-        COUNT(*)::text as order_count,
-        COALESCE(SUM(o.total_amount), 0)::text as revenue,
-        MAX(o.created_at)::text as last_used
-      FROM orders o
-      LEFT JOIN devices d ON d.device_id = o.device_id
-      WHERE o.organization_id = $1
-        AND o.status = 'completed'
-        AND o.device_id IS NOT NULL
-        ${deviceDateCondition}
-      GROUP BY o.device_id, d.device_name, d.model_name, d.os_name
-      ORDER BY SUM(o.total_amount) DESC`,
-      dateParams
-    );
-
-    const totalDeviceOrders = deviceQuery.reduce((sum, d) => sum + parseInt(d.order_count || '0'), 0);
-    const deviceBreakdown = deviceQuery.map(d => {
+    // ── Process device breakdown ──
+    const totalDeviceOrders = deviceResult.reduce((sum, d) => sum + parseInt(d.order_count || '0'), 0);
+    const deviceBreakdown = deviceResult.map(d => {
       const orderCount = parseInt(d.order_count || '0');
       const revenue = Math.round(parseFloat(d.revenue || '0') * 100) / 100;
       return {
@@ -4338,31 +4025,14 @@ app.openapi(analyticsRoute, async (c) => {
       };
     });
 
-    // ── Await and merge preorder & ticket data ──
-    const ptResults = await preorderTicketPromise;
-
-    const preorderCurrentAgg = ptResults[0][0];
-    const ticketCurrentAgg = ptResults[1][0];
-    const preorderPreviousAgg = ptResults[2][0];
-    const ticketPreviousAgg = ptResults[3][0];
-    const preorderHourlyTS = ptResults[4];
-    const ticketHourlyTS = ptResults[5];
-    const preorderDailyTS = ptResults[6];
-    const ticketDailyTS = ptResults[7];
-    const preorderMonthlyTS = ptResults[8];
-    const ticketMonthlyTS = ptResults[9];
-    const preorderTopProducts = ptResults[10];
-    const preorderCatalogBreakdown = ptResults[11];
-    const preorderPeakHours = ptResults[12];
-    const ticketPeakHours = ptResults[13];
-    const preorderHeatmap = ptResults[14];
-    const ticketHeatmap = ptResults[15];
-    const cancelledPreorders = ptResults[16][0];
-    const refundedTickets = ptResults[17][0];
-    const preorderPaymentCount = parseInt(ptResults[18][0]?.count || '0');
-    const ticketPaymentCount = parseInt(ptResults[19][0]?.count || '0');
+    // ── Merge preorder & ticket data ──
 
     // 1. Core metrics — add preorder + ticket revenue/count
+    const preorderCurrentAgg = preorderCurrentAggResult[0];
+    const ticketCurrentAgg = ticketCurrentAggResult[0];
+    const preorderPreviousAgg = preorderPreviousAggResult[0];
+    const ticketPreviousAgg = ticketPreviousAggResult[0];
+
     const preorderRevenue = parseFloat(preorderCurrentAgg?.revenue || '0');
     const preorderCount = parseInt(preorderCurrentAgg?.count || '0');
     const ticketRevenue = parseFloat(ticketCurrentAgg?.revenue || '0');
@@ -4382,56 +4052,28 @@ app.openapi(analyticsRoute, async (c) => {
     const mergedPreviousTransactions = previousTransactions + prevPreorderCount + prevTicketCount;
 
     // 3. Merge time series — add preorder/ticket values into each time bucket
-    // Determine which time series results to use based on bucket type
-    let preorderTSData: Array<{ bucket: string; revenue: string; order_count: string }>;
-    let ticketTSData: Array<{ bucket: string; revenue: string; order_count: string }>;
-
-    if (timeSeriesBucketType === 'hourly') {
-      preorderTSData = preorderHourlyTS;
-      ticketTSData = ticketHourlyTS;
-    } else if (timeSeriesBucketType === 'monthly') {
-      preorderTSData = preorderMonthlyTS;
-      ticketTSData = ticketMonthlyTS;
-    } else {
-      preorderTSData = preorderDailyTS;
-      ticketTSData = ticketDailyTS;
-    }
-
-    // Build maps from preorder/ticket time series
     const preorderTSMap: Record<string, { revenue: number; count: number }> = {};
-    preorderTSData.forEach(row => {
+    preorderTSResult.forEach(row => {
       preorderTSMap[row.bucket] = {
         revenue: parseFloat(row.revenue || '0'),
         count: parseInt(row.order_count || '0'),
       };
     });
     const ticketTSMap: Record<string, { revenue: number; count: number }> = {};
-    ticketTSData.forEach(row => {
+    ticketTSResult.forEach(row => {
       ticketTSMap[row.bucket] = {
         revenue: parseFloat(row.revenue || '0'),
         count: parseInt(row.order_count || '0'),
       };
     });
 
-    // Map labels back to bucket keys for merging
-    // For hourly: label is "12AM", "1PM", etc. — we need to match by hour number
-    // For daily (week): label is "Mon", "Tue" — we need date key
-    // For daily (month/custom): label is day number or "Jan 5" — we need date key
-    // For monthly: label is "Jan '25" — we need YYYY-MM key
-    // We'll iterate revenueData/transactionData and merge based on bucket type + index
-
     if (timeSeriesBucketType === 'hourly') {
-      // For hourly bucketing, the bucket key is the hour number (0-23)
-      // We need to match revenueData labels back to hours
-      // revenueData labels are like "9AM", "12PM", "1PM" etc.
-      // We'll reconstruct the hour from the label or iterate the range directly
       const hourLabels: Record<string, number> = {};
-      // Build reverse map from label to hour
       for (let h = 0; h <= 23; h++) {
         const hour12 = h === 0 ? 12 : (h > 12 ? h - 12 : h);
         const ampm = h >= 12 ? 'PM' : 'AM';
         hourLabels[`${hour12}${ampm}`] = h;
-        hourLabels[`${hour12} ${ampm}`] = h; // Handle possible space variant
+        hourLabels[`${hour12} ${ampm}`] = h;
       }
       revenueData = revenueData.map(rd => {
         const h = hourLabels[rd.label];
@@ -4454,12 +4096,6 @@ app.openapi(analyticsRoute, async (c) => {
         return td;
       });
     } else if (timeSeriesBucketType === 'daily') {
-      // For daily bucketing, bucket keys are YYYY-MM-DD dates
-      // We need to match revenueData indices to dates
-      // For 'week': labels are Mon-Sun, we can rebuild dates from currentStart + index
-      // For 'month': labels are day numbers, we can rebuild dates
-      // For 'custom' daily: labels are "Jan 5" etc, rebuild from currentStart + index
-      // Easiest approach: iterate by index and reconstruct the date
       for (let i = 0; i < revenueData.length; i++) {
         const date = new Date(currentStart.getTime() + i * 24 * 60 * 60 * 1000);
         const dateStr = date.toISOString().split('T')[0];
@@ -4477,8 +4113,7 @@ app.openapi(analyticsRoute, async (c) => {
         }
       }
     } else {
-      // Monthly bucketing — bucket keys are YYYY-MM
-      // Labels are like "Jan '25" — iterate by index from currentStart month
+      // Monthly
       for (let i = 0; i < revenueData.length; i++) {
         const monthDate = new Date(currentStart.getFullYear(), currentStart.getMonth() + i, 1);
         const yearMonth = `${monthDate.getFullYear()}-${String(monthDate.getMonth() + 1).padStart(2, '0')}`;
@@ -4499,47 +4134,45 @@ app.openapi(analyticsRoute, async (c) => {
 
     // 4. Payment methods — add "Preorder" and "Ticket Sale" entries
     const mergedPaymentMethods = [...paymentMethods];
-    if (preorderPaymentCount > 0) {
+    if (preorderCount > 0) {
       mergedPaymentMethods.push({
         method: 'Preorder',
-        count: preorderPaymentCount,
+        count: preorderCount,
         revenue: Math.round(preorderRevenue * 100) / 100,
-        percentage: 0, // Recalculated below
+        percentage: 0,
       });
     }
-    if (ticketPaymentCount > 0) {
+    if (ticketCount > 0) {
       mergedPaymentMethods.push({
         method: 'Ticket Sale',
-        count: ticketPaymentCount,
+        count: ticketCount,
         revenue: Math.round(ticketRevenue * 100) / 100,
-        percentage: 0, // Recalculated below
+        percentage: 0,
       });
     }
-    // Recalculate percentages for all payment methods
     const mergedTotalPayments = mergedPaymentMethods.reduce((sum, p) => sum + p.count, 0);
     mergedPaymentMethods.forEach(p => {
       p.percentage = mergedTotalPayments > 0 ? Math.round((p.count / mergedTotalPayments) * 100) : 0;
     });
 
-    // 5. Peak hours — merge preorder/ticket hourly data
-    // Build maps from preorder/ticket peak hours
+    // 5. Peak hours — derive preorder/ticket peak hours from their heatmap data
     const preorderPeakMap: Record<number, number> = {};
-    preorderPeakHours.forEach(row => {
-      preorderPeakMap[parseInt(row.hour)] = parseInt(row.count);
+    preorderHeatmapResult.forEach(row => {
+      const hour = parseInt(row.hour);
+      preorderPeakMap[hour] = (preorderPeakMap[hour] || 0) + parseInt(row.order_count);
     });
     const ticketPeakMap: Record<number, number> = {};
-    ticketPeakHours.forEach(row => {
-      ticketPeakMap[parseInt(row.hour)] = parseInt(row.count);
+    ticketHeatmapResult.forEach(row => {
+      const hour = parseInt(row.hour);
+      ticketPeakMap[hour] = (ticketPeakMap[hour] || 0) + parseInt(row.order_count);
     });
 
-    // Merge into hourCountMap and rebuild peakHours
     const allPeakHoursWithData = new Set([
       ...Object.keys(hourCountMap).map(Number),
       ...Object.keys(preorderPeakMap).map(Number),
       ...Object.keys(ticketPeakMap).map(Number),
     ]);
 
-    // Expand min/max range if preorder/ticket data has hours outside current range
     let mergedMinHour = minHour;
     let mergedMaxHour = maxHour;
     if (allPeakHoursWithData.size > 0) {
@@ -4552,7 +4185,6 @@ app.openapi(analyticsRoute, async (c) => {
       }
     }
 
-    // Build merged peak hours
     let mergedTotalHourTransactions = 0;
     const mergedPeakHoursData: Array<{ hour: string; count: number; percentage: number }> = [];
     for (let h = mergedMinHour; h <= mergedMaxHour; h++) {
@@ -4563,7 +4195,7 @@ app.openapi(analyticsRoute, async (c) => {
       mergedPeakHoursData.push({
         hour: `${hour12} ${ampm}`,
         count,
-        percentage: 0, // Recalculated below
+        percentage: 0,
       });
     }
     mergedPeakHoursData.forEach(ph => {
@@ -4576,7 +4208,7 @@ app.openapi(analyticsRoute, async (c) => {
       const key = `${entry.day}-${entry.hour}`;
       heatmapMergeMap[key] = { orderCount: entry.orderCount, revenue: entry.revenue };
     });
-    preorderHeatmap.forEach(row => {
+    preorderHeatmapResult.forEach(row => {
       const key = `${parseInt(row.day_of_week)}-${parseInt(row.hour)}`;
       if (!heatmapMergeMap[key]) {
         heatmapMergeMap[key] = { orderCount: 0, revenue: 0 };
@@ -4584,7 +4216,7 @@ app.openapi(analyticsRoute, async (c) => {
       heatmapMergeMap[key].orderCount += parseInt(row.order_count);
       heatmapMergeMap[key].revenue += parseFloat(row.revenue);
     });
-    ticketHeatmap.forEach(row => {
+    ticketHeatmapResult.forEach(row => {
       const key = `${parseInt(row.day_of_week)}-${parseInt(row.hour)}`;
       if (!heatmapMergeMap[key]) {
         heatmapMergeMap[key] = { orderCount: 0, revenue: 0 };
@@ -4602,13 +4234,13 @@ app.openapi(analyticsRoute, async (c) => {
       };
     }).sort((a, b) => a.day !== b.day ? a.day - b.day : a.hour - b.hour);
 
-    // 7. Top products — merge preorder items into top products, re-sort, take top 10
+    // 7. Top products — merge preorder items, re-sort, take top 10
     const productMergeMap: Record<string, { productId: string | null; name: string; description: string | null; imageUrl: string | null; quantity: number; revenue: number }> = {};
     topProducts.forEach(p => {
       const key = p.productId || `unnamed:${p.name}`;
       productMergeMap[key] = { ...p };
     });
-    preorderTopProducts.forEach(p => {
+    preorderTopProductsResult.forEach(p => {
       const key = p.product_id || `unnamed:${p.name}`;
       if (productMergeMap[key]) {
         productMergeMap[key].quantity += parseInt(p.quantity || '0');
@@ -4633,12 +4265,12 @@ app.openapi(analyticsRoute, async (c) => {
       percentage: mergedTotalProductQty > 0 ? Math.round((p.quantity / mergedTotalProductQty) * 100) : 0,
     }));
 
-    // 8. Catalog breakdown — merge preorder catalog counts into existing
+    // 8. Catalog breakdown — merge preorder catalog counts
     const catalogMergeMap: Record<string, typeof catalogBreakdown[0]> = {};
     catalogBreakdown.forEach(c => {
       catalogMergeMap[c.catalogId || 'null'] = { ...c };
     });
-    preorderCatalogBreakdown.forEach(pc => {
+    preorderCatalogResult.forEach(pc => {
       const key = pc.catalog_id || 'null';
       if (catalogMergeMap[key]) {
         catalogMergeMap[key].orderCount += parseInt(pc.order_count || '0');
@@ -4678,10 +4310,10 @@ app.openapi(analyticsRoute, async (c) => {
       : 0;
 
     // 10. Refund stats — add cancelled preorders + refunded tickets
-    const cancelledPreorderCount = parseInt(cancelledPreorders?.count || '0');
-    const cancelledPreorderAmount = Math.round(parseFloat(cancelledPreorders?.amount || '0') * 100) / 100;
-    const refundedTicketCount = parseInt(refundedTickets?.count || '0');
-    const refundedTicketAmount = Math.round(parseFloat(refundedTickets?.amount || '0') * 100) / 100;
+    const cancelledPreorderCount = parseInt(cancelledPreordersResult[0]?.count || '0');
+    const cancelledPreorderAmount = Math.round(parseFloat(cancelledPreordersResult[0]?.amount || '0') * 100) / 100;
+    const refundedTicketCount = parseInt(refundedTicketsResult[0]?.count || '0');
+    const refundedTicketAmount = Math.round(parseFloat(refundedTicketsResult[0]?.amount || '0') * 100) / 100;
 
     const mergedRefundCount = refundCount + cancelledPreorderCount + refundedTicketCount;
     const mergedRefundAmount = Math.round((refundAmount + cancelledPreorderAmount + refundedTicketAmount) * 100) / 100;

@@ -92,7 +92,7 @@ function formatPreorder(row: any) {
     taxAmount: parseFloat(row.tax_amount),
     tipAmount: parseFloat(row.tip_amount),
     totalAmount: parseFloat(row.total_amount),
-    status: row.status,
+    status: row.status === 'cancelled' && row.stripe_charge_id ? 'refunded' : row.status,
     estimatedReadyAt: row.estimated_ready_at?.toISOString() || null,
     readyAt: row.ready_at?.toISOString() || null,
     pickedUpAt: row.picked_up_at?.toISOString() || null,
@@ -137,6 +137,16 @@ app.openapi(getPublicMenuRoute, async (c) => {
     }
 
     const catalog = catalogs[0];
+
+    // Check if organization has a Pro subscription (preorders are Pro-only)
+    const subRows = await query<{ tier: string }>(
+      `SELECT tier FROM subscriptions WHERE organization_id = $1 AND status IN ('active', 'trialing') LIMIT 1`,
+      [(catalog as any).organization_id]
+    );
+    const orgTier = subRows[0]?.tier || 'starter';
+    if (orgTier === 'starter' || orgTier === 'free') {
+      return c.json({ error: 'Menu not available' }, 404);
+    }
 
     // Check if organization has Stripe Connect enabled
     const stripeAccounts = await query(
@@ -302,12 +312,17 @@ app.openapi(createPreorderRoute, async (c) => {
     const sessionId = generateSessionId();
     const estimatedReadyAt = new Date(Date.now() + (catalog.estimated_prep_time || 10) * 60 * 1000);
 
-    // Get subscription tier for platform fees
+    // Get subscription tier for platform fees + Pro check
     const subRows = await query<{ tier: string }>(
       `SELECT tier FROM subscriptions WHERE organization_id = $1 AND status IN ('active', 'trialing') LIMIT 1`,
       [organizationId]
     );
     const subTier = (subRows[0]?.tier || 'starter') as SubscriptionTier;
+
+    // Preorders require Pro subscription
+    if (subTier === 'starter') {
+      return c.json({ error: 'Preorders are not available for this menu', code: 'PRO_REQUIRED' }, 403);
+    }
 
     let paymentIntentId: string | null = null;
     let chargeId: string | null = null;
@@ -365,8 +380,8 @@ app.openapi(createPreorderRoute, async (c) => {
       chargeId = (paymentIntent.latest_charge as string) || null;
     }
 
-    // Create preorder in transaction
-    return await transaction(async (client) => {
+    // Create preorder in transaction — side effects (socket, email) happen AFTER commit
+    const { preorder, dailyNumber } = await transaction(async (client) => {
       // Get next daily order number for this organization (resets each day)
       const dailyResult = await client.query(
         `SELECT COALESCE(MAX(daily_number), 0) + 1 AS next_number
@@ -446,79 +461,74 @@ app.openapi(createPreorderRoute, async (c) => {
         [organizationId, body.customerEmail.toLowerCase(), body.customerName, totalAmount]
       );
 
-      logger.info('Preorder created', {
-        preorderId: preorder.id,
-        orderNumber,
-        dailyNumber,
-        organizationId: organizationId,
-        catalogId: catalog.id,
-        catalogSlug: slug,
-        paymentType: body.paymentType,
-        totalAmount,
-      });
-
-      // Emit socket event for vendor notification
-      logger.info('[PREORDER DEBUG] Emitting PREORDER_CREATED event', {
-        organizationId,
-        preorderId: preorder.id,
-        orderNumber,
-        event: SocketEvents.PREORDER_CREATED,
-        targetRoom: `org:${organizationId}`,
-      });
-
-      socketService.emitToOrganization(organizationId, SocketEvents.PREORDER_CREATED, {
-        preorderId: preorder.id,
-        orderNumber,
-        dailyNumber,
-        catalogId: catalog.id,
-        customerName: body.customerName,
-        totalAmount,
-        paymentType: body.paymentType,
-        itemCount: body.items.length,
-      });
-
-      // Queue confirmation email
-      const siteUrl = process.env.SITE_URL || 'https://lumapos.co';
-      const trackingUrl = `${siteUrl}/menu/${slug}/success?id=${preorder.id}&email=${encodeURIComponent(body.customerEmail.toLowerCase().trim())}`;
-
-      await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
-        type: 'preorder_confirmation',
-        to: body.customerEmail,
-        data: {
-          orderNumber,
-          dailyNumber,
-          customerName: body.customerName,
-          catalogName: catalog.name,
-          location: catalog.location,
-          items: body.items.map((item: any) => ({
-            name: productMap.get(item.catalogProductId).name,
-            quantity: item.quantity,
-            unitPrice: parseFloat(productMap.get(item.catalogProductId).price) / 100,
-          })),
-          subtotal,
-          taxAmount,
-          tipAmount,
-          totalAmount,
-          paymentType: body.paymentType,
-          estimatedReadyAt: estimatedReadyAt.toISOString(),
-          pickupInstructions: catalog.pickup_instructions,
-          trackingUrl,
-        },
-      });
-
-      return c.json({
-        preorder: {
-          ...formatPreorder(preorder),
-          items: body.items.map((item: any) => ({
-            catalogProductId: item.catalogProductId,
-            name: productMap.get(item.catalogProductId).name,
-            unitPrice: parseFloat(productMap.get(item.catalogProductId).price) / 100,
-            quantity: item.quantity,
-            notes: item.notes || null,
-          })),
-        },
-      }, 201);
+      return { preorder, dailyNumber };
     });
+
+    // --- Transaction committed — safe to emit socket events and queue emails ---
+
+    logger.info('Preorder created', {
+      preorderId: preorder.id,
+      orderNumber,
+      dailyNumber,
+      organizationId: organizationId,
+      catalogId: catalog.id,
+      catalogSlug: slug,
+      paymentType: body.paymentType,
+      totalAmount,
+    });
+
+    socketService.emitToOrganization(organizationId, SocketEvents.PREORDER_CREATED, {
+      preorderId: preorder.id,
+      orderNumber,
+      dailyNumber,
+      catalogId: catalog.id,
+      customerName: body.customerName,
+      totalAmount,
+      paymentType: body.paymentType,
+      itemCount: body.items.length,
+    });
+
+    // Queue confirmation email
+    const siteUrl = process.env.SITE_URL || 'https://lumapos.co';
+    const trackingUrl = `${siteUrl}/menu/${slug}/success?id=${preorder.id}&email=${encodeURIComponent(body.customerEmail.toLowerCase().trim())}`;
+
+    await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
+      type: 'preorder_confirmation',
+      to: body.customerEmail,
+      data: {
+        orderNumber,
+        dailyNumber,
+        customerName: body.customerName,
+        catalogName: catalog.name,
+        location: catalog.location,
+        items: body.items.map((item: any) => ({
+          name: productMap.get(item.catalogProductId).name,
+          quantity: item.quantity,
+          unitPrice: parseFloat(productMap.get(item.catalogProductId).price) / 100,
+        })),
+        subtotal,
+        taxAmount,
+        tipAmount,
+        totalAmount,
+        paymentType: body.paymentType,
+        estimatedReadyAt: estimatedReadyAt.toISOString(),
+        pickupInstructions: catalog.pickup_instructions,
+        trackingUrl,
+      },
+    });
+
+    return c.json({
+      preorder: {
+        ...formatPreorder(preorder),
+        items: body.items.map((item: any) => ({
+          catalogProductId: item.catalogProductId,
+          name: productMap.get(item.catalogProductId).name,
+          unitPrice: parseFloat(productMap.get(item.catalogProductId).price) / 100,
+          quantity: item.quantity,
+          notes: item.notes || null,
+        })),
+      },
+    }, 201);
   } catch (error: any) {
     logger.error('Error creating preorder', { error, slug });
     if (error.type === 'StripeCardError') {

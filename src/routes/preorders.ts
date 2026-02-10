@@ -4,6 +4,7 @@ import { query } from '../db';
 import { logger } from '../utils/logger';
 import { socketService, SocketEvents } from '../services/socket';
 import { queueService, QueueName } from '../services/queue';
+import { stripe } from '../services/stripe';
 
 const app = new OpenAPIHono();
 
@@ -553,9 +554,33 @@ app.openapi(completePreorderRoute, async (c) => {
       updates.push(`stripe_payment_intent_id = $${paramCount}`);
       values.push(body.stripePaymentIntentId);
       paramCount++;
-    }
 
-    if (body.stripeChargeId) {
+      // Look up the charge ID from the payment intent
+      try {
+        const connectedAccounts = await query<{ stripe_account_id: string }>(
+          'SELECT stripe_account_id FROM stripe_connected_accounts WHERE organization_id = $1 LIMIT 1',
+          [payload.organizationId]
+        );
+        if (connectedAccounts[0]) {
+          const pi = await stripe.paymentIntents.retrieve(
+            body.stripePaymentIntentId,
+            { stripeAccount: connectedAccounts[0].stripe_account_id }
+          );
+          if (pi.latest_charge) {
+            const chargeId = typeof pi.latest_charge === 'string' ? pi.latest_charge : pi.latest_charge.id;
+            updates.push(`stripe_charge_id = $${paramCount}`);
+            values.push(chargeId);
+            paramCount++;
+          }
+        }
+      } catch (err) {
+        logger.warn('Failed to retrieve charge ID from payment intent during preorder completion', {
+          preorderId: id,
+          paymentIntentId: body.stripePaymentIntentId,
+          error: (err as Error).message,
+        });
+      }
+    } else if (body.stripeChargeId) {
       updates.push(`stripe_charge_id = $${paramCount}`);
       values.push(body.stripeChargeId);
       paramCount++;
