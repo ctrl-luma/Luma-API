@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { tipsService } from '../services/tips';
 import { logger } from '../utils/logger';
 import { socketService, SocketEvents } from '../services/socket';
+import { query } from '../db';
 
 const app = new OpenAPIHono();
 
@@ -149,6 +150,19 @@ async function verifyAuth(authHeader: string | undefined) {
   return authService.verifyToken(token);
 }
 
+// Pro subscription check
+async function requirePro(organizationId: string): Promise<{ tier: string } | null> {
+  const rows = await query<{ tier: string; status: string }>(
+    `SELECT tier, status FROM subscriptions
+     WHERE organization_id = $1 AND status IN ('active', 'trialing') LIMIT 1`,
+    [organizationId]
+  );
+  if (rows.length === 0) return null;
+  const { tier } = rows[0];
+  if (tier !== 'pro' && tier !== 'enterprise') return null;
+  return { tier };
+}
+
 // Helper to transform DB row to API response format
 function transformPool(pool: any) {
   return {
@@ -230,6 +244,12 @@ const getTipReportRoute = createRoute({
 app.openapi(getTipReportRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Tip management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const { startDate, endDate } = c.req.query();
 
     const report = await tipsService.getTipReport(
@@ -278,6 +298,12 @@ const getStaffWithTipsRoute = createRoute({
 app.openapi(getStaffWithTipsRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Tip management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const { startDate, endDate } = c.req.query();
 
     const staff = await tipsService.getStaffWithTips(
@@ -332,6 +358,12 @@ const listPoolsRoute = createRoute({
 app.openapi(listPoolsRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Tip management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const { status, limit, offset } = c.req.query();
 
     const result = await tipsService.listPools(payload.organizationId, {
@@ -387,6 +419,12 @@ const createPoolRoute = createRoute({
 app.openapi(createPoolRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Tip management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const body = await c.req.json();
 
     const pool = await tipsService.createPool({
@@ -448,6 +486,12 @@ const getPoolRoute = createRoute({
 app.openapi(getPoolRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Tip management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const { id } = c.req.param();
 
     const pool = await tipsService.getPool(id, payload.organizationId);
@@ -507,6 +551,12 @@ const updatePoolRoute = createRoute({
 app.openapi(updatePoolRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Tip management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const { id } = c.req.param();
     const body = await c.req.json();
 
@@ -560,6 +610,12 @@ const deletePoolRoute = createRoute({
 app.openapi(deletePoolRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Tip management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const { id } = c.req.param();
 
     const deleted = await tipsService.deletePool(id, payload.organizationId);
@@ -624,6 +680,12 @@ const setPoolMembersRoute = createRoute({
 app.openapi(setPoolMembersRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Tip management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const { id } = c.req.param();
     const body = await c.req.json();
 
@@ -677,6 +739,12 @@ const removePoolMemberRoute = createRoute({
 app.openapi(removePoolMemberRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Tip management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const { id, userId } = c.req.param();
 
     const removed = await tipsService.removePoolMember(id, userId, payload.organizationId);
@@ -737,6 +805,12 @@ const calculatePoolRoute = createRoute({
 app.openapi(calculatePoolRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Tip management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const { id } = c.req.param();
 
     const pool = await tipsService.calculatePool(id, payload.organizationId);
@@ -794,6 +868,12 @@ const finalizePoolRoute = createRoute({
 app.openapi(finalizePoolRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Tip management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const { id } = c.req.param();
 
     const pool = await tipsService.finalizePool(id, payload.organizationId);

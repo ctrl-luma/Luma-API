@@ -60,6 +60,7 @@ const listCustomersRoute = createRoute({
 app.openapi(listCustomersRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
     const { search, limit, offset } = c.req.query();
 
     // Parse with defaults
@@ -160,6 +161,7 @@ const upsertCustomerRoute = createRoute({
 app.openapi(upsertCustomerRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
     const body = await c.req.json();
 
     // Check if customer exists
@@ -272,6 +274,7 @@ const searchCustomersRoute = createRoute({
 app.openapi(searchCustomersRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
     const { q, limit } = c.req.query();
 
     const customers = await query<Customer>(

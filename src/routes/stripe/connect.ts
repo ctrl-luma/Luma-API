@@ -8,6 +8,7 @@ import { logger } from '../../utils/logger';
 import { socketService, SocketEvents } from '../../services/socket';
 import { emailService } from '../../services/email';
 import { queueService, QueueName } from '../../services/queue';
+import { getImageUrl } from '../../services/images';
 import Stripe from 'stripe';
 
 const app = new OpenAPIHono();
@@ -1086,7 +1087,7 @@ const listTransactionsRoute = createRoute({
       offset: z.string().transform(Number).optional(),
       starting_after: z.string().optional(),
       ending_before: z.string().optional(),
-      source: z.enum(['all', 'orders', 'preorders', 'tickets']).optional(),
+      source: z.enum(['all', 'orders', 'preorders', 'tickets', 'invoices']).optional(),
       catalog_id: z.string().uuid().optional(),
       customer_email: z.string().optional(),
       device_id: z.string().optional(),
@@ -1126,7 +1127,7 @@ const listTransactionsRoute = createRoute({
                 processingFee: z.number(),
                 netAmount: z.number(),
               }).optional(),
-              sourceType: z.enum(['order', 'preorder', 'ticket']),
+              sourceType: z.enum(['order', 'preorder', 'ticket', 'invoice']),
               catalogName: z.string().nullable().optional(),
               eventName: z.string().nullable().optional(),
               eventId: z.string().nullable().optional(),
@@ -1189,6 +1190,8 @@ app.openapi(listTransactionsRoute, async (c) => {
               SELECT id, created_at FROM preorders WHERE organization_id = $1 AND id = $2
               UNION ALL
               SELECT id, purchased_at as created_at FROM tickets WHERE organization_id = $1 AND id = $2
+              UNION ALL
+              SELECT id, paid_at as created_at FROM invoices WHERE organization_id = $1 AND id = $2 AND status = 'paid'
             ) as cursor_lookup LIMIT 1`,
             [payload.organizationId, startingAfter]
           )
@@ -1197,11 +1200,12 @@ app.openapi(listTransactionsRoute, async (c) => {
     const connectedAccount = accountRows.length > 0 ? accountRows[0] : null;
     const cursorCreatedAt: Date | null = cursorResult.length > 0 ? cursorResult[0].created_at : null;
 
-    // Build UNION ALL query across orders, preorders, and tickets
+    // Build UNION ALL query across orders, preorders, tickets, and invoices
     const includeOrders = source === 'all' || source === 'orders';
     const includePreorders = source === 'all' || source === 'preorders';
     // Exclude tickets when device_id is present (mobile POS app doesn't show ticket sales)
     const includeTickets = (source === 'all' || source === 'tickets') && !deviceIdFilter;
+    const includeInvoices = (source === 'all' || source === 'invoices') && !deviceIdFilter;
 
     const subqueries: string[] = [];
     const params: any[] = [payload.organizationId]; // $1
@@ -1308,6 +1312,34 @@ app.openapi(listTransactionsRoute, async (c) => {
         JOIN ticket_tiers tt ON t.ticket_tier_id = tt.id
         WHERE ${conds.join(' AND ')}
       `);
+    }
+
+    // --- Invoices subquery ---
+    if (includeInvoices && statusFilter !== 'pending' && statusFilter !== 'cancelled' && statusFilter !== 'failed') {
+      const conds: string[] = ['i.organization_id = $1', "i.status = 'paid'"];
+      if (statusFilter === 'refunded') {
+        // Invoices don't have a refunded status — skip
+      } else {
+        if (customerEmailFilter) conds.push(`LOWER(i.customer_email) LIKE ${addParam(`%${customerEmailFilter}%`)}`);
+        if (dateFrom) conds.push(`i.paid_at >= to_timestamp(${addParam(dateFrom)})`);
+        if (dateTo) conds.push(`i.paid_at <= to_timestamp(${addParam(dateTo)})`);
+        if (amountMin !== null) conds.push(`i.total_amount >= ${addParam(amountMin)}`);
+        if (amountMax !== null) conds.push(`i.total_amount <= ${addParam(amountMax)}`);
+        if (cursorTsParam) conds.push(`(i.paid_at, i.id) < (${cursorTsParam}, ${cursorIdParam})`);
+
+        subqueries.push(`
+          SELECT i.id, 'invoice'::text as source_type, i.invoice_number as display_number,
+                 'paid'::text as raw_status, i.total_amount, 0::decimal(10,2) as tip_amount,
+                 i.customer_email, i.customer_name,
+                 'invoice'::text as payment_method, i.stripe_charge_id, i.stripe_payment_intent_id,
+                 NULL::varchar as catalog_name, NULL::varchar as event_name, NULL::varchar as event_id, NULL::varchar as tier_name,
+                 NULL::integer as daily_number, NULL::varchar as device_id,
+                 NULL::jsonb as metadata, i.paid_at as created_at,
+                 (SELECT COUNT(*)::int FROM invoice_items ii WHERE ii.invoice_id = i.id) as item_count
+          FROM invoices i
+          WHERE ${conds.join(' AND ')}
+        `);
+      }
     }
 
     // If no subqueries match the filters, return empty result
@@ -1470,6 +1502,8 @@ app.openapi(listTransactionsRoute, async (c) => {
           status = order.stripe_charge_id ? 'refunded' : 'cancelled';
         }
         else status = 'pending';
+      } else if (order.source_type === 'invoice') {
+        status = 'succeeded'; // Only paid invoices are in the list
       } else {
         // ticket
         if (order.raw_status === 'refunded') status = 'refunded';
@@ -1524,7 +1558,7 @@ app.openapi(listTransactionsRoute, async (c) => {
         created: Math.floor(new Date(order.created_at).getTime() / 1000),
         metadata: charge?.metadata || (order.metadata && typeof order.metadata === 'object' ? order.metadata : undefined),
         fees,
-        sourceType: order.source_type as 'order' | 'preorder' | 'ticket',
+        sourceType: order.source_type as 'order' | 'preorder' | 'ticket' | 'invoice',
         catalogName: order.catalog_name || null,
         eventName: order.event_name || null,
         eventId: order.event_id || null,
@@ -1727,7 +1761,115 @@ app.openapi(getTransactionRoute, async (c) => {
         );
 
         if (ticketRows.length === 0) {
-          return c.json({ error: 'Transaction not found' }, 404);
+          // Also check invoices
+          const invoiceRows = await query<{
+            id: string;
+            invoice_number: string;
+            status: string;
+            subtotal: string;
+            tax_amount: string;
+            total_amount: string;
+            amount_paid: string;
+            stripe_charge_id: string | null;
+            stripe_payment_intent_id: string | null;
+            customer_name: string;
+            customer_email: string;
+            customer_phone: string | null;
+            memo: string | null;
+            due_date: string | null;
+            paid_at: Date | null;
+            created_at: Date;
+          }>(
+            `SELECT id, invoice_number, status, subtotal, tax_amount, total_amount, amount_paid,
+                    stripe_charge_id, stripe_payment_intent_id, customer_name, customer_email,
+                    customer_phone, memo, due_date, paid_at, created_at
+             FROM invoices WHERE id = $1 AND organization_id = $2`,
+            [transactionId, payload.organizationId]
+          );
+
+          if (invoiceRows.length === 0) {
+            return c.json({ error: 'Transaction not found' }, 404);
+          }
+
+          // Format invoice as transaction detail
+          const invoice = invoiceRows[0];
+          const invoiceAmount = Math.round(parseFloat(invoice.total_amount) * 100);
+          const invoiceTax = Math.round(parseFloat(invoice.tax_amount || '0') * 100);
+
+          let invoiceCharge: Stripe.Charge | null = null;
+          if (invoice.stripe_charge_id) {
+            try {
+              invoiceCharge = await stripeService.retrieveConnectedAccountCharge(
+                connectedAccount.stripe_account_id,
+                invoice.stripe_charge_id
+              );
+            } catch (err: any) {
+              logger.warn('Failed to fetch Stripe charge for invoice', { error: err.message });
+            }
+          }
+
+          const invoiceRefunds = invoiceCharge
+            ? (invoiceCharge.refunds?.data || []).map((r) => ({
+                id: r.id, amount: r.amount, status: r.status || 'unknown', reason: r.reason, created: r.created,
+              }))
+            : [];
+
+          let invoiceFees = { processingFee: 0, netAmount: invoiceAmount };
+          if (invoiceCharge) {
+            const platformFee = (invoiceCharge as any).application_fee_amount ||
+              (invoiceCharge.metadata?.platform_fee_cents ? parseInt(invoiceCharge.metadata.platform_fee_cents) : 0);
+            const stripeFeePercent = 0.029;
+            const stripeFeeFixed = 30;
+            const stripeFee = Math.round(invoiceCharge.amount * stripeFeePercent) + stripeFeeFixed;
+            const processingFee = stripeFee + platformFee;
+            invoiceFees = { processingFee, netAmount: invoiceCharge.amount - processingFee - invoiceCharge.amount_refunded };
+          }
+
+          // Fetch invoice line items
+          const invoiceItemRows = await query<{
+            id: string;
+            product_id: string | null;
+            description: string;
+            quantity: number;
+            unit_price: string;
+          }>(
+            'SELECT id, product_id, description, quantity, unit_price FROM invoice_items WHERE invoice_id = $1 ORDER BY sort_order',
+            [invoice.id]
+          );
+
+          const invoiceItems = invoiceItemRows.map((item) => ({
+            id: item.id,
+            productId: item.product_id,
+            name: item.description,
+            quantity: item.quantity,
+            unitPrice: Math.round(parseFloat(item.unit_price) * 100),
+          }));
+
+          return c.json({
+            id: invoice.id,
+            amount: invoiceAmount,
+            amountRefunded: invoiceCharge?.amount_refunded || 0,
+            currency: invoiceCharge?.currency || 'usd',
+            status: invoice.status === 'paid' ? 'succeeded' : invoice.status,
+            description: `Invoice #${invoice.invoice_number}`,
+            customerEmail: invoice.customer_email || null,
+            customerName: invoice.customer_name || null,
+            billingAddress: null,
+            paymentMethod: invoiceCharge?.payment_method_details?.card
+              ? { type: 'card', brand: invoiceCharge.payment_method_details.card.brand, last4: invoiceCharge.payment_method_details.card.last4 }
+              : { type: 'invoice', brand: null, last4: null },
+            receiptUrl: invoiceCharge?.receipt_url || null,
+            created: Math.floor(new Date(invoice.paid_at || invoice.created_at).getTime() / 1000),
+            metadata: {},
+            refunds: invoiceRefunds,
+            fees: invoiceFees,
+            orderItems: invoiceItems,
+            isQuickCharge: false,
+            tipAmount: 0,
+            taxAmount: invoiceTax,
+            sourceType: 'invoice',
+            invoiceNumber: invoice.invoice_number,
+          });
         }
 
         // Format ticket as transaction detail
@@ -2178,6 +2320,16 @@ app.openapi(refundTransactionRoute, async (c) => {
     const connectedAccount = rows[0];
     const body = await c.req.json();
 
+    // Get organization branding for email notifications
+    const brandingRows = await query<{ name: string; branding_logo_id: string | null }>(
+      'SELECT name, branding_logo_id FROM organizations WHERE id = $1',
+      [payload.organizationId]
+    );
+    const vendorBranding = {
+      organizationName: brandingRows[0]?.name || '',
+      brandingLogoUrl: getImageUrl(brandingRows[0]?.branding_logo_id || null),
+    };
+
     // transactionId is now an order ID — look up the order
     const orderLookup = await query<{ id: string; order_number: string; stripe_charge_id: string | null; payment_method: string | null; total_amount: string }>(
       'SELECT id, order_number, stripe_charge_id, payment_method, total_amount FROM orders WHERE id = $1 AND organization_id = $2',
@@ -2290,6 +2442,7 @@ app.openapi(refundTransactionRoute, async (c) => {
         await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
           type: 'ticket_refund',
           to: ticket.customer_email,
+          vendorBranding,
           data: {
             customerName: ticket.customer_name || ticket.customer_email,
             eventName: ticket.event_name,
@@ -2378,6 +2531,7 @@ app.openapi(refundTransactionRoute, async (c) => {
         await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
           type: 'preorder_cancelled',
           to: preorder.customer_email,
+          vendorBranding,
           data: {
             orderNumber: preorder.order_number,
             dailyNumber: preorder.daily_number,
@@ -2437,6 +2591,7 @@ app.openapi(refundTransactionRoute, async (c) => {
       await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
         type: 'preorder_cancelled',
         to: preorder.customer_email,
+        vendorBranding,
         data: {
           orderNumber: preorder.order_number,
           dailyNumber: preorder.daily_number,
@@ -2875,6 +3030,19 @@ app.openapi(sendReceiptRoute, async (c) => {
   }
 });
 
+// Pro subscription check for analytics features
+async function requirePro(organizationId: string): Promise<{ tier: string } | null> {
+  const rows = await query<{ tier: string; status: string }>(
+    `SELECT tier, status FROM subscriptions
+     WHERE organization_id = $1 AND status IN ('active', 'trialing') LIMIT 1`,
+    [organizationId]
+  );
+  if (rows.length === 0) return null;
+  const { tier } = rows[0];
+  if (tier !== 'pro' && tier !== 'enterprise') return null;
+  return { tier };
+}
+
 // Dashboard metrics endpoint
 const dashboardRoute = createRoute({
   method: 'get',
@@ -2912,7 +3080,7 @@ const dashboardRoute = createRoute({
               amount: z.number(),
               currency: z.string(),
               status: z.string(),
-              type: z.enum(['order', 'preorder', 'ticket']),
+              type: z.enum(['order', 'preorder', 'ticket', 'invoice']),
               customerName: z.string().nullable(),
               customerEmail: z.string().nullable(),
               created: z.number(),
@@ -2955,7 +3123,7 @@ app.openapi(dashboardRoute, async (c) => {
     const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const yesterdayStart = new Date(todayStart.getTime() - 24 * 60 * 60 * 1000);
 
-    // Run all 10 independent queries in parallel
+    // Run all 14 independent queries in parallel
     const [
       todayRows,
       yesterdayRows,
@@ -2963,9 +3131,12 @@ app.openapi(dashboardRoute, async (c) => {
       yesterdayPreorderRows,
       todayTicketRows,
       yesterdayTicketRows,
+      todayInvoiceRows,
+      yesterdayInvoiceRows,
       recentRows,
       recentPreorderRows,
       recentTicketRows,
+      recentInvoiceRows,
       balance,
     ] = await Promise.all([
       // Today's orders
@@ -3010,6 +3181,20 @@ app.openapi(dashboardRoute, async (c) => {
          AND purchased_at >= $2 AND purchased_at < $3`,
         [payload.organizationId, yesterdayStart.toISOString(), todayStart.toISOString()]
       ),
+      // Today's paid invoices
+      query<{ total_amount: string; customer_email: string | null }>(
+        `SELECT total_amount, customer_email FROM invoices
+         WHERE organization_id = $1 AND status = 'paid'
+         AND paid_at >= $2`,
+        [payload.organizationId, todayStart.toISOString()]
+      ),
+      // Yesterday's paid invoices
+      query<{ total_amount: string; customer_email: string | null }>(
+        `SELECT total_amount, customer_email FROM invoices
+         WHERE organization_id = $1 AND status = 'paid'
+         AND paid_at >= $2 AND paid_at < $3`,
+        [payload.organizationId, yesterdayStart.toISOString(), todayStart.toISOString()]
+      ),
       // Recent orders (last 6)
       query<{ id: string; order_number: string | null; total_amount: string; status: string; payment_method: string | null; customer_email: string | null; created_at: Date }>(
         `SELECT id, order_number, total_amount, status, payment_method, customer_email, created_at FROM orders
@@ -3032,34 +3217,45 @@ app.openapi(dashboardRoute, async (c) => {
          ORDER BY t.purchased_at DESC LIMIT 6`,
         [payload.organizationId]
       ),
+      // Recent paid invoices (last 6)
+      query<{ id: string; invoice_number: string; total_amount: string; customer_name: string | null; customer_email: string | null; paid_at: Date }>(
+        `SELECT id, invoice_number, total_amount, customer_name, customer_email, paid_at FROM invoices
+         WHERE organization_id = $1 AND status = 'paid'
+         ORDER BY paid_at DESC LIMIT 6`,
+        [payload.organizationId]
+      ),
       // Stripe balance
       stripeService.getConnectedAccountBalance(connectedAccount.stripe_account_id),
     ]);
 
-    // Calculate today's metrics (orders + preorders + tickets)
+    // Calculate today's metrics (orders + preorders + tickets + invoices)
     const todayOrderSalesCents = todayRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
     const todayPreorderSalesCents = todayPreorderRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
     const todayTicketSalesCents = todayTicketRows.reduce((sum, o) => sum + Math.round(parseFloat(o.amount_paid) * 100), 0);
-    const todaySales = (todayOrderSalesCents + todayPreorderSalesCents + todayTicketSalesCents) / 100;
-    const todayOrders = todayRows.length + todayPreorderRows.length + todayTicketRows.length;
+    const todayInvoiceSalesCents = todayInvoiceRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
+    const todaySales = (todayOrderSalesCents + todayPreorderSalesCents + todayTicketSalesCents + todayInvoiceSalesCents) / 100;
+    const todayOrders = todayRows.length + todayPreorderRows.length + todayTicketRows.length + todayInvoiceRows.length;
     const todayAvgOrder = todayOrders > 0 ? todaySales / todayOrders : 0;
     const todayCustomerEmails = new Set([
       ...todayRows.map(o => o.customer_email).filter((e): e is string => !!e),
       ...todayPreorderRows.map(o => o.customer_email).filter((e): e is string => !!e),
       ...todayTicketRows.map(o => o.customer_email).filter((e): e is string => !!e),
+      ...todayInvoiceRows.map(o => o.customer_email).filter((e): e is string => !!e),
     ]);
     const todayCustomers = todayCustomerEmails.size;
 
-    // Calculate yesterday's metrics (orders + preorders + tickets)
+    // Calculate yesterday's metrics (orders + preorders + tickets + invoices)
     const yesterdayOrderSalesCents = yesterdayRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
     const yesterdayPreorderSalesCents = yesterdayPreorderRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
     const yesterdayTicketSalesCents = yesterdayTicketRows.reduce((sum, o) => sum + Math.round(parseFloat(o.amount_paid) * 100), 0);
-    const yesterdaySales = (yesterdayOrderSalesCents + yesterdayPreorderSalesCents + yesterdayTicketSalesCents) / 100;
-    const yesterdayOrders = yesterdayRows.length + yesterdayPreorderRows.length + yesterdayTicketRows.length;
+    const yesterdayInvoiceSalesCents = yesterdayInvoiceRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
+    const yesterdaySales = (yesterdayOrderSalesCents + yesterdayPreorderSalesCents + yesterdayTicketSalesCents + yesterdayInvoiceSalesCents) / 100;
+    const yesterdayOrders = yesterdayRows.length + yesterdayPreorderRows.length + yesterdayTicketRows.length + yesterdayInvoiceRows.length;
     const yesterdayCustomerEmails = new Set([
       ...yesterdayRows.map(o => o.customer_email).filter((e): e is string => !!e),
       ...yesterdayPreorderRows.map(o => o.customer_email).filter((e): e is string => !!e),
       ...yesterdayTicketRows.map(o => o.customer_email).filter((e): e is string => !!e),
+      ...yesterdayInvoiceRows.map(o => o.customer_email).filter((e): e is string => !!e),
     ]);
     const yesterdayCustomers = yesterdayCustomerEmails.size;
 
@@ -3105,6 +3301,17 @@ app.openapi(dashboardRoute, async (c) => {
         customerName: ticket.customer_name || null,
         customerEmail: ticket.customer_email || null,
         created: Math.floor(new Date(ticket.purchased_at).getTime() / 1000),
+      })),
+      ...recentInvoiceRows.map(inv => ({
+        id: inv.id,
+        orderNumber: inv.invoice_number || null,
+        amount: Math.round(parseFloat(inv.total_amount) * 100) / 100,
+        currency: 'usd',
+        status: 'succeeded' as string,
+        type: 'invoice' as const,
+        customerName: inv.customer_name || null,
+        customerEmail: inv.customer_email || null,
+        created: Math.floor(new Date(inv.paid_at).getTime() / 1000),
       })),
     ]
       .sort((a, b) => b.created - a.created)
@@ -3295,6 +3502,11 @@ app.openapi(analyticsRoute, async (c) => {
     const { authService } = await import('../../services/auth');
     const payload = await authService.verifyToken(token);
 
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Analytics require a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const range = c.req.query('range') || 'week';
     const offset = parseInt(c.req.query('offset') || '0') || 0; // Offset for navigating to previous periods
     const customStartDate = c.req.query('startDate'); // ISO date string for custom range
@@ -3411,7 +3623,17 @@ app.openapi(analyticsRoute, async (c) => {
       ? 'AND purchased_at >= $2 AND purchased_at <= $3'
       : 'AND purchased_at >= $2';
 
-    // ── Run ALL queries in parallel (23 queries) ──
+    // Invoice helper conditions
+    const invoiceDateCondition = useBoundedQuery
+      ? 'AND paid_at >= $2 AND paid_at <= $3'
+      : 'AND paid_at >= $2';
+    const invoiceTsBucket = timeSeriesBucketType === 'hourly'
+      ? 'EXTRACT(HOUR FROM paid_at)::text'
+      : timeSeriesBucketType === 'monthly'
+        ? "TO_CHAR(paid_at, 'YYYY-MM')"
+        : 'DATE(paid_at)::text';
+
+    // ── Run ALL queries in parallel (27 queries) ──
     const [
       combinedMetricsResult,
       previousMetricsResult,
@@ -3436,6 +3658,10 @@ app.openapi(analyticsRoute, async (c) => {
       ticketHeatmapResult,
       cancelledPreordersResult,
       refundedTicketsResult,
+      invoiceCurrentAggResult,
+      invoicePreviousAggResult,
+      invoiceTSResult,
+      voidedInvoicesResult,
     ] = await Promise.all([
       // 0: Combined current-period order metrics (revenue + transactions + tips + quick charge + refunds)
       query<{
@@ -3811,6 +4037,53 @@ app.openapi(analyticsRoute, async (c) => {
           ${ticketDateCondition}`,
         dateParams
       ),
+
+      // 23: Invoice current period aggregate (paid invoices by paid_at)
+      query<{ revenue: string; count: string }>(
+        `SELECT
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as count
+        FROM invoices
+        WHERE organization_id = $1 AND status = 'paid'
+          ${invoiceDateCondition}`,
+        dateParams
+      ),
+
+      // 24: Invoice previous period aggregate
+      query<{ revenue: string; count: string }>(
+        `SELECT
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as count
+        FROM invoices
+        WHERE organization_id = $1 AND status = 'paid'
+          AND paid_at >= $2 AND paid_at <= $3`,
+        [payload.organizationId, previousStart.toISOString(), previousEnd.toISOString()]
+      ),
+
+      // 25: Invoice time series (by paid_at)
+      query<{ bucket: string; revenue: string; order_count: string }>(
+        `SELECT
+          ${invoiceTsBucket} as bucket,
+          COALESCE(SUM(total_amount), 0)::text as revenue,
+          COUNT(*)::text as order_count
+        FROM invoices
+        WHERE organization_id = $1 AND status = 'paid'
+          ${invoiceDateCondition}
+        GROUP BY ${invoiceTsBucket}
+        ORDER BY ${invoiceTsBucket}`,
+        dateParams
+      ),
+
+      // 26: Voided invoices (for refund/void stats)
+      query<{ count: string; amount: string }>(
+        `SELECT
+          COUNT(*)::text as count,
+          COALESCE(SUM(total_amount), 0)::text as amount
+        FROM invoices
+        WHERE organization_id = $1 AND status = 'void'
+          AND voided_at >= $2 ${useBoundedQuery ? 'AND voided_at <= $3' : ''}`,
+        dateParams
+      ),
     ]);
 
     // ── Process combined order metrics ──
@@ -4037,9 +4310,11 @@ app.openapi(analyticsRoute, async (c) => {
     const preorderCount = parseInt(preorderCurrentAgg?.count || '0');
     const ticketRevenue = parseFloat(ticketCurrentAgg?.revenue || '0');
     const ticketCount = parseInt(ticketCurrentAgg?.count || '0');
+    const invoiceRevenue = parseFloat(invoiceCurrentAggResult[0]?.revenue || '0');
+    const invoiceCount = parseInt(invoiceCurrentAggResult[0]?.count || '0');
 
-    const mergedCurrentRevenue = currentRevenue + preorderRevenue + ticketRevenue;
-    const mergedCurrentTransactions = currentTransactions + preorderCount + ticketCount;
+    const mergedCurrentRevenue = currentRevenue + preorderRevenue + ticketRevenue + invoiceRevenue;
+    const mergedCurrentTransactions = currentTransactions + preorderCount + ticketCount + invoiceCount;
     const mergedCurrentAvg = mergedCurrentTransactions > 0 ? mergedCurrentRevenue / mergedCurrentTransactions : 0;
 
     // 2. Previous period metrics
@@ -4047,9 +4322,11 @@ app.openapi(analyticsRoute, async (c) => {
     const prevPreorderCount = parseInt(preorderPreviousAgg?.count || '0');
     const prevTicketRevenue = parseFloat(ticketPreviousAgg?.revenue || '0');
     const prevTicketCount = parseInt(ticketPreviousAgg?.count || '0');
+    const prevInvoiceRevenue = parseFloat(invoicePreviousAggResult[0]?.revenue || '0');
+    const prevInvoiceCount = parseInt(invoicePreviousAggResult[0]?.count || '0');
 
-    const mergedPreviousRevenue = previousRevenue + prevPreorderRevenue + prevTicketRevenue;
-    const mergedPreviousTransactions = previousTransactions + prevPreorderCount + prevTicketCount;
+    const mergedPreviousRevenue = previousRevenue + prevPreorderRevenue + prevTicketRevenue + prevInvoiceRevenue;
+    const mergedPreviousTransactions = previousTransactions + prevPreorderCount + prevTicketCount + prevInvoiceCount;
 
     // 3. Merge time series — add preorder/ticket values into each time bucket
     const preorderTSMap: Record<string, { revenue: number; count: number }> = {};
@@ -4062,6 +4339,13 @@ app.openapi(analyticsRoute, async (c) => {
     const ticketTSMap: Record<string, { revenue: number; count: number }> = {};
     ticketTSResult.forEach(row => {
       ticketTSMap[row.bucket] = {
+        revenue: parseFloat(row.revenue || '0'),
+        count: parseInt(row.order_count || '0'),
+      };
+    });
+    const invoiceTSMap: Record<string, { revenue: number; count: number }> = {};
+    invoiceTSResult.forEach(row => {
+      invoiceTSMap[row.bucket] = {
         revenue: parseFloat(row.revenue || '0'),
         count: parseInt(row.order_count || '0'),
       };
@@ -4081,7 +4365,8 @@ app.openapi(analyticsRoute, async (c) => {
           const hStr = String(h);
           const preorderVal = preorderTSMap[hStr]?.revenue || 0;
           const ticketVal = ticketTSMap[hStr]?.revenue || 0;
-          return { label: rd.label, revenue: Math.round((rd.revenue + preorderVal + ticketVal) * 100) / 100 };
+          const invoiceVal = invoiceTSMap[hStr]?.revenue || 0;
+          return { label: rd.label, revenue: Math.round((rd.revenue + preorderVal + ticketVal + invoiceVal) * 100) / 100 };
         }
         return rd;
       });
@@ -4091,7 +4376,8 @@ app.openapi(analyticsRoute, async (c) => {
           const hStr = String(h);
           const preorderVal = preorderTSMap[hStr]?.count || 0;
           const ticketVal = ticketTSMap[hStr]?.count || 0;
-          return { label: td.label, count: td.count + preorderVal + ticketVal };
+          const invoiceVal = invoiceTSMap[hStr]?.count || 0;
+          return { label: td.label, count: td.count + preorderVal + ticketVal + invoiceVal };
         }
         return td;
       });
@@ -4101,14 +4387,15 @@ app.openapi(analyticsRoute, async (c) => {
         const dateStr = date.toISOString().split('T')[0];
         const preorderVal = preorderTSMap[dateStr];
         const ticketVal = ticketTSMap[dateStr];
-        if (preorderVal || ticketVal) {
+        const invoiceVal = invoiceTSMap[dateStr];
+        if (preorderVal || ticketVal || invoiceVal) {
           revenueData[i] = {
             label: revenueData[i].label,
-            revenue: Math.round((revenueData[i].revenue + (preorderVal?.revenue || 0) + (ticketVal?.revenue || 0)) * 100) / 100,
+            revenue: Math.round((revenueData[i].revenue + (preorderVal?.revenue || 0) + (ticketVal?.revenue || 0) + (invoiceVal?.revenue || 0)) * 100) / 100,
           };
           transactionData[i] = {
             label: transactionData[i].label,
-            count: transactionData[i].count + (preorderVal?.count || 0) + (ticketVal?.count || 0),
+            count: transactionData[i].count + (preorderVal?.count || 0) + (ticketVal?.count || 0) + (invoiceVal?.count || 0),
           };
         }
       }
@@ -4119,14 +4406,15 @@ app.openapi(analyticsRoute, async (c) => {
         const yearMonth = `${monthDate.getFullYear()}-${String(monthDate.getMonth() + 1).padStart(2, '0')}`;
         const preorderVal = preorderTSMap[yearMonth];
         const ticketVal = ticketTSMap[yearMonth];
-        if (preorderVal || ticketVal) {
+        const invoiceVal = invoiceTSMap[yearMonth];
+        if (preorderVal || ticketVal || invoiceVal) {
           revenueData[i] = {
             label: revenueData[i].label,
-            revenue: Math.round((revenueData[i].revenue + (preorderVal?.revenue || 0) + (ticketVal?.revenue || 0)) * 100) / 100,
+            revenue: Math.round((revenueData[i].revenue + (preorderVal?.revenue || 0) + (ticketVal?.revenue || 0) + (invoiceVal?.revenue || 0)) * 100) / 100,
           };
           transactionData[i] = {
             label: transactionData[i].label,
-            count: transactionData[i].count + (preorderVal?.count || 0) + (ticketVal?.count || 0),
+            count: transactionData[i].count + (preorderVal?.count || 0) + (ticketVal?.count || 0) + (invoiceVal?.count || 0),
           };
         }
       }
@@ -4147,6 +4435,14 @@ app.openapi(analyticsRoute, async (c) => {
         method: 'Ticket Sale',
         count: ticketCount,
         revenue: Math.round(ticketRevenue * 100) / 100,
+        percentage: 0,
+      });
+    }
+    if (invoiceCount > 0) {
+      mergedPaymentMethods.push({
+        method: 'Invoice',
+        count: invoiceCount,
+        revenue: Math.round(invoiceRevenue * 100) / 100,
         percentage: 0,
       });
     }
@@ -4315,8 +4611,11 @@ app.openapi(analyticsRoute, async (c) => {
     const refundedTicketCount = parseInt(refundedTicketsResult[0]?.count || '0');
     const refundedTicketAmount = Math.round(parseFloat(refundedTicketsResult[0]?.amount || '0') * 100) / 100;
 
-    const mergedRefundCount = refundCount + cancelledPreorderCount + refundedTicketCount;
-    const mergedRefundAmount = Math.round((refundAmount + cancelledPreorderAmount + refundedTicketAmount) * 100) / 100;
+    const voidedInvoiceCount = parseInt(voidedInvoicesResult[0]?.count || '0');
+    const voidedInvoiceAmount = Math.round(parseFloat(voidedInvoicesResult[0]?.amount || '0') * 100) / 100;
+
+    const mergedRefundCount = refundCount + cancelledPreorderCount + refundedTicketCount + voidedInvoiceCount;
+    const mergedRefundAmount = Math.round((refundAmount + cancelledPreorderAmount + refundedTicketAmount + voidedInvoiceAmount) * 100) / 100;
     const mergedTotalOrdersForRate = mergedCurrentTransactions + mergedRefundCount;
     const mergedRefundRate = mergedTotalOrdersForRate > 0
       ? Math.round((mergedRefundCount / mergedTotalOrdersForRate) * 1000) / 10

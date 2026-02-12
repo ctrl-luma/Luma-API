@@ -22,9 +22,10 @@ export interface JobData {
     amount: number;
   };
   [QueueName.EMAIL_NOTIFICATIONS]: {
-    type: 'order_confirmation' | 'receipt' | 'payout_confirmation' | 'welcome' | 'ticket_confirmation' | 'ticket_reminder' | 'ticket_refund' | 'preorder_confirmation' | 'preorder_ready' | 'preorder_cancelled';
+    type: 'order_confirmation' | 'receipt' | 'payout_confirmation' | 'welcome' | 'ticket_confirmation' | 'ticket_reminder' | 'ticket_refund' | 'preorder_confirmation' | 'preorder_ready' | 'preorder_cancelled' | 'invoice_sent' | 'invoice_paid' | 'invoice_payment_failed';
     to: string;
     data: Record<string, any>;
+    vendorBranding?: { organizationName: string; brandingLogoUrl: string | null };
   };
   [QueueName.WEBHOOK_DELIVERY]: {
     url: string;

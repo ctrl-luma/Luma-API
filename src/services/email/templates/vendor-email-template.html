@@ -9,7 +9,7 @@
   <meta name="color-scheme" content="light dark">
   <meta name="supported-color-schemes" content="light dark">
   <title>{{subject}}</title>
-  
+
   <!--[if mso]>
   <xml>
     <o:OfficeDocumentSettings>
@@ -18,21 +18,21 @@
     </o:OfficeDocumentSettings>
   </xml>
   <![endif]-->
-  
+
   <style>
     :root {
       color-scheme: light dark;
       supported-color-schemes: light dark;
     }
-    
+
     /* Reset styles */
     body, table, td, a { -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
     table, td { mso-table-lspace: 0pt; mso-table-rspace: 0pt; }
     img { -ms-interpolation-mode: bicubic; border: 0; outline: none; text-decoration: none; }
-    
+
     /* Remove default styling */
     body { margin: 0 !important; padding: 0 !important; width: 100% !important; min-width: 100% !important; }
-    
+
     /* Dark mode styles */
     @media (prefers-color-scheme: dark) {
       .dark-bg { background-color: #0a0a0a !important; }
@@ -43,10 +43,8 @@
       .dark-border { border-color: #404040 !important; }
       .dark-button { background-color: #3b82f6 !important; }
       .dark-button:hover { background-color: #2563eb !important; }
-      .logo-dark { display: block !important; width: auto !important; }
-      .logo-light { display: none !important; }
     }
-    
+
     /* Mobile styles */
     @media screen and (max-width: 600px) {
       .mobile-padding { padding: 20px !important; }
@@ -58,11 +56,11 @@
       h2 { font-size: 20px !important; line-height: 28px !important; }
       p, td { font-size: 16px !important; line-height: 24px !important; }
     }
-    
+
     /* Link styles */
     a { color: #3b82f6; text-decoration: none; }
     a:hover { color: #2563eb; text-decoration: underline; }
-    
+
     /* Button styles */
     .button {
       display: inline-block;
@@ -77,16 +75,16 @@
       text-align: center;
       transition: background-color 0.3s ease;
     }
-    
+
     .button:hover {
       background-color: #2563eb !important;
       color: #ffffff !important;
     }
-    
+
     .button-secondary {
       background-color: #404040;
     }
-    
+
     .button-secondary:hover {
       background-color: #525252 !important;
     }
@@ -95,17 +93,17 @@
 
 <body style="margin: 0; padding: 0; word-spacing: normal; background-color: #0a0a0a;" class="dark-bg">
   <div role="article" aria-roledescription="email" lang="en" style="text-size-adjust: 100%; -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%;">
-    
+
     <!-- Preheader text (hidden) -->
     <div style="display: none; font-size: 1px; color: #0a0a0a; line-height: 1px; font-family: Arial, sans-serif; max-height: 0; max-width: 0; opacity: 0; overflow: hidden;">
       {{preheader_text}}
     </div>
-    
+
     <!-- Email container -->
     <table role="presentation" cellspacing="0" cellpadding="0" border="0" align="center" width="100%" style="border-collapse: collapse; background-color: #0a0a0a;" class="dark-bg">
       <tr>
         <td align="center" style="padding: 40px 20px;">
-          
+
           <!-- Main content container -->
           <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="600" style="border-collapse: collapse; max-width: 600px; width: 100%; background-color: #171717; border-radius: 12px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3); overflow: hidden;" class="dark-bg-secondary mobile-full-width">
 
@@ -114,32 +112,34 @@
               <td style="height: 4px; background-color: #3b82f6; font-size: 1px; line-height: 1px;" class="dark-button">&nbsp;</td>
             </tr>
 
-            <!-- Header -->
+            <!-- Header: Vendor logo or name -->
             <tr>
               <td align="center" style="padding: 36px 40px 20px 40px;" class="mobile-padding">
-                <!-- Logo as text (matching navbar) -->
-                <a href="{{site_url}}" style="display: inline-block; text-decoration: none;">
-                  <span style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 32px; font-weight: 700; color: #3b82f6; letter-spacing: -0.5px;">
-                    Luma
-                  </span>
-                </a>
+                {{#if vendor_logo_url}}
+                <img src="{{vendor_logo_url}}" alt="{{vendor_name}}" style="display: block; max-width: 200px; max-height: 60px; width: auto; height: auto;" />
+                {{/if}}
+                {{#if vendor_name_header}}
+                <span style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 28px; font-weight: 700; color: #fafafa; letter-spacing: -0.5px;">
+                  {{vendor_name}}
+                </span>
+                {{/if}}
               </td>
             </tr>
-            
+
             <!-- Content -->
             <tr>
               <td style="padding: 20px 40px 40px 40px;" class="mobile-padding">
-                
+
                 <!-- Title -->
                 <h1 style="margin: 0 0 20px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 28px; line-height: 36px; color: #fafafa; font-weight: 700; text-align: center;" class="dark-text">
                   {{email_title}}
                 </h1>
-                
+
                 <!-- Main content area -->
                 <div style="margin: 0 0 30px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 16px; line-height: 24px; color: #d4d4d4;" class="dark-text-secondary">
                   {{email_content}}
                 </div>
-                
+
                 <!-- Call-to-action button (if needed) -->
                 {{#if cta_url}}
                 <table role="presentation" cellspacing="0" cellpadding="0" border="0" align="center" style="margin: 0 auto;">
@@ -152,17 +152,17 @@
                   </tr>
                 </table>
                 {{/if}}
-                
+
                 <!-- Secondary content (if needed) -->
                 {{#if secondary_content}}
                 <div style="margin: 30px 0 0 0; padding: 20px; background-color: #262626; border-radius: 8px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; line-height: 20px; color: #a3a3a3;" class="dark-bg-card dark-text-secondary">
                   {{secondary_content}}
                 </div>
                 {{/if}}
-                
+
               </td>
             </tr>
-            
+
             <!-- Divider -->
             <tr>
               <td style="padding: 0 40px;" class="mobile-padding">
@@ -173,77 +173,36 @@
                 </table>
               </td>
             </tr>
-            
+
             <!-- Footer -->
             <tr>
               <td style="padding: 30px 40px 40px 40px;" class="mobile-padding">
                 <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="border-collapse: collapse;">
-                  
-                  <!-- Footer links -->
+
+                  <!-- Powered by Luma POS -->
                   <tr>
-                    <td align="center" style="padding: 0 0 20px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; line-height: 20px;">
-                      <a href="{{site_url}}" style="color: #3b82f6; text-decoration: none; margin: 0 10px;">Website</a>
-                      <span style="color: #404040;">•</span>
-                      <a href="{{dashboard_url}}" style="color: #3b82f6; text-decoration: none; margin: 0 10px;">Dashboard</a>
-                      <span style="color: #404040;">•</span>
-                      <a href="{{support_url}}" style="color: #3b82f6; text-decoration: none; margin: 0 10px;">Support</a>
+                    <td align="center" style="padding: 0 0 15px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 12px; line-height: 18px; color: #737373;" class="dark-text-secondary">
+                      <p style="margin: 0;">
+                        Powered by <a href="{{site_url}}" style="color: #3b82f6; text-decoration: none;">Luma POS</a>
+                      </p>
                     </td>
                   </tr>
-                  
-                  <!-- App download badges -->
-                  {{#if ios_download_url}}
-                  <tr>
-                    <td align="center" style="padding: 0 0 8px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 11px; line-height: 16px; color: #737373; text-transform: uppercase; letter-spacing: 0.5px;" class="dark-text-secondary">
-                      Get the app
-                    </td>
-                  </tr>
-                  <tr>
-                    <td align="center" style="padding: 0 0 20px 0;">
-                      <table role="presentation" cellspacing="0" cellpadding="0" border="0" align="center">
-                        <tr>
-                          <td style="padding: 0 6px;" valign="middle">
-                            <a href="{{ios_download_url}}" target="_blank" style="text-decoration: none;">
-                              <img src="{{api_url}}/public/apple-download.png" alt="Download on the App Store" height="40" style="display: block; height: 40px; width: auto; border: 0;" />
-                            </a>
-                          </td>
-                          <td style="padding: 0 6px;" valign="middle">
-                            <a href="{{android_download_url}}" target="_blank" style="text-decoration: none;">
-                              <img src="{{api_url}}/public/google-download.png" alt="Get it on Google Play" height="40" style="display: block; height: 40px; width: auto; border: 0;" />
-                            </a>
-                          </td>
-                        </tr>
-                      </table>
-                    </td>
-                  </tr>
-                  {{/if}}
 
                   <!-- Company info -->
                   <tr>
                     <td align="center" style="padding: 0 0 15px 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 12px; line-height: 18px; color: #737373;" class="dark-text-secondary">
                       <p style="margin: 0;">
-                        © {{current_year}} Luma. All rights reserved.
+                        &copy; {{current_year}} {{vendor_name}}
                       </p>
                     </td>
                   </tr>
-                  
-                  <!-- Unsubscribe link -->
-                  {{#if unsubscribe_url}}
-                  <tr>
-                    <td align="center" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 12px; line-height: 18px; color: #737373;" class="dark-text-secondary">
-                      <p style="margin: 0;">
-                        Don't want to receive these emails? 
-                        <a href="{{unsubscribe_url}}" style="color: #3b82f6; text-decoration: underline;">Unsubscribe</a>
-                      </p>
-                    </td>
-                  </tr>
-                  {{/if}}
-                  
+
                 </table>
               </td>
             </tr>
-            
+
           </table>
-          
+
           <!-- Security notice (optional) -->
           {{#if security_notice}}
           <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="600" style="border-collapse: collapse; max-width: 600px; width: 100%; margin-top: 20px;" class="mobile-full-width">
@@ -256,11 +215,11 @@
             </tr>
           </table>
           {{/if}}
-          
+
         </td>
       </tr>
     </table>
-    
+
   </div>
 </body>
 </html>

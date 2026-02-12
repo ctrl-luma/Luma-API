@@ -64,6 +64,19 @@ function verifyOwnerOrAdmin(role: string) {
   }
 }
 
+// Pro subscription check
+async function requirePro(organizationId: string): Promise<{ tier: string } | null> {
+  const rows = await query<{ tier: string; status: string }>(
+    `SELECT tier, status FROM subscriptions
+     WHERE organization_id = $1 AND status IN ('active', 'trialing') LIMIT 1`,
+    [organizationId]
+  );
+  if (rows.length === 0) return null;
+  const { tier } = rows[0];
+  if (tier !== 'pro' && tier !== 'enterprise') return null;
+  return { tier };
+}
+
 // Transform Date to ISO string
 function transformStaffMember(staff: any) {
   return {
@@ -107,6 +120,11 @@ app.openapi(listStaffRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     verifyOwnerOrAdmin(payload.role);
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Staff management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
 
     const staff = await staffService.listStaff(payload.organizationId);
     const limits = await staffService.canCreateStaff(payload.organizationId);
@@ -169,6 +187,11 @@ app.openapi(createStaffRoute, async (c) => {
     const payload = await verifyAuth(c.req.header('Authorization'));
     verifyOwnerOrAdmin(payload.role);
 
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Staff management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const body = await c.req.json();
 
     const staff = await staffService.createStaffInvite({
@@ -229,6 +252,11 @@ app.openapi(getStaffRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     verifyOwnerOrAdmin(payload.role);
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Staff management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
 
     const { id } = c.req.param();
     const staff = await staffService.getStaff(id, payload.organizationId);
@@ -291,6 +319,11 @@ app.openapi(updateStaffRoute, async (c) => {
     const payload = await verifyAuth(c.req.header('Authorization'));
     verifyOwnerOrAdmin(payload.role);
 
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Staff management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const { id } = c.req.param();
     const body = await c.req.json();
 
@@ -337,6 +370,11 @@ app.openapi(deleteStaffRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     verifyOwnerOrAdmin(payload.role);
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Staff management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
 
     const { id } = c.req.param();
     await staffService.deleteStaff(id, payload.organizationId);
@@ -390,6 +428,11 @@ app.openapi(resendInviteRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     verifyOwnerOrAdmin(payload.role);
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Staff management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
 
     const { id } = c.req.param();
     await staffService.resendInvite(id, payload.organizationId);
@@ -464,6 +507,11 @@ app.openapi(uploadStaffAvatarRoute, async (c) => {
 
     const payload = await verifyAuth(c.req.header('Authorization'));
     verifyOwnerOrAdmin(payload.role);
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Staff management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
 
     const { id } = c.req.param();
 
@@ -582,6 +630,11 @@ app.openapi(deleteStaffAvatarRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     verifyOwnerOrAdmin(payload.role);
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Staff management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
 
     const { id } = c.req.param();
 

@@ -3,6 +3,7 @@ import { QueueName, JobData, queueService } from '../index';
 import { stripe } from '../../stripe';
 import { query, transaction } from '../../../db';
 import { logger } from '../../../utils/logger';
+import { getImageUrl } from '../../images';
 
 export function registerPaymentProcessor() {
   return queueService.registerWorker(
@@ -59,6 +60,17 @@ export function registerPaymentProcessor() {
             }
           });
 
+          const orgRows = await query<{ name: string; branding_logo_id: string | null }>(
+            `SELECT o.name, o.branding_logo_id
+             FROM organizations o
+             JOIN orders ord ON ord.organization_id = o.id
+             WHERE ord.id = $1`,
+            [orderId]
+          );
+
+          const orgName = orgRows[0]?.name || '';
+          const brandingLogoId = orgRows[0]?.branding_logo_id || null;
+
           await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
             type: 'order_confirmation',
             to: paymentIntent.receipt_email || '',
@@ -66,6 +78,10 @@ export function registerPaymentProcessor() {
               orderId,
               amount,
               paymentIntentId,
+            },
+            vendorBranding: {
+              organizationName: orgName,
+              brandingLogoUrl: getImageUrl(brandingLogoId),
             },
           });
 

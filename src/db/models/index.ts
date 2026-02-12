@@ -5,6 +5,7 @@ export interface Organization {
   stripe_onboarding_completed: boolean;
   settings: Record<string, any>;
   tap_to_pay_device_ids: string[] | null;
+  branding_logo_id: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -471,6 +472,55 @@ export interface UserDevice {
   is_active: boolean;
   created_at: Date;
   updated_at: Date;
+}
+
+// Invoices (custom vendor invoicing via Stripe Invoices API)
+export type InvoiceStatus = 'draft' | 'open' | 'paid' | 'void' | 'uncollectible' | 'past_due';
+
+export interface Invoice {
+  id: string;
+  organization_id: string;
+  invoice_number: string;
+  customer_id: string | null;
+  customer_name: string;
+  customer_email: string;
+  customer_phone: string | null;
+  stripe_invoice_id: string | null;
+  stripe_customer_id: string | null;
+  stripe_hosted_url: string | null;
+  stripe_pdf_url: string | null;
+  stripe_payment_intent_id: string | null;
+  stripe_charge_id: string | null;
+  subtotal: number;
+  tax_amount: number;
+  total_amount: number;
+  amount_paid: number;
+  amount_due: number;
+  platform_fee_cents: number;
+  status: InvoiceStatus;
+  due_date: string | null;
+  memo: string | null;
+  internal_notes: string | null;
+  footer: string | null;
+  sent_at: Date | null;
+  paid_at: Date | null;
+  voided_at: Date | null;
+  created_by: string | null;
+  created_at: Date;
+  updated_at: Date;
+}
+
+export interface InvoiceItem {
+  id: string;
+  invoice_id: string;
+  description: string;
+  quantity: number;
+  unit_price: number;
+  amount: number;
+  product_id: string | null;
+  stripe_invoice_item_id: string | null;
+  sort_order: number;
+  created_at: Date;
 }
 
 export * from './subscription';

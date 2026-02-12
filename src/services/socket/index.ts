@@ -322,4 +322,12 @@ export const SocketEvents = {
   PREORDER_READY: 'preorder:ready',
   PREORDER_COMPLETED: 'preorder:completed',
   PREORDER_CANCELLED: 'preorder:cancelled',
+  // Invoice events
+  INVOICE_CREATED: 'invoice:created',
+  INVOICE_UPDATED: 'invoice:updated',
+  INVOICE_SENT: 'invoice:sent',
+  INVOICE_PAID: 'invoice:paid',
+  INVOICE_PAYMENT_FAILED: 'invoice:payment_failed',
+  INVOICE_VOIDED: 'invoice:voided',
+  INVOICE_OVERDUE: 'invoice:overdue',
 } as const;

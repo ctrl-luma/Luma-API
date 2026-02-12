@@ -6,6 +6,7 @@ import { socketService, SocketEvents } from '../services/socket';
 import { calculatePlatformFee, SubscriptionTier } from '../config/platform-fees';
 import { randomBytes } from 'crypto';
 import { queueService, QueueName } from '../services/queue';
+import { getImageUrl } from '../services/images';
 
 const app = new OpenAPIHono();
 
@@ -237,7 +238,7 @@ app.openapi(createPreorderRoute, async (c) => {
   try {
     // Get catalog
     const catalogs = await query(
-      `SELECT c.*, o.id AS org_id
+      `SELECT c.*, o.id AS org_id, o.name AS org_name, o.branding_logo_id
        FROM catalogs c
        JOIN organizations o ON c.organization_id = o.id
        WHERE c.slug = $1 AND c.preorder_enabled = true AND c.is_active = true`,
@@ -495,6 +496,10 @@ app.openapi(createPreorderRoute, async (c) => {
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'preorder_confirmation',
       to: body.customerEmail,
+      vendorBranding: {
+        organizationName: catalog.org_name,
+        brandingLogoUrl: getImageUrl(catalog.branding_logo_id),
+      },
       data: {
         orderNumber,
         dailyNumber,

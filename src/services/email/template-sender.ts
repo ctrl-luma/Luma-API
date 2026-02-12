@@ -4,6 +4,12 @@ import { emailService } from './index';
 import { logger } from '../../utils/logger';
 import { config } from '../../config';
 
+// Vendor branding for customer-facing emails
+export interface VendorBranding {
+  organizationName: string;
+  brandingLogoUrl: string | null;
+}
+
 // Template variable definitions
 interface EmailTemplateVariables {
   // Required variables
@@ -14,22 +20,33 @@ interface EmailTemplateVariables {
   recipient_email: string;
   current_year: number;
   company_address: string;
-  
+
   // URLs
   site_url: string;
   dashboard_url: string;
   support_url: string;
-  
+
   // Optional variables
   cta_url?: string; // Call-to-action button URL
   cta_text?: string; // Call-to-action button text
   secondary_content?: string; // Additional content in highlighted box
   unsubscribe_url?: string; // Unsubscribe link
   security_notice?: boolean; // Show security notice at bottom
+
+  // App download links
+  api_url?: string; // API URL for serving static assets
+  ios_download_url?: string; // iOS App Store download link
+  android_download_url?: string; // Google Play Store download link
+
+  // Vendor branding (for customer-facing emails)
+  vendor_name?: string;
+  vendor_logo_url?: string;
+  vendor_name_header?: string; // Truthy string to show org name as text header
 }
 
-// Load and cache the template
+// Load and cache the templates
 let cachedTemplate: string | null = null;
+let cachedVendorTemplate: string | null = null;
 
 function loadTemplate(): string {
   if (!cachedTemplate) {
@@ -37,6 +54,14 @@ function loadTemplate(): string {
     cachedTemplate = readFileSync(templatePath, 'utf-8');
   }
   return cachedTemplate;
+}
+
+function loadVendorTemplate(): string {
+  if (!cachedVendorTemplate) {
+    const templatePath = join(__dirname, './templates/vendor-email-template.html');
+    cachedVendorTemplate = readFileSync(templatePath, 'utf-8');
+  }
+  return cachedVendorTemplate;
 }
 
 // Simple template replacement function (without Handlebars)
@@ -91,6 +116,9 @@ export async function sendTemplatedEmail(
       site_url: config.email.siteUrl!,
       dashboard_url: config.email.dashboardUrl!,
       support_url: config.email.contactUrl!,
+      api_url: config.api.url,
+      ios_download_url: config.appLinks.ios,
+      android_download_url: config.appLinks.android,
     };
     
     // Merge with provided variables
@@ -111,6 +139,59 @@ export async function sendTemplatedEmail(
     logger.info('Templated email sent', { to, subject: variables.subject });
   } catch (error) {
     logger.error('Failed to send templated email', { error, to });
+    throw error;
+  }
+}
+
+// Send email using vendor-branded template (for customer-facing emails)
+export async function sendVendorTemplatedEmail(
+  to: string,
+  templateVariables: Partial<EmailTemplateVariables>,
+  vendorBranding: VendorBranding
+): Promise<void> {
+  try {
+    const currentYear = new Date().getFullYear();
+    const defaultVariables: EmailTemplateVariables = {
+      subject: 'Message',
+      preheader_text: '',
+      email_title: 'Notification',
+      email_content: '',
+      recipient_email: to,
+      current_year: currentYear,
+      company_address: '',
+      site_url: config.email.siteUrl!,
+      dashboard_url: config.email.dashboardUrl!,
+      support_url: config.email.contactUrl!,
+      api_url: config.api.url,
+    };
+
+    // Add vendor branding variables
+    const vendorVars: Partial<EmailTemplateVariables> = {
+      vendor_name: vendorBranding.organizationName,
+    };
+
+    if (vendorBranding.brandingLogoUrl) {
+      vendorVars.vendor_logo_url = vendorBranding.brandingLogoUrl;
+    } else {
+      // Show org name as text header when no logo
+      vendorVars.vendor_name_header = 'true';
+    }
+
+    const variables = { ...defaultVariables, ...vendorVars, ...templateVariables };
+
+    const template = loadVendorTemplate();
+    const html = replaceTemplateVariables(template, variables);
+
+    await emailService.sendEmail({
+      to,
+      subject: variables.subject,
+      html,
+      text: generatePlainText(variables),
+    });
+
+    logger.info('Vendor templated email sent', { to, subject: variables.subject, vendorName: vendorBranding.organizationName });
+  } catch (error) {
+    logger.error('Failed to send vendor templated email', { error, to });
     throw error;
   }
 }
@@ -151,7 +232,7 @@ export async function sendWelcomeEmail(to: string, userData: { firstName: string
   const emailContent = `Hi ${userData.firstName},<br><br>
 Welcome to Luma! Your account for <strong>${userData.organizationName}</strong> is all set up and ready to go.<br><br>
 To get started with your ${userData.subscriptionTier} plan, head over to your dashboard where you can set up payments, create events, manage inventory, and invite your team.<br><br>
-Click the button below to access your dashboard and start exploring.`;
+Click the button below to access your dashboard and start exploring. You can also download the Luma POS app using the links at the bottom of this email to start accepting payments on your phone.`;
 
   await sendTemplatedEmail(to, {
     subject: `Welcome to Luma, ${userData.firstName}!`,
@@ -189,12 +270,12 @@ If you didn't request this password reset, please ignore this email or contact s
   });
 }
 
-export async function sendOrderConfirmationEmail(to: string, orderData: any): Promise<void> {
+export async function sendOrderConfirmationEmail(to: string, orderData: any, vendorBranding?: VendorBranding): Promise<void> {
   // Format items as a simple list
-  const itemsList = orderData.items.map((item: any) => 
+  const itemsList = orderData.items.map((item: any) =>
     `${item.name} - ${item.quantity} × $${item.price.toFixed(2)}`
   ).join('<br>');
-  
+
   const emailContent = `Thank you for your order at ${orderData.eventName}!<br><br>
 <strong>Order ID:</strong> ${orderData.orderId}<br>
 <strong>Date:</strong> ${new Date(orderData.date).toLocaleString()}<br><br>
@@ -202,23 +283,29 @@ export async function sendOrderConfirmationEmail(to: string, orderData: any): Pr
 ${itemsList}<br><br>
 <strong>Total:</strong> $${orderData.total.toFixed(2)}<br>
 <strong>Payment Method:</strong> ${orderData.paymentMethod}`;
-  
-  await sendTemplatedEmail(to, {
+
+  const vars = {
     subject: `Order Confirmation - ${orderData.orderId}`,
     preheader_text: 'Thank you for your order',
     email_title: 'Order Confirmed!',
     email_content: emailContent,
-  });
+  };
+
+  if (vendorBranding) {
+    await sendVendorTemplatedEmail(to, vars, vendorBranding);
+  } else {
+    await sendTemplatedEmail(to, vars);
+  }
 }
 
-export async function sendReceiptEmail(to: string, receiptData: any): Promise<void> {
+export async function sendReceiptEmail(to: string, receiptData: any, vendorBranding?: VendorBranding): Promise<void> {
   // Format items as a simple list
-  const itemsList = receiptData.items.map((item: any) => 
+  const itemsList = receiptData.items.map((item: any) =>
     `${item.quantity} ${item.name} - $${item.subtotal.toFixed(2)}`
   ).join('<br>');
-  
+
   const tipLine = receiptData.tip ? `<br>Tip: $${receiptData.tip.toFixed(2)}` : '';
-  
+
   const emailContent = `<strong>${receiptData.businessName}</strong><br>
 ${receiptData.eventName}<br><br>
 <strong>Transaction:</strong> ${receiptData.transactionId}<br>
@@ -231,13 +318,19 @@ Tax: $${receiptData.tax.toFixed(2)}${tipLine}<br>
 <strong>TOTAL: $${receiptData.total.toFixed(2)}</strong><br><br>
 Payment: ${receiptData.paymentMethod} ${receiptData.last4 ? `****${receiptData.last4}` : ''}<br><br>
 Thank you for your purchase!`;
-  
-  await sendTemplatedEmail(to, {
+
+  const vars = {
     subject: `Receipt - ${receiptData.transactionId}`,
     preheader_text: 'Your purchase receipt',
     email_title: 'Receipt',
     email_content: emailContent,
-  });
+  };
+
+  if (vendorBranding) {
+    await sendVendorTemplatedEmail(to, vars, vendorBranding);
+  } else {
+    await sendTemplatedEmail(to, vars);
+  }
 }
 
 export async function sendPayoutEmail(to: string, payoutData: any): Promise<void> {
@@ -295,7 +388,7 @@ export async function sendTicketConfirmationEmail(to: string, ticketData: {
   tickets: { id: string; qrCode: string }[];
   eventSlug: string;
   apiUrl: string;
-}): Promise<void> {
+}, vendorBranding?: VendorBranding): Promise<void> {
   const ticketRows = ticketData.tickets.map((t, i) => `
     <div style="border: 1px solid #374151; border-radius: 12px; padding: 16px; margin-bottom: 12px; text-align: center;">
       <img src="${ticketData.apiUrl}/tickets/${t.id}/qr.png" alt="QR Code" width="180" height="180" style="display: block; margin: 0 auto 12px;" />
@@ -327,14 +420,20 @@ ${ticketRows}`;
 
   const siteUrl = config.email.siteUrl || 'https://lumapos.co';
 
-  await sendTemplatedEmail(to, {
+  const vars = {
     subject: `Your ticket${ticketData.quantity > 1 ? 's' : ''} for ${ticketData.eventName}`,
     preheader_text: `You're in! Show this QR code at the door.`,
     email_title: `You're In!`,
     email_content: emailContent,
     cta_url: `${siteUrl}/events/${ticketData.eventSlug}`,
     cta_text: 'View Event Details',
-  });
+  };
+
+  if (vendorBranding) {
+    await sendVendorTemplatedEmail(to, vars, vendorBranding);
+  } else {
+    await sendTemplatedEmail(to, vars);
+  }
 }
 
 export async function sendStaffDisabledEmail(to: string, staffData: {
@@ -361,7 +460,7 @@ export async function sendTicketRefundEmail(to: string, refundData: {
   refundAmount: number;
   isFullRefund: boolean;
   reason?: string;
-}): Promise<void> {
+}, vendorBranding?: VendorBranding): Promise<void> {
   const reasonLine = refundData.reason
     ? `<br><strong>Reason:</strong> ${refundData.reason}`
     : '';
@@ -378,12 +477,18 @@ ${refundData.isFullRefund
 The refund will be credited back to your original payment method within 5-10 business days, depending on your bank.<br><br>
 If you have any questions, please contact the event organizer.`;
 
-  await sendTemplatedEmail(to, {
+  const vars = {
     subject: `Refund Processed - ${refundData.eventName}`,
     preheader_text: `Your $${refundData.refundAmount.toFixed(2)} refund has been processed`,
     email_title: 'Refund Processed',
     email_content: emailContent,
-  });
+  };
+
+  if (vendorBranding) {
+    await sendVendorTemplatedEmail(to, vars, vendorBranding);
+  } else {
+    await sendTemplatedEmail(to, vars);
+  }
 }
 
 export async function sendTicketReminderEmail(to: string, ticketData: {
@@ -396,7 +501,7 @@ export async function sendTicketReminderEmail(to: string, ticketData: {
   tickets: { id: string; qrCode: string }[];
   eventSlug: string;
   apiUrl: string;
-}): Promise<void> {
+}, vendorBranding?: VendorBranding): Promise<void> {
   // Use address for maps link if available, fallback to location name
   const mapsQuery = encodeURIComponent(ticketData.eventLocationAddress || ticketData.eventLocation || '');
   const appleMapsUrl = `https://maps.apple.com/?q=${mapsQuery}`;
@@ -421,14 +526,20 @@ Just a friendly reminder — <strong>${ticketData.eventName}</strong> is tomorro
 Here's your QR code${ticketData.tickets.length > 1 ? 's' : ''} to show at the door:<br><br>
 ${qrSection}`;
 
-  await sendTemplatedEmail(to, {
+  const vars = {
     subject: `Reminder: ${ticketData.eventName} is tomorrow!`,
     preheader_text: `${ticketData.eventName} is tomorrow — don't forget your ticket!`,
     email_title: 'Event Tomorrow!',
     email_content: emailContent,
     cta_url: `${siteUrl}/events/${ticketData.eventSlug}`,
     cta_text: 'View Event Details',
-  });
+  };
+
+  if (vendorBranding) {
+    await sendVendorTemplatedEmail(to, vars, vendorBranding);
+  } else {
+    await sendTemplatedEmail(to, vars);
+  }
 }
 
 // Helper to format ready time nicely
@@ -481,7 +592,7 @@ export async function sendPreorderConfirmationEmail(to: string, preorderData: {
   estimatedReadyAt: string | null;
   pickupInstructions: string | null;
   trackingUrl: string;
-}): Promise<void> {
+}, vendorBranding?: VendorBranding): Promise<void> {
   const itemsList = preorderData.items.map(item =>
     `${item.quantity} × ${item.name} — $${item.unitPrice.toFixed(2)}`
   ).join('<br>');
@@ -513,14 +624,20 @@ Tax: $${preorderData.taxAmount.toFixed(2)}${tipLine}<br>
 <strong>Total: $${preorderData.totalAmount.toFixed(2)}</strong>${paymentStatusLine}${pickupInfo}<br><br>
 Track your order status in real-time using the button below. We'll also email you when your order is ready!`;
 
-  await sendTemplatedEmail(to, {
+  const vars = {
     subject: `Pre-Order Confirmed - #${preorderData.dailyNumber || preorderData.orderNumber}`,
     preheader_text: `Your pre-order #${preorderData.dailyNumber || preorderData.orderNumber} has been received`,
     email_title: 'Pre-Order Confirmed!',
     email_content: emailContent,
     cta_url: preorderData.trackingUrl,
     cta_text: 'Track Your Order',
-  });
+  };
+
+  if (vendorBranding) {
+    await sendVendorTemplatedEmail(to, vars, vendorBranding);
+  } else {
+    await sendTemplatedEmail(to, vars);
+  }
 }
 
 export async function sendPreorderReadyEmail(to: string, preorderData: {
@@ -532,7 +649,7 @@ export async function sendPreorderReadyEmail(to: string, preorderData: {
   paymentType: 'pay_now' | 'pay_at_pickup';
   pickupInstructions: string | null;
   trackingUrl: string;
-}): Promise<void> {
+}, vendorBranding?: VendorBranding): Promise<void> {
   const paymentReminder = preorderData.paymentType === 'pay_at_pickup'
     ? `<br><br><strong>Payment:</strong> $${preorderData.totalAmount.toFixed(2)} due at pickup`
     : '';
@@ -547,14 +664,131 @@ Great news! Your pre-order is <strong>ready for pickup</strong>!<br><br>
 <strong>Menu:</strong> ${preorderData.catalogName}${paymentReminder}${pickupInfo}<br><br>
 Please come pick up your order at your earliest convenience. Show your order number or this email when you arrive.`;
 
-  await sendTemplatedEmail(to, {
+  const vars = {
     subject: `Your Order #${preorderData.dailyNumber || preorderData.orderNumber} is Ready! 🎉`,
     preheader_text: `Your pre-order is ready for pickup`,
     email_title: 'Your Order is Ready!',
     email_content: emailContent,
     cta_url: preorderData.trackingUrl,
     cta_text: 'View Order',
-  });
+  };
+
+  if (vendorBranding) {
+    await sendVendorTemplatedEmail(to, vars, vendorBranding);
+  } else {
+    await sendTemplatedEmail(to, vars);
+  }
+}
+
+// Invoice email functions
+export async function sendInvoiceEmail(to: string, invoiceData: {
+  customerName: string;
+  invoiceNumber: string;
+  organizationName: string;
+  items: { description: string; quantity: number; unitPrice: number; amount: number }[];
+  subtotal: number;
+  taxAmount: number;
+  totalAmount: number;
+  dueDate: string | null;
+  memo: string | null;
+  hostedUrl: string;
+  pdfUrl: string | null;
+}, vendorBranding?: VendorBranding): Promise<void> {
+  const itemsList = invoiceData.items.map(item =>
+    `${item.description} — ${item.quantity} × $${item.unitPrice.toFixed(2)} = $${item.amount.toFixed(2)}`
+  ).join('<br>');
+
+  const taxLine = invoiceData.taxAmount > 0
+    ? `<br>Tax: $${invoiceData.taxAmount.toFixed(2)}`
+    : '';
+
+  const dueDateLine = invoiceData.dueDate
+    ? `<br><strong>Due Date:</strong> ${new Date(invoiceData.dueDate).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`
+    : '';
+
+  const memoLine = invoiceData.memo
+    ? `<br><br><em>${invoiceData.memo}</em>`
+    : '';
+
+  const emailContent = `Hi ${invoiceData.customerName},<br><br>
+You have a new invoice from <strong>${invoiceData.organizationName}</strong>.<br><br>
+<strong>Invoice #:</strong> ${invoiceData.invoiceNumber}${dueDateLine}<br><br>
+<strong>Items:</strong><br>
+${itemsList}<br><br>
+Subtotal: $${invoiceData.subtotal.toFixed(2)}${taxLine}<br>
+<strong>Total Due: $${invoiceData.totalAmount.toFixed(2)}</strong>${memoLine}<br><br>
+Click the button below to view and pay your invoice securely.`;
+
+  const vars = {
+    subject: `Invoice ${invoiceData.invoiceNumber} from ${invoiceData.organizationName}`,
+    preheader_text: `You have a $${invoiceData.totalAmount.toFixed(2)} invoice from ${invoiceData.organizationName}`,
+    email_title: 'Invoice',
+    email_content: emailContent,
+    cta_url: invoiceData.hostedUrl,
+    cta_text: 'View & Pay Invoice',
+  };
+
+  if (vendorBranding) {
+    await sendVendorTemplatedEmail(to, vars, vendorBranding);
+  } else {
+    await sendTemplatedEmail(to, vars);
+  }
+}
+
+export async function sendInvoicePaidEmail(to: string, invoiceData: {
+  customerName: string;
+  invoiceNumber: string;
+  organizationName: string;
+  totalAmount: number;
+  pdfUrl: string | null;
+}, vendorBranding?: VendorBranding): Promise<void> {
+  const pdfLine = invoiceData.pdfUrl
+    ? `<br><br><a href="${invoiceData.pdfUrl}" style="color: #60A5FA; text-decoration: underline;">Download PDF Receipt</a>`
+    : '';
+
+  const emailContent = `Hi ${invoiceData.customerName},<br><br>
+Thank you! Your payment of <strong>$${invoiceData.totalAmount.toFixed(2)}</strong> for invoice <strong>${invoiceData.invoiceNumber}</strong> from <strong>${invoiceData.organizationName}</strong> has been received.<br><br>
+No further action is needed.${pdfLine}`;
+
+  const vars = {
+    subject: `Payment Received - Invoice ${invoiceData.invoiceNumber}`,
+    preheader_text: `Your payment of $${invoiceData.totalAmount.toFixed(2)} has been received`,
+    email_title: 'Payment Received',
+    email_content: emailContent,
+  };
+
+  if (vendorBranding) {
+    await sendVendorTemplatedEmail(to, vars, vendorBranding);
+  } else {
+    await sendTemplatedEmail(to, vars);
+  }
+}
+
+export async function sendInvoicePaymentFailedEmail(to: string, invoiceData: {
+  customerName: string;
+  invoiceNumber: string;
+  organizationName: string;
+  totalAmount: number;
+  hostedUrl: string;
+}, vendorBranding?: VendorBranding): Promise<void> {
+  const emailContent = `Hi ${invoiceData.customerName},<br><br>
+We were unable to process your payment of <strong>$${invoiceData.totalAmount.toFixed(2)}</strong> for invoice <strong>${invoiceData.invoiceNumber}</strong> from <strong>${invoiceData.organizationName}</strong>.<br><br>
+Please try again using the button below. If you continue to experience issues, contact the vendor directly.`;
+
+  const vars = {
+    subject: `Payment Failed - Invoice ${invoiceData.invoiceNumber}`,
+    preheader_text: `Your payment for invoice ${invoiceData.invoiceNumber} could not be processed`,
+    email_title: 'Payment Failed',
+    email_content: emailContent,
+    cta_url: invoiceData.hostedUrl,
+    cta_text: 'Retry Payment',
+  };
+
+  if (vendorBranding) {
+    await sendVendorTemplatedEmail(to, vars, vendorBranding);
+  } else {
+    await sendTemplatedEmail(to, vars);
+  }
 }
 
 export async function sendPreorderCancelledEmail(to: string, preorderData: {
@@ -566,7 +800,7 @@ export async function sendPreorderCancelledEmail(to: string, preorderData: {
   paymentType: 'pay_now' | 'pay_at_pickup';
   refundIssued: boolean;
   cancellationReason?: string;
-}): Promise<void> {
+}, vendorBranding?: VendorBranding): Promise<void> {
   const reasonLine = preorderData.cancellationReason
     ? `<br><strong>Reason:</strong> ${preorderData.cancellationReason}`
     : '';
@@ -588,10 +822,16 @@ ${bodyText}<br><br>
 If you have any questions about ${contactText}, please contact the vendor directly.<br><br>
 We hope to serve you again soon!`;
 
-  await sendTemplatedEmail(to, {
+  const vars = {
     subject: `Pre-Order #${preorderData.dailyNumber || preorderData.orderNumber} ${isRefund ? 'Refunded' : 'Cancelled'}`,
     preheader_text: bodyText,
     email_title: titleText,
     email_content: emailContent,
-  });
+  };
+
+  if (vendorBranding) {
+    await sendVendorTemplatedEmail(to, vars, vendorBranding);
+  } else {
+    await sendTemplatedEmail(to, vars);
+  }
 }

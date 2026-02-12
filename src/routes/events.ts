@@ -7,7 +7,7 @@ import { logger } from '../utils/logger';
 import { socketService, SocketEvents } from '../services/socket';
 import { calculatePlatformFee, SubscriptionTier } from '../config/platform-fees';
 import { randomBytes } from 'crypto';
-import { imageService, type ImageType } from '../services/images';
+import { imageService, getImageUrl, type ImageType } from '../services/images';
 import { queueService, QueueName } from '../services/queue';
 import QRCode from 'qrcode';
 import { generateAppleWalletPass, generateGoogleWalletUrl, isAppleWalletAvailable, isGoogleWalletAvailable } from '../services/wallet';
@@ -775,7 +775,8 @@ app.openapi(purchaseTicketsRoute, async (c) => {
 
     // Get event + org + tier
     const events = await query(
-      `SELECT e.*, o.stripe_account_id, sca.stripe_account_id as connected_account_id
+      `SELECT e.*, o.stripe_account_id, o.name as org_name, o.branding_logo_id,
+              sca.stripe_account_id as connected_account_id
        FROM events e
        JOIN organizations o ON e.organization_id = o.id
        LEFT JOIN stripe_connected_accounts sca ON sca.organization_id = o.id AND sca.charges_enabled = true
@@ -931,6 +932,10 @@ app.openapi(purchaseTicketsRoute, async (c) => {
       await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
         type: 'ticket_confirmation',
         to: body.customerEmail,
+        vendorBranding: {
+          organizationName: event.org_name,
+          brandingLogoUrl: getImageUrl(event.branding_logo_id),
+        },
         data: {
           customerName: body.customerName,
           eventName: event.name,
@@ -953,6 +958,10 @@ app.openapi(purchaseTicketsRoute, async (c) => {
         await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
           type: 'ticket_reminder',
           to: body.customerEmail,
+          vendorBranding: {
+            organizationName: event.org_name,
+            brandingLogoUrl: getImageUrl(event.branding_logo_id),
+          },
           data: {
             customerName: body.customerName,
             eventName: event.name,
@@ -2005,10 +2014,12 @@ app.openapi(refundTicketRoute, async (c) => {
     // Fetch ticket with event details
     const tickets = await query(
       `SELECT t.*, tt.name as tier_name, e.name as event_name, e.slug as event_slug,
-              e.starts_at, e.location_name, e.timezone, sca.stripe_account_id as connected_account_id
+              e.starts_at, e.location_name, e.timezone, sca.stripe_account_id as connected_account_id,
+              o.name as org_name, o.branding_logo_id
        FROM tickets t
        JOIN ticket_tiers tt ON t.ticket_tier_id = tt.id
        JOIN events e ON t.event_id = e.id
+       JOIN organizations o ON e.organization_id = o.id
        LEFT JOIN stripe_connected_accounts sca ON sca.organization_id = e.organization_id
        WHERE t.id = $1 AND t.event_id = $2 AND t.organization_id = $3`,
       [ticketId, eventId, payload.organizationId]
@@ -2106,6 +2117,10 @@ app.openapi(refundTicketRoute, async (c) => {
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'ticket_refund',
       to: ticket.customer_email,
+      vendorBranding: {
+        organizationName: ticket.org_name,
+        brandingLogoUrl: getImageUrl(ticket.branding_logo_id),
+      },
       data: {
         customerName: ticket.customer_name || ticket.customer_email,
         eventName: ticket.event_name,
@@ -2175,7 +2190,10 @@ app.openapi(resendTicketEmailRoute, async (c) => {
 
     // Verify event ownership + get event details
     const events = await query(
-      `SELECT e.*, e.slug FROM events e WHERE e.id = $1 AND e.organization_id = $2`,
+      `SELECT e.*, e.slug, o.name as org_name, o.branding_logo_id
+       FROM events e
+       JOIN organizations o ON e.organization_id = o.id
+       WHERE e.id = $1 AND e.organization_id = $2`,
       [eventId, payload.organizationId]
     );
     if (!events[0]) return c.json({ error: 'Event not found' }, 404);
@@ -2202,6 +2220,10 @@ app.openapi(resendTicketEmailRoute, async (c) => {
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'ticket_confirmation',
       to: body.customerEmail,
+      vendorBranding: {
+        organizationName: event.org_name,
+        brandingLogoUrl: getImageUrl(event.branding_logo_id),
+      },
       data: {
         customerName: tickets[0].customer_name,
         eventName: event.name,

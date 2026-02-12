@@ -5,6 +5,7 @@ import { logger } from '../utils/logger';
 import { socketService, SocketEvents } from '../services/socket';
 import { queueService, QueueName } from '../services/queue';
 import { stripe } from '../services/stripe';
+import { getImageUrl } from '../services/images';
 
 const app = new OpenAPIHono();
 
@@ -17,6 +18,19 @@ async function verifyAuth(authHeader: string | undefined) {
   const token = authHeader.substring(7);
   const { authService } = await import('../services/auth');
   return authService.verifyToken(token);
+}
+
+// Pro subscription check
+async function requirePro(organizationId: string): Promise<{ tier: string } | null> {
+  const rows = await query<{ tier: string; status: string }>(
+    `SELECT tier, status FROM subscriptions
+     WHERE organization_id = $1 AND status IN ('active', 'trialing') LIMIT 1`,
+    [organizationId]
+  );
+  if (rows.length === 0) return null;
+  const { tier } = rows[0];
+  if (tier !== 'pro' && tier !== 'enterprise') return null;
+  return { tier };
 }
 
 // ─── Response formatters ──────────────────────────────────────────────────────
@@ -86,6 +100,11 @@ const listPreordersRoute = createRoute({
 app.openapi(listPreordersRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Preorder management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
 
     logger.info('[PREORDER DEBUG] List preorders request', {
       userId: payload.userId,
@@ -197,6 +216,11 @@ app.openapi(getPreorderStatsRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
 
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Preorder management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     logger.info('[PREORDER DEBUG] Get preorder stats request', {
       userId: payload.userId,
       organizationId: payload.organizationId,
@@ -273,6 +297,11 @@ app.openapi(getPreorderRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
 
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Preorder management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const rows = await query(
       `SELECT p.*, c.name AS catalog_name, c.location AS catalog_location,
         u.first_name || ' ' || u.last_name AS picked_up_by_name
@@ -346,6 +375,11 @@ app.openapi(updatePreorderStatusRoute, async (c) => {
 
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Preorder management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
 
     // Get current preorder
     const preorders = await query(
@@ -438,10 +472,20 @@ app.openapi(updatePreorderStatusRoute, async (c) => {
         [updatedPreorder.catalog_id]
       );
 
+      // Get organization for vendor branding
+      const orgs = await query<{ name: string; branding_logo_id: string | null }>(
+        `SELECT name, branding_logo_id FROM organizations WHERE id = $1`,
+        [payload.organizationId]
+      );
+
       // Queue ready notification email
       await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
         type: 'preorder_ready',
         to: updatedPreorder.customer_email,
+        vendorBranding: {
+          organizationName: orgs[0]?.name || '',
+          brandingLogoUrl: getImageUrl(orgs[0]?.branding_logo_id ?? null),
+        },
         data: {
           orderNumber: updatedPreorder.order_number,
           dailyNumber: updatedPreorder.daily_number,
@@ -499,6 +543,11 @@ app.openapi(completePreorderRoute, async (c) => {
 
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Preorder management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
 
     const preorders = await query(
       `SELECT * FROM preorders WHERE id = $1 AND organization_id = $2`,
@@ -672,6 +721,11 @@ app.openapi(cancelPreorderVendorRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
 
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Preorder management requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
     const preorders = await query(
       `SELECT * FROM preorders WHERE id = $1 AND organization_id = $2`,
       [id, payload.organizationId]
@@ -757,10 +811,20 @@ app.openapi(cancelPreorderVendorRoute, async (c) => {
       [preorder.catalog_id]
     );
 
+    // Get organization for vendor branding
+    const orgs = await query<{ name: string; branding_logo_id: string | null }>(
+      `SELECT name, branding_logo_id FROM organizations WHERE id = $1`,
+      [payload.organizationId]
+    );
+
     // Queue cancellation email to customer
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'preorder_cancelled',
       to: preorder.customer_email,
+      vendorBranding: {
+        organizationName: orgs[0]?.name || '',
+        brandingLogoUrl: getImageUrl(orgs[0]?.branding_logo_id ?? null),
+      },
       data: {
         orderNumber: preorder.order_number,
         dailyNumber: preorder.daily_number,

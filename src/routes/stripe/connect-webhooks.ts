@@ -5,6 +5,8 @@ import { logger } from '../../utils/logger';
 import { transaction, query } from '../../db';
 import { syncAccountFromStripe, deriveOnboardingState } from './connect';
 import { socketService, SocketEvents } from '../../services/socket';
+import { queueService, QueueName } from '../../services/queue';
+import { getImageUrl } from '../../services/images';
 
 const app = new Hono();
 
@@ -97,6 +99,32 @@ app.post('/stripe/webhook-connect', async (c) => {
 
       case 'charge.refunded':
         await handleChargeRefunded(event.data.object, event.account);
+        break;
+
+      // Invoice events (for custom vendor invoicing)
+      case 'invoice.finalized':
+        await handleInvoiceFinalized(event.data.object, event.account);
+        break;
+
+      case 'invoice.paid':
+      case 'invoice.payment_succeeded':
+        await handleInvoicePaid(event.data.object, event.account);
+        break;
+
+      case 'invoice.payment_failed':
+        await handleInvoicePaymentFailed(event.data.object, event.account);
+        break;
+
+      case 'invoice.voided':
+        await handleInvoiceVoided(event.data.object, event.account);
+        break;
+
+      case 'invoice.marked_uncollectible':
+        await handleInvoiceMarkedUncollectible(event.data.object, event.account);
+        break;
+
+      case 'invoice.overdue':
+        await handleInvoiceOverdue(event.data.object, event.account);
         break;
 
       default:
@@ -401,7 +429,16 @@ async function handlePaymentIntentSucceeded(paymentIntent: any, connectedAccount
     });
 
     if (checkResult.rows.length === 0) {
-      // Let's check recent orders to see what payment intent IDs they have
+      // Check if this is an invoice payment via payment_details.order_reference
+      const stripeInvoiceId = paymentIntent.payment_details?.order_reference;
+      if (stripeInvoiceId && typeof stripeInvoiceId === 'string' && stripeInvoiceId.startsWith('in_')) {
+        logger.info('[CONNECT WEBHOOK DEBUG] No order found but payment_details.order_reference contains invoice ID — handling as invoice payment', {
+          stripeInvoiceId,
+        });
+        await handleInvoicePaymentFromPI(client, paymentIntent, stripeInvoiceId);
+        return;
+      }
+
       const recentOrders = await client.query(
         `SELECT id, status, stripe_payment_intent_id, order_number, created_at
          FROM orders
@@ -462,6 +499,86 @@ async function handlePaymentIntentSucceeded(paymentIntent: any, connectedAccount
   });
 
   logger.info('[CONNECT WEBHOOK DEBUG] ========== handlePaymentIntentSucceeded END ==========');
+}
+
+// Fallback: handle invoice payment from payment_intent.succeeded when invoice.paid/payment_succeeded webhook doesn't arrive
+async function handleInvoicePaymentFromPI(client: any, paymentIntent: any, stripeInvoiceId: string) {
+  const amountPaid = (paymentIntent.amount_received || paymentIntent.amount || 0) / 100;
+
+  const updatedRows = await client.query(
+    `UPDATE invoices SET
+      status = 'paid',
+      amount_paid = $1,
+      amount_due = 0,
+      stripe_payment_intent_id = $2,
+      stripe_charge_id = $3,
+      paid_at = NOW(),
+      updated_at = NOW()
+    WHERE stripe_invoice_id = $4 AND status IN ('open', 'past_due')
+    RETURNING id, organization_id, customer_email, customer_name, invoice_number, total_amount, customer_id`,
+    [amountPaid, paymentIntent.id, paymentIntent.latest_charge, stripeInvoiceId]
+  );
+
+  if (updatedRows.rows.length > 0) {
+    const inv = updatedRows.rows[0];
+
+    // Update customer total_spent if linked
+    if (inv.customer_id) {
+      await client.query(
+        `UPDATE customers SET
+          total_spent = total_spent + $1,
+          total_orders = total_orders + 1,
+          last_order_at = NOW(),
+          updated_at = NOW()
+        WHERE id = $2`,
+        [parseFloat(inv.total_amount), inv.customer_id]
+      );
+    }
+
+    const orgRows = await client.query(
+      'SELECT name, branding_logo_id FROM organizations WHERE id = $1',
+      [inv.organization_id]
+    );
+
+    const orgName = orgRows.rows[0]?.name || 'Your vendor';
+    const brandingLogoId = orgRows.rows[0]?.branding_logo_id || null;
+
+    // Queue payment confirmation email
+    await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
+      type: 'invoice_paid',
+      to: inv.customer_email,
+      vendorBranding: {
+        organizationName: orgName,
+        brandingLogoUrl: getImageUrl(brandingLogoId),
+      },
+      data: {
+        customerName: inv.customer_name,
+        invoiceNumber: inv.invoice_number,
+        organizationName: orgName,
+        totalAmount: parseFloat(inv.total_amount),
+        pdfUrl: null,
+      },
+    });
+
+    socketService.emitToOrganization(inv.organization_id, SocketEvents.INVOICE_PAID, {
+      invoiceId: inv.id,
+      invoiceNumber: inv.invoice_number,
+      customerName: inv.customer_name,
+      totalAmount: parseFloat(inv.total_amount),
+    });
+
+    logger.info('Invoice marked paid via payment_intent.succeeded fallback', {
+      invoiceId: inv.id,
+      stripeInvoiceId,
+      paymentIntentId: paymentIntent.id,
+      amountPaid,
+    });
+  } else {
+    logger.warn('Invoice not found or already paid for payment_intent.succeeded fallback', {
+      stripeInvoiceId,
+      paymentIntentId: paymentIntent.id,
+    });
+  }
 }
 
 async function handlePreorderPaymentSucceeded(paymentIntent: any) {
@@ -619,6 +736,259 @@ async function handleChargeRefunded(charge: any, connectedAccountId: string | un
       });
     }
   });
+}
+
+// ─── Invoice Webhook Handlers ────────────────────────────────────────────────
+
+async function handleInvoiceFinalized(stripeInvoice: any, _connectedAccountId: string | undefined) {
+  const lumaInvoiceId = stripeInvoice.metadata?.luma_invoice_id;
+  if (!lumaInvoiceId) {
+    logger.debug('Invoice finalized webhook skipped - no luma_invoice_id in metadata', {
+      stripeInvoiceId: stripeInvoice.id,
+    });
+    return;
+  }
+
+  await query(
+    `UPDATE invoices SET
+      stripe_hosted_url = $1,
+      stripe_pdf_url = $2,
+      status = 'open',
+      updated_at = NOW()
+    WHERE id = $3`,
+    [stripeInvoice.hosted_invoice_url, stripeInvoice.invoice_pdf, lumaInvoiceId]
+  );
+
+  const invoiceRows = await query<{ organization_id: string }>(
+    'SELECT organization_id FROM invoices WHERE id = $1',
+    [lumaInvoiceId]
+  );
+  if (invoiceRows.length > 0) {
+    socketService.emitToOrganization(invoiceRows[0].organization_id, SocketEvents.INVOICE_UPDATED, {
+      invoiceId: lumaInvoiceId,
+      status: 'open',
+    });
+  }
+
+  logger.info('Invoice finalized via webhook', { lumaInvoiceId, stripeInvoiceId: stripeInvoice.id });
+}
+
+async function handleInvoicePaid(stripeInvoice: any, _connectedAccountId: string | undefined) {
+  const lumaInvoiceId = stripeInvoice.metadata?.luma_invoice_id;
+  if (!lumaInvoiceId) return;
+
+  const amountPaid = (stripeInvoice.amount_paid || 0) / 100;
+
+  const updatedRows = await query<{
+    organization_id: string;
+    customer_email: string;
+    customer_name: string;
+    invoice_number: string;
+    total_amount: any;
+    customer_id: string | null;
+  }>(
+    `UPDATE invoices SET
+      status = 'paid',
+      amount_paid = $1,
+      amount_due = 0,
+      stripe_payment_intent_id = $2,
+      stripe_charge_id = $3,
+      stripe_hosted_url = $4,
+      stripe_pdf_url = $5,
+      paid_at = NOW(),
+      updated_at = NOW()
+    WHERE id = $6
+    RETURNING organization_id, customer_email, customer_name, invoice_number, total_amount, customer_id`,
+    [
+      amountPaid,
+      stripeInvoice.payment_intent,
+      stripeInvoice.charge,
+      stripeInvoice.hosted_invoice_url,
+      stripeInvoice.invoice_pdf,
+      lumaInvoiceId,
+    ]
+  );
+
+  if (updatedRows.length > 0) {
+    const inv = updatedRows[0];
+
+    // Update customer total_spent if linked
+    if (inv.customer_id) {
+      await query(
+        `UPDATE customers SET
+          total_spent = total_spent + $1,
+          total_orders = total_orders + 1,
+          last_order_at = NOW(),
+          updated_at = NOW()
+        WHERE id = $2`,
+        [parseFloat(inv.total_amount), inv.customer_id]
+      );
+    }
+
+    // Get org name and branding for email
+    const orgRows = await query<{ name: string; branding_logo_id: string | null }>(
+      'SELECT name, branding_logo_id FROM organizations WHERE id = $1',
+      [inv.organization_id]
+    );
+
+    const orgName = orgRows[0]?.name || 'Your vendor';
+    const brandingLogoId = orgRows[0]?.branding_logo_id || null;
+
+    // Queue payment confirmation email
+    await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
+      type: 'invoice_paid',
+      to: inv.customer_email,
+      vendorBranding: {
+        organizationName: orgName,
+        brandingLogoUrl: getImageUrl(brandingLogoId),
+      },
+      data: {
+        customerName: inv.customer_name,
+        invoiceNumber: inv.invoice_number,
+        organizationName: orgName,
+        totalAmount: parseFloat(inv.total_amount),
+        pdfUrl: stripeInvoice.invoice_pdf || null,
+      },
+    });
+
+    socketService.emitToOrganization(inv.organization_id, SocketEvents.INVOICE_PAID, {
+      invoiceId: lumaInvoiceId,
+      invoiceNumber: inv.invoice_number,
+      customerName: inv.customer_name,
+      totalAmount: parseFloat(inv.total_amount),
+    });
+
+    logger.info('Invoice paid via webhook', {
+      lumaInvoiceId,
+      stripeInvoiceId: stripeInvoice.id,
+      amountPaid,
+      organizationId: inv.organization_id,
+    });
+  }
+}
+
+async function handleInvoicePaymentFailed(stripeInvoice: any, _connectedAccountId: string | undefined) {
+  const lumaInvoiceId = stripeInvoice.metadata?.luma_invoice_id;
+  if (!lumaInvoiceId) return;
+
+  // Update status to past_due on payment failure
+  const updatedRows = await query<{
+    organization_id: string;
+    customer_email: string;
+    customer_name: string;
+    invoice_number: string;
+    total_amount: any;
+    stripe_hosted_url: string | null;
+  }>(
+    `UPDATE invoices SET
+      status = 'past_due',
+      updated_at = NOW()
+    WHERE id = $1 AND status IN ('open', 'past_due')
+    RETURNING organization_id, customer_email, customer_name, invoice_number, total_amount, stripe_hosted_url`,
+    [lumaInvoiceId]
+  );
+
+  if (updatedRows.length > 0) {
+    const inv = updatedRows[0];
+
+    const orgRows = await query<{ name: string; branding_logo_id: string | null }>(
+      'SELECT name, branding_logo_id FROM organizations WHERE id = $1',
+      [inv.organization_id]
+    );
+
+    const orgName = orgRows[0]?.name || 'Your vendor';
+    const brandingLogoId = orgRows[0]?.branding_logo_id || null;
+
+    // Queue payment failure email
+    await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
+      type: 'invoice_payment_failed',
+      to: inv.customer_email,
+      vendorBranding: {
+        organizationName: orgName,
+        brandingLogoUrl: getImageUrl(brandingLogoId),
+      },
+      data: {
+        customerName: inv.customer_name,
+        invoiceNumber: inv.invoice_number,
+        organizationName: orgName,
+        totalAmount: parseFloat(inv.total_amount),
+        hostedUrl: inv.stripe_hosted_url || stripeInvoice.hosted_invoice_url || '',
+      },
+    });
+
+    socketService.emitToOrganization(inv.organization_id, SocketEvents.INVOICE_PAYMENT_FAILED, {
+      invoiceId: lumaInvoiceId,
+      invoiceNumber: inv.invoice_number,
+      status: 'past_due',
+    });
+
+    logger.warn('Invoice payment failed via webhook — status set to past_due', {
+      lumaInvoiceId,
+      stripeInvoiceId: stripeInvoice.id,
+      organizationId: inv.organization_id,
+    });
+  }
+}
+
+async function handleInvoiceVoided(stripeInvoice: any, _connectedAccountId: string | undefined) {
+  const lumaInvoiceId = stripeInvoice.metadata?.luma_invoice_id;
+  if (!lumaInvoiceId) return;
+
+  const updatedRows = await query<{ organization_id: string }>(
+    `UPDATE invoices SET status = 'void', voided_at = NOW(), updated_at = NOW() WHERE id = $1 RETURNING organization_id`,
+    [lumaInvoiceId]
+  );
+
+  if (updatedRows.length > 0) {
+    socketService.emitToOrganization(updatedRows[0].organization_id, SocketEvents.INVOICE_VOIDED, {
+      invoiceId: lumaInvoiceId,
+    });
+  }
+
+  logger.info('Invoice voided via webhook', { lumaInvoiceId, stripeInvoiceId: stripeInvoice.id });
+}
+
+async function handleInvoiceMarkedUncollectible(stripeInvoice: any, _connectedAccountId: string | undefined) {
+  const lumaInvoiceId = stripeInvoice.metadata?.luma_invoice_id;
+  if (!lumaInvoiceId) return;
+
+  const updatedRows = await query<{ organization_id: string }>(
+    `UPDATE invoices SET status = 'uncollectible', updated_at = NOW() WHERE id = $1 RETURNING organization_id`,
+    [lumaInvoiceId]
+  );
+
+  if (updatedRows.length > 0) {
+    socketService.emitToOrganization(updatedRows[0].organization_id, SocketEvents.INVOICE_UPDATED, {
+      invoiceId: lumaInvoiceId,
+      status: 'uncollectible',
+    });
+  }
+
+  logger.info('Invoice marked uncollectible via webhook', { lumaInvoiceId, stripeInvoiceId: stripeInvoice.id });
+}
+
+async function handleInvoiceOverdue(stripeInvoice: any, _connectedAccountId: string | undefined) {
+  const lumaInvoiceId = stripeInvoice.metadata?.luma_invoice_id;
+  if (!lumaInvoiceId) return;
+
+  const updatedRows = await query<{ organization_id: string; invoice_number: string }>(
+    `UPDATE invoices SET
+      status = 'past_due',
+      updated_at = NOW()
+    WHERE id = $1 AND status = 'open'
+    RETURNING organization_id, invoice_number`,
+    [lumaInvoiceId]
+  );
+
+  if (updatedRows.length > 0) {
+    socketService.emitToOrganization(updatedRows[0].organization_id, SocketEvents.INVOICE_OVERDUE, {
+      invoiceId: lumaInvoiceId,
+      invoiceNumber: updatedRows[0].invoice_number,
+      status: 'past_due',
+    });
+  }
+
+  logger.info('Invoice overdue via webhook — status set to past_due', { lumaInvoiceId, stripeInvoiceId: stripeInvoice.id });
 }
 
 export default app;
