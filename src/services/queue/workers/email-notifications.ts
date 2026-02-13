@@ -1,7 +1,7 @@
 import { Job } from 'bullmq';
 import { QueueName, JobData, queueService } from '../index';
 import { logger } from '../../../utils/logger';
-import { VendorBranding, sendOrderConfirmationEmail, sendReceiptEmail, sendPayoutEmail, sendWelcomeEmail, sendTicketConfirmationEmail, sendTicketReminderEmail, sendTicketRefundEmail, sendPreorderConfirmationEmail, sendPreorderReadyEmail, sendPreorderCancelledEmail, sendInvoiceEmail, sendInvoicePaidEmail, sendInvoicePaymentFailedEmail } from '../../email/template-sender';
+import { VendorBranding, sendOrderConfirmationEmail, sendReceiptEmail, sendPayoutEmail, sendWelcomeEmail, sendTicketConfirmationEmail, sendTicketReminderEmail, sendTicketRefundEmail, sendPreorderConfirmationEmail, sendPreorderReadyEmail, sendPreorderCancelledEmail, sendInvoiceEmail, sendInvoicePaidEmail, sendInvoicePaymentFailedEmail, sendInvoiceRefundedEmail } from '../../email/template-sender';
 
 export function registerEmailNotifications() {
   return queueService.registerWorker(
@@ -75,6 +75,10 @@ export function registerEmailNotifications() {
 
           case 'invoice_payment_failed':
             await sendInvoicePaymentFailedEmail(to, data as any, vendorBranding);
+            break;
+
+          case 'invoice_refunded':
+            await sendInvoiceRefundedEmail(to, data as any, vendorBranding);
             break;
 
           default:

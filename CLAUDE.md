@@ -268,6 +268,23 @@ These endpoints power the customer-facing menu on the marketing site. No auth re
 
 **Status transitions:** `pending → confirmed → preparing → ready → picked_up` (or `cancelled` from any non-terminal state)
 
+### Invoices (Pro only)
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| POST | `/invoices` | Create draft invoice |
+| GET | `/invoices` | List invoices (paginated, filterable) |
+| GET | `/invoices/stats` | Invoice statistics (counts, totals) |
+| GET | `/invoices/{id}` | Get invoice detail |
+| PUT | `/invoices/{id}` | Update draft invoice |
+| DELETE | `/invoices/{id}` | Delete draft invoice |
+| POST | `/invoices/{id}/send` | Finalize and send to customer via Stripe |
+| POST | `/invoices/{id}/void` | Void invoice |
+| POST | `/invoices/{id}/mark-uncollectible` | Mark as uncollectible |
+| POST | `/invoices/{id}/send-reminder` | Send reminder email |
+| POST | `/invoices/{id}/duplicate` | Duplicate as new draft |
+| POST | `/invoices/{id}/refund` | Refund paid invoice (full or partial) |
+
 ### Webhooks
 
 | Method | Endpoint | Purpose |
@@ -389,6 +406,25 @@ quantity INTEGER CHECK (quantity > 0),
 notes TEXT                         -- Per-item customer notes (e.g., "no onions")
 ```
 
+**invoices** - Customer invoicing (Pro feature, migration 056-058)
+```sql
+id UUID PRIMARY KEY,
+organization_id UUID FK, invoice_number VARCHAR(50),
+customer_id UUID FK → customers,
+customer_name, customer_email, customer_phone,
+stripe_invoice_id, stripe_customer_id,
+stripe_hosted_url, stripe_pdf_url,
+stripe_payment_intent_id, stripe_charge_id,
+subtotal, tax_amount, total_amount DECIMAL(10,2),  -- In dollars
+amount_paid, amount_due, amount_refunded DECIMAL(10,2),
+platform_fee_cents INTEGER,
+status VARCHAR(30),  -- 'draft' | 'open' | 'paid' | 'void' | 'uncollectible' | 'past_due' | 'refunded'
+due_date DATE, memo TEXT, internal_notes TEXT, footer TEXT,
+sent_at, paid_at, voided_at, refunded_at TIMESTAMPTZ,
+refund_receipt_url TEXT,
+created_by UUID FK → users
+```
+
 **stripe_connected_accounts**
 ```sql
 id, organization_id FK, stripe_account_id,
@@ -425,6 +461,11 @@ CATEGORY_CREATED, CATEGORY_UPDATED, CATEGORY_DELETED
 // Preorder events
 PREORDER_CREATED, PREORDER_UPDATED, PREORDER_READY
 PREORDER_COMPLETED, PREORDER_CANCELLED
+
+// Invoice events
+INVOICE_CREATED, INVOICE_UPDATED, INVOICE_SENT
+INVOICE_PAID, INVOICE_PAYMENT_FAILED
+INVOICE_VOIDED, INVOICE_OVERDUE
 
 // User events
 USER_UPDATED, ORGANIZATION_UPDATED, CONNECT_STATUS_UPDATED
@@ -651,6 +692,8 @@ await sendTemplatedEmail(to, {
 - `sendPreorderConfirmationEmail()` - Preorder placed (with tracking URL)
 - `sendPreorderReadyEmail()` - Order ready for pickup
 - `sendPreorderCancelledEmail()` - Preorder cancelled (with refund status)
+- `sendInvoiceSentEmail()` - Invoice sent to customer
+- `sendInvoiceRefundedEmail()` - Invoice refund notification
 
 ---
 

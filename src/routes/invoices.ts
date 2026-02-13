@@ -106,6 +106,9 @@ function formatInvoice(row: any) {
     sentAt: row.sent_at?.toISOString() || null,
     paidAt: row.paid_at?.toISOString() || null,
     voidedAt: row.voided_at?.toISOString() || null,
+    amountRefunded: parseFloat(row.amount_refunded) || 0,
+    refundedAt: row.refunded_at?.toISOString() || null,
+    refundReceiptUrl: row.refund_receipt_url || null,
     createdBy: row.created_by,
     createdByName: row.created_by_name || null,
     createdAt: row.created_at?.toISOString() || new Date().toISOString(),
@@ -1249,6 +1252,201 @@ app.openapi(duplicateInvoiceRoute, async (c) => {
     }
     logger.error('Error duplicating invoice', { error });
     return c.json({ error: 'Failed to duplicate invoice' }, 500);
+  }
+});
+
+// ─── POST /invoices/:id/refund — Refund a paid invoice ──────────────────────
+
+const refundInvoiceRoute = createRoute({
+  method: 'post',
+  path: '/invoices/{id}/refund',
+  summary: 'Refund a paid invoice (full or partial)',
+  tags: ['Invoices'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    params: z.object({ id: z.string().uuid() }),
+    body: {
+      content: {
+        'application/json': {
+          schema: z.object({
+            amount: z.number().positive().optional(),
+            reason: z.string().max(500).optional(),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: { description: 'Refund processed' },
+    400: { description: 'Invalid refund' },
+    401: { description: 'Unauthorized' },
+    403: { description: 'Pro subscription required' },
+    404: { description: 'Invoice not found' },
+  },
+});
+
+app.openapi(refundInvoiceRoute, async (c) => {
+  try {
+    const payload = await verifyAuth(c.req.header('Authorization'));
+    const sub = await requirePro(payload.organizationId);
+    if (!sub) {
+      return c.json({ error: 'Invoicing requires a Pro subscription', code: 'PRO_REQUIRED' }, 403);
+    }
+
+    const { id } = c.req.param();
+    const body = await c.req.json();
+
+    // Get invoice
+    const invoices = await query<any>(
+      'SELECT * FROM invoices WHERE id = $1 AND organization_id = $2',
+      [id, payload.organizationId]
+    );
+    if (invoices.length === 0) {
+      return c.json({ error: 'Invoice not found' }, 404);
+    }
+    const invoice = invoices[0];
+
+    if (invoice.status !== 'paid') {
+      return c.json({ error: 'Only paid invoices can be refunded' }, 400);
+    }
+
+    const amountPaid = parseFloat(invoice.amount_paid);
+    const alreadyRefunded = parseFloat(invoice.amount_refunded) || 0;
+    const refundableAmount = amountPaid - alreadyRefunded;
+
+    if (refundableAmount <= 0) {
+      return c.json({ error: 'This invoice has already been fully refunded' }, 400);
+    }
+
+    const refundAmount = body.amount ? Math.min(body.amount, refundableAmount) : refundableAmount;
+    if (refundAmount <= 0) {
+      return c.json({ error: 'Invalid refund amount' }, 400);
+    }
+
+    // Get connected account
+    const connectedAccountId = await getConnectedAccount(payload.organizationId);
+    if (!connectedAccountId) {
+      return c.json({ error: 'Stripe Connect account not found' }, 400);
+    }
+
+    // Process Stripe refund
+    let stripeRefundId: string | null = null;
+    let refundReceiptUrl: string | null = null;
+    const chargeId = invoice.stripe_charge_id;
+    const paymentIntentId = invoice.stripe_payment_intent_id;
+
+    if (chargeId || paymentIntentId) {
+      const refundCents = Math.round(refundAmount * 100);
+      const refundParams: any = {
+        amount: refundCents,
+        reason: 'requested_by_customer',
+        metadata: {
+          luma_invoice_id: id,
+          refund_reason: body.reason || 'Vendor initiated refund',
+        },
+      };
+      if (chargeId) {
+        refundParams.charge = chargeId;
+      } else {
+        refundParams.payment_intent = paymentIntentId;
+      }
+
+      const refund = await stripe.refunds.create(
+        refundParams,
+        { stripeAccount: connectedAccountId }
+      );
+      stripeRefundId = refund.id;
+
+      // Get the charge receipt URL (shows refund info after refund)
+      if (chargeId) {
+        try {
+          const charge = await stripe.charges.retrieve(chargeId, { stripeAccount: connectedAccountId });
+          refundReceiptUrl = charge.receipt_url || null;
+        } catch (e) {
+          // Non-critical, continue without receipt URL
+        }
+      }
+    }
+
+    // Update invoice
+    const newAmountRefunded = alreadyRefunded + refundAmount;
+    const isFullRefund = newAmountRefunded >= amountPaid;
+    const newStatus = isFullRefund ? 'refunded' : 'paid';
+
+    const updatedRows = await query<any>(
+      `UPDATE invoices SET
+        amount_refunded = $1,
+        status = $2,
+        refunded_at = COALESCE(refunded_at, NOW()),
+        refund_receipt_url = COALESCE($4, refund_receipt_url),
+        updated_at = NOW()
+      WHERE id = $3 RETURNING *`,
+      [newAmountRefunded, newStatus, id, refundReceiptUrl]
+    );
+
+    // Get items for response
+    const items = await query<any>(
+      'SELECT * FROM invoice_items WHERE invoice_id = $1 ORDER BY sort_order',
+      [id]
+    );
+
+    // Emit socket event
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.INVOICE_UPDATED, {
+      invoiceId: id,
+      invoiceNumber: invoice.invoice_number,
+      refundAmount,
+      isFullRefund,
+    });
+
+    // Queue refund notification email
+    const orgRows = await query<{ name: string; branding_logo_id: string | null }>(
+      'SELECT name, branding_logo_id FROM organizations WHERE id = $1',
+      [payload.organizationId]
+    );
+    const orgName = orgRows[0]?.name || 'Your vendor';
+    const brandingLogoId = orgRows[0]?.branding_logo_id || null;
+
+    await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
+      type: 'invoice_refunded',
+      to: invoice.customer_email,
+      vendorBranding: {
+        organizationName: orgName,
+        brandingLogoUrl: getImageUrl(brandingLogoId),
+      },
+      data: {
+        customerName: invoice.customer_name,
+        invoiceNumber: invoice.invoice_number,
+        organizationName: orgName,
+        refundAmount,
+        isFullRefund,
+        totalAmount: parseFloat(invoice.total_amount),
+      },
+    });
+
+    logger.info('Invoice refunded', {
+      invoiceId: id,
+      refundAmount,
+      isFullRefund,
+      stripeRefundId,
+      organizationId: payload.organizationId,
+    });
+
+    return c.json({
+      invoice: {
+        ...formatInvoice(updatedRows[0]),
+        items: items.map(formatInvoiceItem),
+      },
+      refundAmount,
+      isFullRefund,
+      stripeRefundId,
+    });
+  } catch (error: any) {
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    logger.error('Error refunding invoice', { error });
+    const msg = error?.raw?.message || error?.message || 'Failed to refund invoice';
+    return c.json({ error: msg }, 500);
   }
 });
 

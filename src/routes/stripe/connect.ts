@@ -425,8 +425,8 @@ app.openapi(createConnectedAccountRoute, async (c) => {
       const existingAccount = existingRows[0];
       const accountLink = await stripeService.createAccountLink(
         existingAccount.stripe_account_id,
-        `${config.email.dashboardUrl}/connect`,
-        `${config.email.dashboardUrl}/connect`
+        `${config.email.dashboardUrl}/banking`,
+        `${config.email.dashboardUrl}/banking`
       );
 
       // Set flag so next status check will force refresh from Stripe
@@ -475,8 +475,8 @@ app.openapi(createConnectedAccountRoute, async (c) => {
     // Create onboarding link
     const accountLink = await stripeService.createAccountLink(
       account.id,
-      `${config.email.dashboardUrl}/connect`,
-      `${config.email.dashboardUrl}/connect`
+      `${config.email.dashboardUrl}/banking`,
+      `${config.email.dashboardUrl}/banking`
     );
 
     // Set flag so next status check will force refresh from Stripe
@@ -559,8 +559,8 @@ app.openapi(createOnboardingLinkRoute, async (c) => {
 
     const accountLink = await stripeService.createAccountLink(
       connectedAccount.stripe_account_id,
-      `${config.email.dashboardUrl}/connect`,
-      `${config.email.dashboardUrl}/connect`,
+      `${config.email.dashboardUrl}/banking`,
+      `${config.email.dashboardUrl}/banking`,
       linkType
     );
 

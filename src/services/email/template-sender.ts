@@ -791,6 +791,33 @@ Please try again using the button below. If you continue to experience issues, c
   }
 }
 
+export async function sendInvoiceRefundedEmail(to: string, invoiceData: {
+  customerName: string;
+  invoiceNumber: string;
+  organizationName: string;
+  refundAmount: number;
+  totalAmount: number;
+  isFullRefund: boolean;
+}, vendorBranding?: VendorBranding): Promise<void> {
+  const refundType = invoiceData.isFullRefund ? 'full' : 'partial';
+  const emailContent = `Hi ${invoiceData.customerName},<br><br>
+A ${refundType} refund of <strong>$${invoiceData.refundAmount.toFixed(2)}</strong> has been issued for invoice <strong>${invoiceData.invoiceNumber}</strong> from <strong>${invoiceData.organizationName}</strong>.<br><br>
+The refund will be returned to your original payment method. Please allow 5-10 business days for the refund to appear on your statement.`;
+
+  const vars = {
+    subject: `Refund Issued - Invoice ${invoiceData.invoiceNumber}`,
+    preheader_text: `A refund of $${invoiceData.refundAmount.toFixed(2)} has been issued`,
+    email_title: 'Refund Issued',
+    email_content: emailContent,
+  };
+
+  if (vendorBranding) {
+    await sendVendorTemplatedEmail(to, vars, vendorBranding);
+  } else {
+    await sendTemplatedEmail(to, vars);
+  }
+}
+
 export async function sendPreorderCancelledEmail(to: string, preorderData: {
   customerName: string;
   orderNumber: string;
