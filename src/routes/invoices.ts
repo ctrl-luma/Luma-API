@@ -385,6 +385,7 @@ app.openapi(invoiceStatsRoute, async (c) => {
         COUNT(*) FILTER (WHERE status = 'past_due') AS past_due_count,
         COUNT(*) FILTER (WHERE status = 'void') AS void_count,
         COUNT(*) FILTER (WHERE status = 'uncollectible') AS uncollectible_count,
+        COUNT(*) FILTER (WHERE status = 'refunded') AS refunded_count,
         COALESCE(SUM(amount_due) FILTER (WHERE status IN ('open', 'past_due')), 0) AS total_outstanding,
         COALESCE(SUM(total_amount) FILTER (WHERE status = 'paid' AND paid_at >= DATE_TRUNC('month', CURRENT_DATE)), 0) AS paid_this_month,
         COALESCE(SUM(total_amount) FILTER (WHERE status = 'paid'), 0) AS total_collected
@@ -401,6 +402,7 @@ app.openapi(invoiceStatsRoute, async (c) => {
       pastDueCount: parseInt(stats.past_due_count),
       voidCount: parseInt(stats.void_count),
       uncollectibleCount: parseInt(stats.uncollectible_count),
+      refundedCount: parseInt(stats.refunded_count),
       totalOutstanding: parseFloat(stats.total_outstanding),
       paidThisMonth: parseFloat(stats.paid_this_month),
       totalCollected: parseFloat(stats.total_collected),

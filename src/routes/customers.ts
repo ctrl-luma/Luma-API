@@ -84,12 +84,44 @@ app.openapi(listCustomersRoute, async (c) => {
     );
     const total = parseInt(countResult[0]?.count || '0', 10);
 
-    // Get customers
+    // Get customers with unified stats across all transaction types
     params.push(limitNum, offsetNum);
-    const customers = await query<Customer>(
-      `SELECT * FROM customers ${whereClause}
-       ORDER BY last_order_at DESC NULLS LAST, created_at DESC
-       LIMIT $${paramCount} OFFSET $${paramCount + 1}`,
+    const customers = await query<Customer & {
+      computed_total_orders: string;
+      computed_total_spent: string;
+      computed_last_activity: Date | null;
+    }>(
+      `WITH all_transactions AS (
+        SELECT customer_email, total_amount AS amount, created_at AS txn_date
+        FROM orders WHERE organization_id = $1 AND status IN ('completed', 'processing')
+        UNION ALL
+        SELECT customer_email, total_amount, created_at
+        FROM preorders WHERE organization_id = $1 AND status NOT IN ('cancelled')
+        UNION ALL
+        SELECT customer_email, amount_paid, purchased_at
+        FROM tickets WHERE organization_id = $1 AND status NOT IN ('cancelled', 'refunded')
+        UNION ALL
+        SELECT customer_email, amount_paid, paid_at
+        FROM invoices WHERE organization_id = $1 AND status IN ('paid', 'refunded')
+      ),
+      customer_stats AS (
+        SELECT LOWER(customer_email) AS email_lower,
+          COUNT(*) AS total_transactions,
+          COALESCE(SUM(amount), 0) AS total_spent,
+          MAX(txn_date) AS last_activity
+        FROM all_transactions
+        WHERE customer_email IS NOT NULL
+        GROUP BY LOWER(customer_email)
+      )
+      SELECT c.*,
+        COALESCE(s.total_transactions, 0) AS computed_total_orders,
+        COALESCE(s.total_spent, 0) AS computed_total_spent,
+        s.last_activity AS computed_last_activity
+      FROM customers c
+      LEFT JOIN customer_stats s ON LOWER(c.email) = s.email_lower
+      ${whereClause}
+      ORDER BY s.last_activity DESC NULLS LAST, c.created_at DESC
+      LIMIT $${paramCount} OFFSET $${paramCount + 1}`,
       params
     );
 
@@ -99,9 +131,11 @@ app.openapi(listCustomersRoute, async (c) => {
         email: customer.email,
         name: customer.name,
         phone: customer.phone,
-        totalOrders: customer.total_orders,
-        totalSpent: Number(customer.total_spent),
-        lastOrderAt: customer.last_order_at?.toISOString() || null,
+        totalOrders: parseInt(String(customer.computed_total_orders), 10),
+        totalSpent: parseFloat(String(customer.computed_total_spent)),
+        lastOrderAt: customer.computed_last_activity
+          ? new Date(customer.computed_last_activity).toISOString()
+          : null,
         createdAt: customer.created_at.toISOString(),
       })),
       total,
