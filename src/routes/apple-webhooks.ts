@@ -5,6 +5,7 @@ import { DEFAULT_FEATURES_BY_TIER, PRICING_BY_TIER } from '../db/models/subscrip
 import { staffService } from '../services/staff';
 import { socketService, SocketEvents } from '../services/socket';
 import { cacheService, CacheKeys } from '../services/redis/cache';
+import { redisService } from '../services/redis';
 
 const app = new Hono();
 
@@ -128,6 +129,13 @@ app.post('/apple/webhook', async (c) => {
       notificationUUID: payload.notificationUUID,
       environment: payload.data.environment,
     });
+
+    // Idempotency check: skip if we've already processed this notification
+    const isNew = await redisService.setNX(`luma:webhook:apple:${payload.notificationUUID}`, '1', 86400);
+    if (!isNew) {
+      logger.info('Apple webhook already processed, skipping', { notificationUUID: payload.notificationUUID });
+      return c.json({ received: true });
+    }
 
     // Decode transaction info if present
     let transactionInfo: AppleTransactionInfo | null = null;

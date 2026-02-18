@@ -5,7 +5,7 @@ import { logger } from '../utils/logger';
 export const pool = new Pool({
   connectionString: config.database.url,
   ssl: config.database.ssl ? { rejectUnauthorized: false } : false,
-  max: 20,
+  max: 50,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,
 });

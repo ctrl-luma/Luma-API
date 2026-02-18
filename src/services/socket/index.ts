@@ -1,5 +1,7 @@
 import { Server as SocketIOServer } from 'socket.io';
 import { Server as HTTPServer } from 'http';
+import { createAdapter } from '@socket.io/redis-adapter';
+import { createClient } from 'redis';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
 import { authService } from '../auth';
@@ -14,7 +16,7 @@ export class SocketService {
   private io: SocketIOServer | null = null;
   private connectedUsers: Map<string, SocketUser> = new Map();
 
-  initialize(server: HTTPServer) {
+  async initialize(server: HTTPServer) {
     this.io = new SocketIOServer(server, {
       path: config.socketio.path,
       cors: {
@@ -23,6 +25,28 @@ export class SocketService {
       },
       transports: ['websocket', 'polling'],
     });
+
+    // Set up Redis adapter for cross-instance event broadcasting
+    try {
+      const pubClient = createClient({ url: config.redis.url });
+      const subClient = pubClient.duplicate();
+
+      pubClient.on('error', (err) => {
+        logger.error('Socket.IO Redis pub client error:', err);
+      });
+      subClient.on('error', (err) => {
+        logger.error('Socket.IO Redis sub client error:', err);
+      });
+
+      await Promise.all([pubClient.connect(), subClient.connect()]);
+
+      this.io.adapter(createAdapter(pubClient, subClient));
+      logger.info('Socket.IO Redis adapter initialized — cross-instance broadcasting enabled');
+    } catch (error) {
+      logger.error('Failed to initialize Socket.IO Redis adapter, falling back to in-memory adapter', error);
+      // Socket.IO will continue to work with the default in-memory adapter
+      // This allows local development without Redis but logs a clear warning
+    }
 
     this.setupMiddleware();
     this.setupEventHandlers();

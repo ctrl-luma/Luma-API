@@ -8,24 +8,14 @@ import { PRICING_BY_TIER, DEFAULT_FEATURES_BY_TIER } from '../../db/models/subsc
 import { socketService, SocketEvents } from '../../services/socket';
 import { staffService } from '../../services/staff';
 import { cacheService, CacheKeys } from '../../services/redis/cache';
+import { redisService } from '../../services/redis';
 
 const app = new Hono();
 
 // Use plain Hono route (not OpenAPI) to get raw body for signature verification
 app.post('/stripe/webhook', async (c) => {
-  console.log('!!! WEBHOOK HIT !!! - /stripe/webhook received request');
-  console.log('!!! Headers:', JSON.stringify(Object.fromEntries(c.req.raw.headers.entries())));
-
   const signature = c.req.header('stripe-signature');
   const rawBody = await c.req.text();
-
-  console.log('!!! WEBHOOK - signature present:', !!signature, 'body length:', rawBody?.length);
-
-  logger.info('[WEBHOOK DEBUG] Received webhook request', {
-    hasSignature: !!signature,
-    bodyLength: rawBody?.length || 0,
-    webhookSecretConfigured: !!config.stripe.webhookSecret,
-  });
 
   if (!signature) {
     logger.error('[WEBHOOK DEBUG] Missing stripe-signature header');
@@ -58,6 +48,13 @@ app.post('/stripe/webhook', async (c) => {
     livemode: event.livemode,
     apiVersion: event.api_version,
   });
+
+  // Idempotency check: skip if we've already processed this event
+  const isNew = await redisService.setNX(`luma:webhook:stripe:${event.id}`, '1', 86400);
+  if (!isNew) {
+    logger.info('Webhook event already processed, skipping', { eventId: event.id, eventType: event.type });
+    return c.json({ received: true });
+  }
 
   // Log full event data for payment-related events
   if (event.type.startsWith('payment_intent') || event.type.startsWith('charge')) {

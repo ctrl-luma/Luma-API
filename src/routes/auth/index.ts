@@ -12,6 +12,7 @@ import { sendPasswordResetEmail } from '../../services/email/template-sender';
 import { cacheService, CacheKeys } from '../../services/redis/cache';
 import { imageService } from '../../services/images';
 import { stripe } from '../../services/stripe';
+import { loginRateLimit, forgotPasswordRateLimit, resetPasswordRateLimit, checkRateLimit } from '../../middleware/rate-limit';
 
 const app = new OpenAPIHono({
   defaultHook: (result, c) => {
@@ -37,6 +38,14 @@ const app = new OpenAPIHono({
 
 // Mount signup routes
 app.route('/', signupRoutes);
+
+// Rate limiting on public auth endpoints
+app.use('/auth/login', loginRateLimit);
+app.use('/auth/forgot-password', forgotPasswordRateLimit);
+app.use('/auth/reset-password', resetPasswordRateLimit);
+app.use('/auth/validate-reset-token', resetPasswordRateLimit);
+app.use('/auth/check-email', checkRateLimit);
+app.use('/auth/check-password', checkRateLimit);
 
 const DeviceInfoSchema = z.object({
   name: z.string().max(255).optional(),

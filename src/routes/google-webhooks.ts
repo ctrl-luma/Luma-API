@@ -7,6 +7,7 @@ import { DEFAULT_FEATURES_BY_TIER, PRICING_BY_TIER } from '../db/models/subscrip
 import { staffService } from '../services/staff';
 import { socketService, SocketEvents } from '../services/socket';
 import { cacheService, CacheKeys } from '../services/redis/cache';
+import { redisService } from '../services/redis';
 
 const app = new Hono();
 
@@ -279,6 +280,13 @@ app.post('/google/webhook', async (c) => {
       hasOneTimeNotification: !!notification.oneTimeProductNotification,
       hasTestNotification: !!notification.testNotification,
     });
+
+    // Idempotency check: skip if we've already processed this message
+    const isNew = await redisService.setNX(`luma:webhook:google:${pubsubMessage.message.messageId}`, '1', 86400);
+    if (!isNew) {
+      logger.info('Google webhook already processed, skipping', { messageId: pubsubMessage.message.messageId });
+      return c.json({ received: true });
+    }
 
     // Handle test notification (from Play Console "Send test notification" button)
     if (notification.testNotification) {

@@ -7,6 +7,7 @@ import { syncAccountFromStripe, deriveOnboardingState } from './connect';
 import { socketService, SocketEvents } from '../../services/socket';
 import { queueService, QueueName } from '../../services/queue';
 import { getImageUrl } from '../../services/images';
+import { redisService } from '../../services/redis';
 
 const app = new Hono();
 
@@ -51,6 +52,13 @@ app.post('/stripe/webhook-connect', async (c) => {
     created: event.created,
     livemode: event.livemode,
   });
+
+  // Idempotency check: skip if we've already processed this event
+  const isNew = await redisService.setNX(`luma:webhook:stripe-connect:${event.id}`, '1', 86400);
+  if (!isNew) {
+    logger.info('Connect webhook event already processed, skipping', { eventId: event.id, eventType: event.type });
+    return c.json({ received: true });
+  }
 
   // Log full event data for payment-related events
   if (event.type.startsWith('payment_intent') || event.type.startsWith('charge')) {

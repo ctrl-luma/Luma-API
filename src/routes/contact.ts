@@ -2,14 +2,18 @@ import { OpenAPIHono, createRoute } from '@hono/zod-openapi';
 import { z } from 'zod';
 import { emailService } from '../services/email';
 import { logger } from '../utils/logger';
+import { contactRateLimit } from '../middleware/rate-limit';
 
 const app = new OpenAPIHono();
 
+// Rate limiting on contact form
+app.use('/', contactRateLimit);
+
 const ContactRequestSchema = z.object({
-  name: z.string().min(1),
-  email: z.string().email(),
-  company: z.string().min(1),
-  message: z.string().min(1),
+  name: z.string().min(1).max(100),
+  email: z.string().email().max(254),
+  company: z.string().min(1).max(200),
+  message: z.string().min(1).max(5000),
 });
 
 const contactRoute = createRoute({
@@ -56,13 +60,21 @@ app.openapi(contactRoute, async (c) => {
 
     const supportEmail = process.env.SUPPORT_EMAIL || 'support@lumapos.co';
 
+    // Sanitize inputs to prevent email header injection and XSS
+    const sanitizeName = (str: string) => str.replace(/[\r\n]/g, ' ').trim();
+    const escapeHtml = (str: string) =>
+      str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+    const safeName = sanitizeName(name);
+    const safeCompany = sanitizeName(company);
+
     const html = `
       <h2>New Contact Request</h2>
-      <p><strong>Name:</strong> ${name}</p>
-      <p><strong>Email:</strong> ${email}</p>
-      <p><strong>Company:</strong> ${company}</p>
+      <p><strong>Name:</strong> ${escapeHtml(safeName)}</p>
+      <p><strong>Email:</strong> ${escapeHtml(email)}</p>
+      <p><strong>Company:</strong> ${escapeHtml(safeCompany)}</p>
       <p><strong>Message:</strong></p>
-      <p>${message.replace(/\n/g, '<br>')}</p>
+      <p>${escapeHtml(message).replace(/\n/g, '<br>')}</p>
       <hr>
       <p style="color: #666; font-size: 12px;">
         This message was sent from the Luma POS contact form.
@@ -71,9 +83,9 @@ app.openapi(contactRoute, async (c) => {
 
     const text = `New Contact Request
 
-Name: ${name}
+Name: ${safeName}
 Email: ${email}
-Company: ${company}
+Company: ${safeCompany}
 
 Message:
 ${message}
@@ -83,7 +95,7 @@ This message was sent from the Luma POS contact form.`;
 
     await emailService.sendEmail({
       to: supportEmail,
-      subject: `Contact Request from ${name} (${company})`,
+      subject: `Contact Request from ${safeName} (${safeCompany})`,
       html,
       text,
       replyTo: email

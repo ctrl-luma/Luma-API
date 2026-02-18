@@ -614,110 +614,129 @@ app.openapi(lockTicketsRoute, async (c) => {
       return c.json({ error: `Maximum ${maxPerOrder} tickets per order`, maxPerOrder }, 400);
     }
 
-    const tier = await query(
-      `SELECT tt.*,
-        COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.ticket_tier_id = tt.id AND t.status NOT IN ('cancelled', 'refunded')), 0)::int AS sold_count,
-        COALESCE((SELECT SUM(tl.quantity) FROM ticket_locks tl WHERE tl.ticket_tier_id = tt.id AND tl.expires_at > NOW()), 0)::int AS locked_count
-       FROM ticket_tiers tt
-       WHERE tt.id = $1 AND tt.event_id = $2 AND tt.is_active = true`,
-      [body.tierId, events[0].id]
-    );
-    if (!tier[0]) return c.json({ error: 'Ticket tier not found' }, 404);
-
-    if (tier[0].max_quantity) {
-      const available = parseInt(tier[0].max_quantity) - parseInt(tier[0].sold_count) - parseInt(tier[0].locked_count);
-      if (available < body.quantity) {
-        return c.json({ error: 'Not enough tickets available', available }, 409);
-      }
-    }
-
-    // Check max_per_customer limit if set (only if email provided for email-based check)
-    if (tier[0].max_per_customer) {
-      const maxPerCustomer = parseInt(tier[0].max_per_customer);
-
-      // Email-based check only if email provided
-      if (customerEmail) {
-        // Count existing tickets by email for this event
-        const emailTickets = await query<{ count: string }>(
-          `SELECT COUNT(*) as count FROM tickets
-           WHERE event_id = $1 AND LOWER(customer_email) = $2 AND status != 'cancelled'`,
-          [events[0].id, customerEmail]
-        );
-        const existingByEmail = parseInt(emailTickets[0]?.count || '0');
-
-        // Count locked tickets by email (pending checkouts)
-        const emailLocks = await query<{ total: string }>(
-          `SELECT COALESCE(SUM(quantity), 0) as total FROM ticket_locks tl
-           JOIN ticket_tiers tt ON tl.ticket_tier_id = tt.id
-           WHERE tt.event_id = $1 AND LOWER(tl.customer_email) = $2 AND tl.expires_at > NOW()`,
-          [events[0].id, customerEmail]
-        );
-        const lockedByEmail = parseInt(emailLocks[0]?.total || '0');
-
-        const totalByEmail = existingByEmail + lockedByEmail + body.quantity;
-        if (totalByEmail > maxPerCustomer) {
-          const remaining = Math.max(0, maxPerCustomer - existingByEmail - lockedByEmail);
-          return c.json({
-            error: `Maximum ${maxPerCustomer} tickets per customer. You can purchase ${remaining} more.`,
-            code: 'MAX_PER_CUSTOMER_EXCEEDED',
-            maxPerCustomer,
-            alreadyPurchased: existingByEmail,
-            pendingCheckout: lockedByEmail,
-            remaining,
-          }, 409);
-        }
-      }
-
-      // Also check by IP as secondary fraud prevention (if IP available)
-      if (customerIp) {
-        const ipTickets = await query<{ count: string }>(
-          `SELECT COUNT(*) as count FROM tickets
-           WHERE event_id = $1 AND customer_ip = $2 AND status != 'cancelled'`,
-          [events[0].id, customerIp]
-        );
-        const existingByIp = parseInt(ipTickets[0]?.count || '0');
-
-        const ipLocks = await query<{ total: string }>(
-          `SELECT COALESCE(SUM(quantity), 0) as total FROM ticket_locks tl
-           JOIN ticket_tiers tt ON tl.ticket_tier_id = tt.id
-           WHERE tt.event_id = $1 AND tl.customer_ip = $2 AND tl.expires_at > NOW()`,
-          [events[0].id, customerIp]
-        );
-        const lockedByIp = parseInt(ipLocks[0]?.total || '0');
-
-        // Allow 2x the per-customer limit by IP (to account for shared IPs like offices/schools)
-        const ipLimit = maxPerCustomer * 2;
-        const totalByIp = existingByIp + lockedByIp + body.quantity;
-        if (totalByIp > ipLimit) {
-          logger.warn('IP-based ticket limit exceeded', {
-            eventId: events[0].id,
-            customerIp,
-            existingByIp,
-            lockedByIp,
-            requested: body.quantity
-          });
-          return c.json({
-            error: 'Too many tickets purchased from this location. Please contact support if this is an error.',
-            code: 'IP_LIMIT_EXCEEDED',
-          }, 409);
-        }
-      }
-    }
-
+    // Wrap availability check + lock creation in a transaction with FOR UPDATE
+    // to prevent race conditions where concurrent requests both see the same availability
     const sessionId = randomBytes(16).toString('hex');
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
-    const [lock] = await query(
-      `INSERT INTO ticket_locks (ticket_tier_id, quantity, session_id, expires_at, customer_email, customer_ip)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [body.tierId, body.quantity, sessionId, expiresAt, customerEmail, customerIp]
-    );
+    const lockResult = await transaction(async (client) => {
+      // FOR UPDATE locks the tier row, serializing concurrent lock attempts for the same tier
+      const tierResult = await client.query(
+        `SELECT tt.*,
+          COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.ticket_tier_id = tt.id AND t.status NOT IN ('cancelled', 'refunded')), 0)::int AS sold_count,
+          COALESCE((SELECT SUM(tl.quantity) FROM ticket_locks tl WHERE tl.ticket_tier_id = tt.id AND tl.expires_at > NOW()), 0)::int AS locked_count
+         FROM ticket_tiers tt
+         WHERE tt.id = $1 AND tt.event_id = $2 AND tt.is_active = true
+         FOR UPDATE OF tt`,
+        [body.tierId, events[0].id]
+      );
+      if (!tierResult.rows[0]) return { error: 'Ticket tier not found', status: 404 };
+
+      const tierRow = tierResult.rows[0];
+
+      if (tierRow.max_quantity) {
+        const available = parseInt(tierRow.max_quantity) - parseInt(tierRow.sold_count) - parseInt(tierRow.locked_count);
+        if (available < body.quantity) {
+          return { error: 'Not enough tickets available', available, status: 409 };
+        }
+      }
+
+      // Check max_per_customer limit if set (only if email provided for email-based check)
+      if (tierRow.max_per_customer) {
+        const maxPerCustomer = parseInt(tierRow.max_per_customer);
+
+        // Email-based check only if email provided
+        if (customerEmail) {
+          const emailTickets = await client.query(
+            `SELECT COUNT(*) as count FROM tickets
+             WHERE event_id = $1 AND LOWER(customer_email) = $2 AND status != 'cancelled'`,
+            [events[0].id, customerEmail]
+          );
+          const existingByEmail = parseInt(emailTickets.rows[0]?.count || '0');
+
+          const emailLocks = await client.query(
+            `SELECT COALESCE(SUM(quantity), 0) as total FROM ticket_locks tl
+             JOIN ticket_tiers tt ON tl.ticket_tier_id = tt.id
+             WHERE tt.event_id = $1 AND LOWER(tl.customer_email) = $2 AND tl.expires_at > NOW()`,
+            [events[0].id, customerEmail]
+          );
+          const lockedByEmail = parseInt(emailLocks.rows[0]?.total || '0');
+
+          const totalByEmail = existingByEmail + lockedByEmail + body.quantity;
+          if (totalByEmail > maxPerCustomer) {
+            const remaining = Math.max(0, maxPerCustomer - existingByEmail - lockedByEmail);
+            return {
+              error: `Maximum ${maxPerCustomer} tickets per customer. You can purchase ${remaining} more.`,
+              code: 'MAX_PER_CUSTOMER_EXCEEDED',
+              maxPerCustomer,
+              alreadyPurchased: existingByEmail,
+              pendingCheckout: lockedByEmail,
+              remaining,
+              status: 409,
+            };
+          }
+        }
+
+        // Also check by IP as secondary fraud prevention (if IP available)
+        if (customerIp) {
+          const ipTickets = await client.query(
+            `SELECT COUNT(*) as count FROM tickets
+             WHERE event_id = $1 AND customer_ip = $2 AND status != 'cancelled'`,
+            [events[0].id, customerIp]
+          );
+          const existingByIp = parseInt(ipTickets.rows[0]?.count || '0');
+
+          const ipLocks = await client.query(
+            `SELECT COALESCE(SUM(quantity), 0) as total FROM ticket_locks tl
+             JOIN ticket_tiers tt ON tl.ticket_tier_id = tt.id
+             WHERE tt.event_id = $1 AND tl.customer_ip = $2 AND tl.expires_at > NOW()`,
+            [events[0].id, customerIp]
+          );
+          const lockedByIp = parseInt(ipLocks.rows[0]?.total || '0');
+
+          const ipLimit = maxPerCustomer * 2;
+          const totalByIp = existingByIp + lockedByIp + body.quantity;
+          if (totalByIp > ipLimit) {
+            logger.warn('IP-based ticket limit exceeded', {
+              eventId: events[0].id,
+              customerIp,
+              existingByIp,
+              lockedByIp,
+              requested: body.quantity
+            });
+            return {
+              error: 'Too many tickets purchased from this location. Please contact support if this is an error.',
+              code: 'IP_LIMIT_EXCEEDED',
+              status: 409,
+            };
+          }
+        }
+      }
+
+      // Create lock within the same transaction (still holding FOR UPDATE lock)
+      const lockInsert = await client.query(
+        `INSERT INTO ticket_locks (ticket_tier_id, quantity, session_id, expires_at, customer_email, customer_ip)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [body.tierId, body.quantity, sessionId, expiresAt, customerEmail, customerIp]
+      );
+
+      return {
+        lock: lockInsert.rows[0],
+        tierPrice: parseFloat(tierRow.price),
+      };
+    });
+
+    // Handle errors returned from within the transaction
+    if ('error' in lockResult) {
+      const { status, ...errorBody } = lockResult;
+      return c.json(errorBody, status as 409 | 404);
+    }
 
     return c.json({
       sessionId,
-      lockId: lock.id,
+      lockId: lockResult.lock.id,
       expiresAt: expiresAt.toISOString(),
-      tierPrice: parseFloat(tier[0].price),
+      tierPrice: lockResult.tierPrice,
       quantity: body.quantity,
     });
   } catch (error: any) {

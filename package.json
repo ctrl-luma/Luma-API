@@ -30,6 +30,7 @@
     "@aws-sdk/client-cognito-identity-provider": "^3.893.0",
     "@aws-sdk/client-ses": "^3.893.0",
     "@hono/node-server": "^1.13.8",
+    "@socket.io/redis-adapter": "^8.3.0",
     "@hono/swagger-ui": "^0.4.1",
     "@hono/zod-openapi": "^0.18.3",
     "@types/qrcode": "^1.5.6",

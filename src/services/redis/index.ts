@@ -115,6 +115,19 @@ export class RedisService {
     }
   }
 
+  async setNX(key: string, value: string, ttl?: number): Promise<boolean> {
+    try {
+      const result = await this.client.set(key, value, {
+        NX: true,
+        ...(ttl ? { EX: ttl } : {}),
+      });
+      return result === 'OK';
+    } catch (error) {
+      logger.error('Redis SETNX error:', { key, error });
+      return false;
+    }
+  }
+
   async incr(key: string): Promise<number | null> {
     try {
       return await this.client.incr(key);

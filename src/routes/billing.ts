@@ -1075,6 +1075,10 @@ app.openapi(createUpgradeSessionRoute, async (c) => {
         [customerId, user.id]
       );
 
+      // Invalidate user cache after updating users table
+      await cacheService.del(CacheKeys.user(user.id));
+      await cacheService.del(CacheKeys.userByEmail(user.email));
+
       logger.info('Created Stripe customer for user', {
         userId: user.id,
         customerId,

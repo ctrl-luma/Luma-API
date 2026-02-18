@@ -166,8 +166,8 @@ async function startServer() {
       port,
     });
 
-    // Initialize Socket.IO with the HTTP server
-    socketService.initialize(server as any);
+    // Initialize Socket.IO with the HTTP server (async for Redis adapter setup)
+    await socketService.initialize(server as any);
 
     winstonLogger.info(`Server is running on port ${port}`);
     winstonLogger.info(`Socket.IO initialized on path ${config.socketio.path}`);

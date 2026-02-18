@@ -14,6 +14,7 @@ import { config } from '../../config';
 import { queueService, QueueName } from '../../services/queue';
 import Stripe from 'stripe';
 import { syncAccountFromStripe } from '../stripe/connect';
+import { signupRateLimit } from '../../middleware/rate-limit';
 
 const app = new OpenAPIHono({
   defaultHook: (result, c) => {
@@ -36,6 +37,9 @@ const app = new OpenAPIHono({
     return undefined;
   },
 });
+
+// Rate limiting on signup
+app.use('/auth/signup', signupRateLimit);
 
 const SignupRequestSchema = z.object({
   email: z.string().email(),

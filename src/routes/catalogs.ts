@@ -51,7 +51,7 @@ const createCatalogSchema = z.object({
   layoutType: layoutTypeSchema.optional().default('grid'),
   // Preorder settings
   preorderEnabled: z.boolean().optional().default(false),
-  slug: z.string().max(200).nullable().optional(),
+  slug: z.string().min(1).max(200).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Slug must contain only lowercase letters, numbers, and hyphens (no leading/trailing/consecutive hyphens)').nullable().optional(),
   preorderPaymentMode: preorderPaymentModeSchema.optional().default('both'),
   pickupInstructions: z.string().max(1000).nullable().optional(),
   estimatedPrepTime: z.number().int().min(1).max(180).optional().default(10),
@@ -71,7 +71,7 @@ const updateCatalogSchema = z.object({
   layoutType: layoutTypeSchema.optional(),
   // Preorder settings
   preorderEnabled: z.boolean().optional(),
-  slug: z.string().max(200).nullable().optional(),
+  slug: z.string().min(1).max(200).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, 'Slug must contain only lowercase letters, numbers, and hyphens (no leading/trailing/consecutive hyphens)').nullable().optional(),
   preorderPaymentMode: preorderPaymentModeSchema.optional(),
   pickupInstructions: z.string().max(1000).nullable().optional(),
   estimatedPrepTime: z.number().int().min(1).max(180).optional(),
@@ -800,6 +800,29 @@ app.openapi(duplicateCatalogRoute, async (c) => {
         error: accessCheck.reason,
         code: 'CATALOG_LOCKED'
       }, 403);
+    }
+
+    // Check subscription tier - free/starter can only have 1 catalog (prevent bypass via duplication)
+    const subResult = await query<{ tier: string }>(
+      `SELECT tier FROM subscriptions
+       WHERE organization_id = $1 AND status IN ('active', 'trialing')
+       LIMIT 1`,
+      [payload.organizationId]
+    );
+    if (subResult.length > 0) {
+      const { tier } = subResult[0];
+      if (tier === 'starter' || tier === 'free') {
+        const catalogCount = await query<{ count: string }>(
+          `SELECT COUNT(*) as count FROM catalogs WHERE organization_id = $1`,
+          [payload.organizationId]
+        );
+        if (parseInt(catalogCount[0].count) >= 1) {
+          return c.json({
+            error: 'Free tier accounts can only have one catalog. Upgrade to Pro to duplicate catalogs.',
+            code: 'CATALOG_LIMIT_REACHED'
+          }, 403);
+        }
+      }
     }
 
     const body = await c.req.json().catch(() => ({}));
