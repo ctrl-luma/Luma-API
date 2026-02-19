@@ -218,7 +218,9 @@ app.post('/apple/webhook', async (c) => {
 
   } catch (error) {
     logger.error('Error processing Apple webhook', { error });
-    return c.json({ error: 'Webhook processing failed' }, 500);
+    // Return 200 to prevent Apple from retrying — idempotency key is already set,
+    // and retries after TTL expiry could cause duplicate processing
+    return c.json({ received: true });
   }
 });
 

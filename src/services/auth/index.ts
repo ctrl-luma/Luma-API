@@ -166,13 +166,17 @@ export class AuthService {
   }
 
   private async incrementSessionVersion(userId: string): Promise<number> {
-    const result = await query<{ session_version: number }>(
+    const result = await query<{ session_version: number; email: string }>(
       `UPDATE users
        SET session_version = session_version + 1, updated_at = NOW()
        WHERE id = $1
-       RETURNING session_version`,
+       RETURNING session_version, email`,
       [userId]
     );
+    // Invalidate user cache immediately to prevent concurrent requests
+    // from reading stale session_version between here and the later invalidation in login()
+    await cacheService.del(CacheKeys.user(userId));
+    await cacheService.del(CacheKeys.userByEmail(result[0].email));
     return result[0].session_version;
   }
 

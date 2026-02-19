@@ -151,7 +151,9 @@ app.post('/stripe/webhook-connect', async (c) => {
       eventType: event.type,
       eventId: event.id,
     });
-    return c.json({ error: 'Webhook processing failed' }, 500);
+    // Return 200 to prevent Stripe from retrying — idempotency key is already set,
+    // and retries after TTL expiry could cause duplicate processing
+    return c.json({ received: true });
   }
 });
 

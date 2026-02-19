@@ -122,6 +122,13 @@ export class SocketService {
         organizationId: user.organizationId,
       });
 
+      // Clean up stale entries for this user (e.g., from a previous connection that didn't disconnect cleanly)
+      for (const [existingSocketId, existingUser] of this.connectedUsers.entries()) {
+        if (existingUser.userId === user.userId && existingSocketId !== socket.id) {
+          this.connectedUsers.delete(existingSocketId);
+        }
+      }
+
       this.connectedUsers.set(socket.id, user);
 
       const orgRoom = `org:${user.organizationId}`;

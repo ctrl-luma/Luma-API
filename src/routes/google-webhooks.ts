@@ -365,7 +365,9 @@ app.post('/google/webhook', async (c) => {
       error: error.message,
       stack: error.stack,
     });
-    return c.json({ error: 'Webhook processing failed' }, 500);
+    // Return 200 to prevent Google from retrying — idempotency key is already set,
+    // and retries after TTL expiry could cause duplicate processing
+    return c.json({ received: true });
   }
 });
 

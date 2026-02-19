@@ -8,11 +8,12 @@ import { swaggerUI } from '@hono/swagger-ui';
 import { config } from './config';
 import { errorHandler } from './middleware/error-handler';
 import { requestId } from './middleware/request-id';
-import { testConnection } from './db';
+import { testConnection, pool, query } from './db';
 import { initializeDatabase } from './db/migrate';
 import { logger as winstonLogger } from './utils/logger';
 import { redisService } from './services/redis';
 import { registerAllWorkers } from './services/queue/workers';
+import { queueService } from './services/queue';
 import { socketService } from './services/socket';
 import authRoutes from './routes/auth';
 import organizationRoutes from './routes/organizations';
@@ -94,11 +95,29 @@ app.get('/', (c) => {
   });
 });
 
-app.get('/health', (c) => {
-  return c.json({
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-  });
+app.get('/health', async (c) => {
+  try {
+    await query('SELECT 1');
+    const redisOk = await redisService.get('health:ping').then(() => true).catch(() => false);
+
+    return c.json({
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      dependencies: {
+        database: 'ok',
+        redis: redisOk ? 'ok' : 'degraded',
+      },
+    });
+  } catch (error) {
+    return c.json({
+      status: 'unhealthy',
+      timestamp: new Date().toISOString(),
+      dependencies: {
+        database: 'down',
+        redis: 'unknown',
+      },
+    }, 503);
+  }
 });
 
 // Serve static files from public/ directory (wallet badges, etc.)
@@ -178,3 +197,25 @@ async function startServer() {
 }
 
 startServer();
+
+// Graceful shutdown — clean up connections on SIGTERM/SIGINT
+async function gracefulShutdown(signal: string) {
+  winstonLogger.info(`${signal} received, starting graceful shutdown...`);
+  try {
+    await queueService.closeAll();
+    await redisService.disconnect();
+    await pool.end();
+    winstonLogger.info('Graceful shutdown complete');
+    process.exit(0);
+  } catch (error) {
+    winstonLogger.error('Error during graceful shutdown:', error);
+    process.exit(1);
+  }
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+process.on('unhandledRejection', (reason, promise) => {
+  winstonLogger.error('Unhandled Promise Rejection', { reason, promise });
+});
