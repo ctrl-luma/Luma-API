@@ -879,10 +879,37 @@ app.openapi(subscriptionInfoRoute, async (c) => {
       }
     }
 
-    // For Stripe subscriptions with active status, generate a billing portal URL
-    if (platform === 'stripe' && user.stripe_customer_id && dbSubscription.status === 'active') {
+    // For Stripe subscriptions, fetch real subscription data from Stripe and generate portal URL
+    // This matches how /billing/payment-info (vendor endpoint) works
+    let stripeSubscriptionPrice: number | null = null;
+    let stripeSubscriptionCurrency: string | null = null;
+    let stripeSubscriptionInterval: string | null = null;
+
+    const isActiveSubscription = dbSubscription.status === 'active' || dbSubscription.status === 'trialing';
+
+    if (platform === 'stripe' && user.stripe_customer_id && isActiveSubscription) {
       try {
-        const portalConfigs = await getOrCreatePortalConfigs();
+        const [portalConfigs, stripeSubscriptions] = await Promise.all([
+          getOrCreatePortalConfigs(),
+          stripe.subscriptions.list({
+            customer: user.stripe_customer_id,
+            status: 'all',
+            limit: 5,
+          }),
+        ]);
+
+        // Get real price from the active Stripe subscription
+        const activeSub = stripeSubscriptions.data.find(s => s.status === 'active' || s.status === 'trialing');
+        if (activeSub) {
+          const subscriptionItem = activeSub.items?.data?.[0];
+          if (subscriptionItem?.price) {
+            stripeSubscriptionPrice = subscriptionItem.price.unit_amount || null;
+            stripeSubscriptionCurrency = subscriptionItem.price.currency || null;
+            stripeSubscriptionInterval = subscriptionItem.price.recurring?.interval || null;
+          }
+        }
+
+        // Generate billing portal URL
         const returnUrl = config.email.dashboardUrl || 'https://portal.lumapos.co';
         const session = await stripe.billingPortal.sessions.create({
           customer: user.stripe_customer_id,
@@ -891,20 +918,19 @@ app.openapi(subscriptionInfoRoute, async (c) => {
         });
         manageSubscriptionUrl = session.url;
       } catch (e) {
-        logger.warn('Failed to create billing portal session', { error: e });
+        logger.warn('Failed to fetch Stripe subscription data or create billing portal session', { error: e });
       }
     }
 
     // Build plan info based on tier - only show plan for active/trialing subscriptions
     let currentPlan = null;
-    const isActiveSubscription = dbSubscription.status === 'active' || dbSubscription.status === 'trialing';
 
     if (isActiveSubscription && dbSubscription.tier === 'pro') {
       currentPlan = {
         name: 'Pro Plan',
-        price: platform === 'stripe' ? 1900 : 2999, // $19 Stripe, $29.99 mobile
-        currency: 'usd',
-        interval: 'month' as const,
+        price: stripeSubscriptionPrice ?? 2999, // Use real Stripe price, fallback to $29.99
+        currency: stripeSubscriptionCurrency || 'usd',
+        interval: (stripeSubscriptionInterval || 'month') as 'month' | 'year',
         description: platform === 'apple'
           ? 'Managed via App Store'
           : platform === 'google'
