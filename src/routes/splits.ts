@@ -154,7 +154,7 @@ app.openapi(listSplitsRoute, async (c) => {
       return c.json({ error: 'Pro subscription required' }, 403);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error listing splits', { error });
     return c.json({ error: 'Failed to list splits' }, 500);
@@ -233,7 +233,7 @@ app.openapi(createSplitRoute, async (c) => {
       return c.json({ error: 'Pro subscription required' }, 403);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     if (error.message === 'Percentage must be between 0 and 100') {
       return c.json({ error: error.message }, 400);
@@ -319,7 +319,7 @@ app.openapi(updateSplitRoute, async (c) => {
       return c.json({ error: 'Pro subscription required' }, 403);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     if (error.message === 'Percentage must be between 0 and 100') {
       return c.json({ error: error.message }, 400);
@@ -374,7 +374,7 @@ app.openapi(deleteSplitRoute, async (c) => {
       return c.json({ error: 'Pro subscription required' }, 403);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error deleting split', { error, splitId });
     return c.json({ error: 'Failed to delete split' }, 500);
@@ -438,7 +438,7 @@ app.openapi(getSplitReportRoute, async (c) => {
       return c.json({ error: 'Pro subscription required' }, 403);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error getting split report', { error, catalogId });
     return c.json({ error: 'Failed to get split report' }, 500);

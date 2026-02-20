@@ -136,7 +136,7 @@ async function checkCatalogAccess(
 
   return {
     allowed: false,
-    reason: 'This catalog is locked. Free tier accounts can only access their oldest catalog. Upgrade to Pro to unlock all catalogs.',
+    reason: 'This menu is locked. Free tier accounts can only access their oldest menu. Upgrade to Pro to unlock all menus.',
   };
 }
 
@@ -251,7 +251,7 @@ app.openapi(listCatalogsRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     logger.error('Error listing catalogs', { error });
-    return c.json({ error: 'Failed to list catalogs' }, 500);
+    return c.json({ error: 'Failed to list menus' }, 500);
   }
 });
 
@@ -305,7 +305,7 @@ app.openapi(getCatalogRoute, async (c) => {
     );
 
     if (!rows[0]) {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
 
     const row = rows[0];
@@ -337,7 +337,7 @@ app.openapi(getCatalogRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     logger.error('Error fetching catalog', { error, catalogId: id });
-    return c.json({ error: 'Failed to fetch catalog' }, 500);
+    return c.json({ error: 'Failed to fetch menu' }, 500);
   }
 });
 
@@ -393,7 +393,7 @@ app.openapi(createCatalogRoute, async (c) => {
         );
         if (parseInt(catalogCount[0].count) >= 1) {
           return c.json({
-            error: 'Free tier accounts can only have one catalog. Upgrade to Pro to create additional catalogs.',
+            error: 'Free tier accounts can only have one menu. Upgrade to Pro to create additional menus.',
             code: 'CATALOG_LIMIT_REACHED'
           }, 403);
         }
@@ -473,7 +473,7 @@ app.openapi(createCatalogRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     logger.error('Error creating catalog', { error });
-    return c.json({ error: 'Failed to create catalog' }, 500);
+    return c.json({ error: 'Failed to create menu' }, 500);
   }
 });
 
@@ -643,7 +643,7 @@ app.openapi(updateCatalogRoute, async (c) => {
     );
 
     if (!rows[0]) {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
 
     const row = rows[0];
@@ -687,7 +687,7 @@ app.openapi(updateCatalogRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     logger.error('Error updating catalog', { error, catalogId: id });
-    return c.json({ error: 'Failed to update catalog' }, 500);
+    return c.json({ error: 'Failed to update menu' }, 500);
   }
 });
 
@@ -718,7 +718,7 @@ app.openapi(deleteCatalogRoute, async (c) => {
 
     // Only owners can delete catalogs
     if (payload.role !== 'owner') {
-      return c.json({ error: 'Only owners can delete catalogs' }, 403);
+      return c.json({ error: 'Only owners can delete menus' }, 403);
     }
 
     const result = await query(
@@ -727,7 +727,7 @@ app.openapi(deleteCatalogRoute, async (c) => {
     );
 
     if (result.length === 0) {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
 
     logger.info('Catalog deleted', { catalogId: id });
@@ -747,7 +747,7 @@ app.openapi(deleteCatalogRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     logger.error('Error deleting catalog', { error, catalogId: id });
-    return c.json({ error: 'Failed to delete catalog' }, 500);
+    return c.json({ error: 'Failed to delete menu' }, 500);
   }
 });
 
@@ -818,7 +818,7 @@ app.openapi(duplicateCatalogRoute, async (c) => {
         );
         if (parseInt(catalogCount[0].count) >= 1) {
           return c.json({
-            error: 'Free tier accounts can only have one catalog. Upgrade to Pro to duplicate catalogs.',
+            error: 'Free tier accounts can only have one menu. Upgrade to Pro to duplicate menus.',
             code: 'CATALOG_LIMIT_REACHED'
           }, 403);
         }
@@ -835,7 +835,7 @@ app.openapi(duplicateCatalogRoute, async (c) => {
       ) as { rows: Catalog[] };
 
       if (originalCatalog.rows.length === 0) {
-        return c.json({ error: 'Catalog not found' }, 404);
+        return c.json({ error: 'Menu not found' }, 404);
       }
 
       const original = originalCatalog.rows[0];
@@ -1011,7 +1011,7 @@ app.openapi(duplicateCatalogRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     logger.error('Error duplicating catalog', { error, catalogId: originalId });
-    return c.json({ error: 'Failed to duplicate catalog' }, 500);
+    return c.json({ error: 'Failed to duplicate menu' }, 500);
   }
 });
 

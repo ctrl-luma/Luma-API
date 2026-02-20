@@ -121,7 +121,7 @@ app.openapi(listCategoriesRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error listing categories', { error });
     return c.json({ error: 'Failed to list categories' }, 500);
@@ -193,7 +193,7 @@ app.openapi(getCategoryRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error fetching category', { error, id });
     return c.json({ error: 'Failed to fetch category' }, 500);
@@ -292,7 +292,7 @@ app.openapi(createCategoryRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error creating category', { error, catalogId });
     return c.json({ error: 'Failed to create category' }, 500);
@@ -421,7 +421,7 @@ app.openapi(updateCategoryRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error updating category', { error, id });
     return c.json({ error: 'Failed to update category' }, 500);
@@ -480,7 +480,7 @@ app.openapi(deleteCategoryRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error deleting category', { error, id });
     return c.json({ error: 'Failed to delete category' }, 500);
@@ -544,7 +544,7 @@ app.openapi(reorderCategoriesRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error reordering categories', { error, catalogId });
     return c.json({ error: 'Failed to reorder categories' }, 500);

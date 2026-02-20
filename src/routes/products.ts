@@ -492,6 +492,12 @@ app.openapi(updateProductImageRoute, async (c) => {
     const row = rows[0];
     logger.info('[ImageUpload] SUCCESS', { productId: row.id, imageId: result.id, imageUrl: result.url });
 
+    // Emit socket event for real-time updates
+    socketService.emitToOrganization(payload.organizationId, SocketEvents.PRODUCT_UPDATED, {
+      productId: row.id,
+      name: row.name,
+    });
+
     return c.json({
       id: row.id,
       name: row.name,

@@ -155,10 +155,10 @@ app.openapi(listCatalogProductsRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error listing catalog products', { error });
-    return c.json({ error: 'Failed to list catalog products' }, 500);
+    return c.json({ error: 'Failed to list menu products' }, 500);
   }
 });
 
@@ -221,7 +221,7 @@ app.openapi(addProductToCatalogRoute, async (c) => {
         [body.categoryId, catalogId]
       );
       if (categoryRows.length === 0) {
-        return c.json({ error: 'Category not found or does not belong to this catalog' }, 400);
+        return c.json({ error: 'Category not found or does not belong to this menu' }, 400);
       }
     }
 
@@ -231,7 +231,7 @@ app.openapi(addProductToCatalogRoute, async (c) => {
       [catalogId, body.productId]
     );
     if (existingRows.length > 0) {
-      return c.json({ error: 'Product already in catalog' }, 409);
+      return c.json({ error: 'Product already in menu' }, 409);
     }
 
     // Add product to catalog
@@ -304,10 +304,10 @@ app.openapi(addProductToCatalogRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error adding product to catalog', { error });
-    return c.json({ error: 'Failed to add product to catalog' }, 500);
+    return c.json({ error: 'Failed to add product to menu' }, 500);
   }
 });
 
@@ -361,7 +361,7 @@ app.openapi(updateCatalogProductRoute, async (c) => {
         [body.categoryId, catalogId]
       );
       if (categoryRows.length === 0) {
-        return c.json({ error: 'Category not found or does not belong to this catalog' }, 400);
+        return c.json({ error: 'Category not found or does not belong to this menu' }, 400);
       }
     }
 
@@ -402,7 +402,7 @@ app.openapi(updateCatalogProductRoute, async (c) => {
     );
 
     if (rows.length === 0) {
-      return c.json({ error: 'Catalog product not found' }, 404);
+      return c.json({ error: 'Menu product not found' }, 404);
     }
 
     // Get product and category details for response
@@ -458,10 +458,10 @@ app.openapi(updateCatalogProductRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error updating catalog product', { error });
-    return c.json({ error: 'Failed to update catalog product' }, 500);
+    return c.json({ error: 'Failed to update menu product' }, 500);
   }
 });
 
@@ -498,7 +498,7 @@ app.openapi(removeProductFromCatalogRoute, async (c) => {
     );
 
     if (rows.length === 0) {
-      return c.json({ error: 'Catalog product not found' }, 404);
+      return c.json({ error: 'Menu product not found' }, 404);
     }
 
     // Emit socket event
@@ -515,10 +515,10 @@ app.openapi(removeProductFromCatalogRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error removing product from catalog', { error });
-    return c.json({ error: 'Failed to remove product from catalog' }, 500);
+    return c.json({ error: 'Failed to remove product from menu' }, 500);
   }
 });
 
@@ -626,10 +626,10 @@ app.openapi(bulkAddProductsRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error bulk adding products to catalog', { error });
-    return c.json({ error: 'Failed to bulk add products to catalog' }, 500);
+    return c.json({ error: 'Failed to bulk add products to menu' }, 500);
   }
 });
 
@@ -705,7 +705,7 @@ app.openapi(reorderProductsRoute, async (c) => {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     if (error.message === 'Catalog not found') {
-      return c.json({ error: 'Catalog not found' }, 404);
+      return c.json({ error: 'Menu not found' }, 404);
     }
     logger.error('Error reordering products', { error });
     return c.json({ error: 'Failed to reorder products' }, 500);
