@@ -721,10 +721,24 @@ app.openapi(deleteCatalogRoute, async (c) => {
       return c.json({ error: 'Only owners can delete menus' }, 403);
     }
 
-    const result = await query(
-      `DELETE FROM catalogs WHERE id = $1 AND organization_id = $2 RETURNING id`,
-      [id, payload.organizationId]
-    );
+    const result = await transaction(async (client) => {
+      // Delete preorder items and preorders first (FK lacks ON DELETE CASCADE)
+      await client.query(
+        `DELETE FROM preorder_items WHERE preorder_id IN (
+          SELECT id FROM preorders WHERE catalog_id = $1 AND organization_id = $2
+        )`,
+        [id, payload.organizationId]
+      );
+      await client.query(
+        `DELETE FROM preorders WHERE catalog_id = $1 AND organization_id = $2`,
+        [id, payload.organizationId]
+      );
+      const res = await client.query(
+        `DELETE FROM catalogs WHERE id = $1 AND organization_id = $2 RETURNING id`,
+        [id, payload.organizationId]
+      );
+      return res.rows;
+    });
 
     if (result.length === 0) {
       return c.json({ error: 'Menu not found' }, 404);

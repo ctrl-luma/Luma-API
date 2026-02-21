@@ -15,6 +15,7 @@ import { redisService } from './services/redis';
 import { registerAllWorkers } from './services/queue/workers';
 import { queueService } from './services/queue';
 import { socketService } from './services/socket';
+import { startScheduledCleanups, stopScheduledCleanups } from './services/scheduled/ticket-lock-cleanup';
 import authRoutes from './routes/auth';
 import organizationRoutes from './routes/organizations';
 import stripeWebhookRoutes from './routes/stripe/webhooks';
@@ -178,6 +179,7 @@ async function startServer() {
     await initializeDatabase();
     await redisService.connect();
     registerAllWorkers();
+    startScheduledCleanups();
 
     // Create HTTP server and initialize Socket.IO
     const server = serve({
@@ -202,6 +204,7 @@ startServer();
 async function gracefulShutdown(signal: string) {
   winstonLogger.info(`${signal} received, starting graceful shutdown...`);
   try {
+    stopScheduledCleanups();
     await queueService.closeAll();
     await redisService.disconnect();
     await pool.end();

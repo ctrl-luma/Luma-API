@@ -9,6 +9,7 @@ import { socketService, SocketEvents } from '../../services/socket';
 import { emailService } from '../../services/email';
 import { queueService, QueueName } from '../../services/queue';
 import { getImageUrl } from '../../services/images';
+import { cacheService } from '../../services/redis/cache';
 import Stripe from 'stripe';
 
 const app = new OpenAPIHono();
@@ -3574,6 +3575,13 @@ app.openapi(analyticsRoute, async (c) => {
     // Use bounded query when viewing past periods (offset != 0) or custom date range
     const useBoundedQuery = offset !== 0 || range === 'custom';
 
+    // Check Redis cache (5-minute TTL)
+    const analyticsCacheKey = `analytics:${payload.organizationId}:${range}:${offset}:${currentStart.getTime()}:${currentEnd.getTime()}`;
+    const cached = await cacheService.get<Record<string, any>>(analyticsCacheKey);
+    if (cached) {
+      return c.json(cached);
+    }
+
     // ── Pre-compute conditions used by all queries ──
     const dateCondition = useBoundedQuery
       ? 'AND created_at >= $2 AND created_at <= $3'
@@ -3786,7 +3794,10 @@ app.openapi(analyticsRoute, async (c) => {
         FROM orders o
         LEFT JOIN catalogs c ON o.catalog_id = c.id
         LEFT JOIN (
-          SELECT catalog_id, COUNT(*)::bigint as cnt FROM catalog_products GROUP BY catalog_id
+          SELECT cp.catalog_id, COUNT(*)::bigint as cnt FROM catalog_products cp
+          JOIN catalogs cat ON cp.catalog_id = cat.id
+          WHERE cat.organization_id = $1
+          GROUP BY cp.catalog_id
         ) cp_counts ON cp_counts.catalog_id = c.id
         WHERE o.organization_id = $1
           AND o.status = 'completed'
@@ -3849,7 +3860,8 @@ app.openapi(analyticsRoute, async (c) => {
           AND o.user_id IS NOT NULL
           ${orderDateCondition}
         GROUP BY o.user_id, u.first_name, u.last_name, u.avatar_image_id
-        ORDER BY SUM(o.total_amount) DESC`,
+        ORDER BY SUM(o.total_amount) DESC
+        LIMIT 20`,
         dateParams
       ),
 
@@ -3873,7 +3885,8 @@ app.openapi(analyticsRoute, async (c) => {
           AND o.device_id IS NOT NULL
           ${orderDateCondition}
         GROUP BY o.device_id, d.device_name, d.model_name, d.os_name
-        ORDER BY SUM(o.total_amount) DESC`,
+        ORDER BY SUM(o.total_amount) DESC
+        LIMIT 20`,
         dateParams
       ),
 
@@ -4642,7 +4655,7 @@ app.openapi(analyticsRoute, async (c) => {
       ? Math.round((quickChargeOrders / mergedCurrentTransactions) * 100)
       : 0;
 
-    return c.json({
+    const analyticsResponse = {
       metrics: {
         revenue: Math.round(mergedCurrentRevenue * 100) / 100,
         transactions: mergedCurrentTransactions,
@@ -4683,7 +4696,12 @@ app.openapi(analyticsRoute, async (c) => {
       },
       staffBreakdown,
       deviceBreakdown,
-    });
+    };
+
+    // Cache for 5 minutes
+    await cacheService.set(analyticsCacheKey, analyticsResponse, { ttl: 300 });
+
+    return c.json(analyticsResponse);
   } catch (error: any) {
     logger.error('Error fetching analytics', {
       error: error.message || error,
