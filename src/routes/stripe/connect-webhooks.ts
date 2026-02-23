@@ -135,6 +135,27 @@ app.post('/stripe/webhook-connect', async (c) => {
         await handleInvoiceOverdue(event.data.object, event.account);
         break;
 
+      // Dispute events
+      case 'charge.dispute.created':
+        await handleDisputeCreated(event.data.object, event.account);
+        break;
+
+      case 'charge.dispute.updated':
+        await handleDisputeUpdated(event.data.object, event.account);
+        break;
+
+      case 'charge.dispute.closed':
+        await handleDisputeClosed(event.data.object, event.account);
+        break;
+
+      case 'charge.dispute.funds_withdrawn':
+        await handleDisputeFundsWithdrawn(event.data.object, event.account);
+        break;
+
+      case 'charge.dispute.funds_reinstated':
+        await handleDisputeFundsReinstated(event.data.object, event.account);
+        break;
+
       default:
         logger.info('[CONNECT WEBHOOK DEBUG] Unhandled event type (no handler)', { type: event.type });
     }
@@ -999,6 +1020,256 @@ async function handleInvoiceOverdue(stripeInvoice: any, _connectedAccountId: str
   }
 
   logger.info('Invoice overdue via webhook — status set to past_due', { lumaInvoiceId, stripeInvoiceId: stripeInvoice.id });
+}
+
+// ─── Dispute Webhook Handlers ─────────────────────────────────────────────────
+
+async function handleDisputeCreated(dispute: any, connectedAccountId: string | undefined) {
+  const accountId = connectedAccountId || dispute.charge?.account;
+
+  // Find organization
+  const orgRows = await query<{ id: string; name: string }>(
+    'SELECT o.id, o.name FROM organizations o WHERE o.stripe_account_id = $1',
+    [accountId]
+  );
+  if (orgRows.length === 0) {
+    logger.warn('Organization not found for dispute', { accountId, disputeId: dispute.id });
+    return;
+  }
+  const org = orgRows[0];
+
+  // Resolve charge ID
+  const chargeId = typeof dispute.charge === 'string' ? dispute.charge : dispute.charge?.id;
+
+  // Attempt to link to an existing entity by charge_id
+  let orderId: string | null = null;
+  let preorderId: string | null = null;
+  let invoiceId: string | null = null;
+  let ticketId: string | null = null;
+
+  if (chargeId) {
+    const orderRows = await query<{ id: string }>(
+      'SELECT id FROM orders WHERE stripe_charge_id = $1 AND organization_id = $2',
+      [chargeId, org.id]
+    );
+    if (orderRows.length > 0) {
+      orderId = orderRows[0].id;
+    } else {
+      const preorderRows = await query<{ id: string }>(
+        'SELECT id FROM preorders WHERE stripe_charge_id = $1 AND organization_id = $2',
+        [chargeId, org.id]
+      );
+      if (preorderRows.length > 0) {
+        preorderId = preorderRows[0].id;
+      } else {
+        const invoiceRows = await query<{ id: string }>(
+          'SELECT id FROM invoices WHERE stripe_charge_id = $1 AND organization_id = $2',
+          [chargeId, org.id]
+        );
+        if (invoiceRows.length > 0) {
+          invoiceId = invoiceRows[0].id;
+        } else {
+          const ticketRows = await query<{ id: string }>(
+            'SELECT id FROM tickets WHERE stripe_charge_id = $1',
+            [chargeId]
+          );
+          if (ticketRows.length > 0) {
+            ticketId = ticketRows[0].id;
+          }
+        }
+      }
+    }
+  }
+
+  // Construct Stripe Dashboard URL
+  const isLive = dispute.livemode !== false;
+  const dashboardBase = isLive
+    ? 'https://dashboard.stripe.com'
+    : 'https://dashboard.stripe.com/test';
+  const stripeDashboardUrl = `${dashboardBase}/disputes/${dispute.id}`;
+
+  // Insert dispute record (upsert for idempotency)
+  const result = await query<{ id: string }>(
+    `INSERT INTO disputes (
+      organization_id, stripe_dispute_id, stripe_charge_id,
+      stripe_payment_intent_id, amount, currency, reason, status,
+      customer_email, customer_name,
+      order_id, preorder_id, invoice_id, ticket_id,
+      is_charge_refundable, stripe_dashboard_url,
+      evidence_due_by, created_at, updated_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, NOW(), NOW())
+    ON CONFLICT (stripe_dispute_id) DO UPDATE SET
+      status = EXCLUDED.status,
+      reason = EXCLUDED.reason,
+      amount = EXCLUDED.amount,
+      updated_at = NOW()
+    RETURNING id`,
+    [
+      org.id,
+      dispute.id,
+      chargeId,
+      dispute.payment_intent || null,
+      dispute.amount,
+      dispute.currency || 'usd',
+      dispute.reason || null,
+      dispute.status,
+      dispute.evidence?.customer_email_address || null,
+      dispute.evidence?.customer_name || null,
+      orderId,
+      preorderId,
+      invoiceId,
+      ticketId,
+      dispute.is_charge_refundable || false,
+      stripeDashboardUrl,
+      dispute.evidence_details?.due_by
+        ? new Date(dispute.evidence_details.due_by * 1000).toISOString()
+        : null,
+    ]
+  );
+
+  // Emit socket event
+  socketService.emitToOrganization(org.id, SocketEvents.DISPUTE_CREATED, {
+    disputeId: result[0].id,
+    stripeDisputeId: dispute.id,
+    amount: dispute.amount,
+    reason: dispute.reason,
+    status: dispute.status,
+    timestamp: new Date().toISOString(),
+  });
+
+  // Queue email to org owner
+  const ownerRows = await query<{ email: string; first_name: string }>(
+    `SELECT email, first_name FROM users
+     WHERE organization_id = $1 AND role = 'owner' AND is_active = true
+     LIMIT 1`,
+    [org.id]
+  );
+  if (ownerRows.length > 0) {
+    await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
+      type: 'dispute_created',
+      to: ownerRows[0].email,
+      data: {
+        firstName: ownerRows[0].first_name,
+        organizationName: org.name,
+        amount: dispute.amount,
+        currency: dispute.currency || 'usd',
+        reason: dispute.reason || 'unknown',
+        status: dispute.status,
+        stripeDashboardUrl,
+        evidenceDueBy: dispute.evidence_details?.due_by
+          ? new Date(dispute.evidence_details.due_by * 1000).toISOString()
+          : null,
+      },
+    });
+  }
+
+  logger.info('Dispute created and stored', {
+    disputeId: dispute.id,
+    organizationId: org.id,
+    amount: dispute.amount,
+    reason: dispute.reason,
+    orderId, preorderId, invoiceId, ticketId,
+  });
+}
+
+async function handleDisputeUpdated(dispute: any, _connectedAccountId: string | undefined) {
+  const result = await query<{ id: string; organization_id: string }>(
+    `UPDATE disputes SET
+      status = $1, reason = $2,
+      is_charge_refundable = $3,
+      evidence_due_by = $4,
+      updated_at = NOW()
+    WHERE stripe_dispute_id = $5
+    RETURNING id, organization_id`,
+    [
+      dispute.status,
+      dispute.reason || null,
+      dispute.is_charge_refundable || false,
+      dispute.evidence_details?.due_by
+        ? new Date(dispute.evidence_details.due_by * 1000).toISOString()
+        : null,
+      dispute.id,
+    ]
+  );
+
+  if (result.length > 0) {
+    socketService.emitToOrganization(result[0].organization_id, SocketEvents.DISPUTE_UPDATED, {
+      disputeId: result[0].id,
+      status: dispute.status,
+      reason: dispute.reason,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  logger.info('Dispute updated', { disputeId: dispute.id, status: dispute.status });
+}
+
+async function handleDisputeClosed(dispute: any, _connectedAccountId: string | undefined) {
+  const result = await query<{ id: string; organization_id: string }>(
+    `UPDATE disputes SET
+      status = $1,
+      closed_at = NOW(),
+      updated_at = NOW()
+    WHERE stripe_dispute_id = $2
+    RETURNING id, organization_id`,
+    [dispute.status, dispute.id]
+  );
+
+  if (result.length > 0) {
+    socketService.emitToOrganization(result[0].organization_id, SocketEvents.DISPUTE_CLOSED, {
+      disputeId: result[0].id,
+      status: dispute.status,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  logger.info('Dispute closed', { disputeId: dispute.id, status: dispute.status });
+}
+
+async function handleDisputeFundsWithdrawn(dispute: any, _connectedAccountId: string | undefined) {
+  const result = await query<{ id: string; organization_id: string }>(
+    `UPDATE disputes SET
+      funds_withdrawn = true,
+      status = $1,
+      updated_at = NOW()
+    WHERE stripe_dispute_id = $2
+    RETURNING id, organization_id`,
+    [dispute.status, dispute.id]
+  );
+
+  if (result.length > 0) {
+    socketService.emitToOrganization(result[0].organization_id, SocketEvents.DISPUTE_UPDATED, {
+      disputeId: result[0].id,
+      status: dispute.status,
+      fundsWithdrawn: true,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  logger.info('Dispute funds withdrawn', { disputeId: dispute.id });
+}
+
+async function handleDisputeFundsReinstated(dispute: any, _connectedAccountId: string | undefined) {
+  const result = await query<{ id: string; organization_id: string }>(
+    `UPDATE disputes SET
+      funds_reinstated = true,
+      status = $1,
+      updated_at = NOW()
+    WHERE stripe_dispute_id = $2
+    RETURNING id, organization_id`,
+    [dispute.status, dispute.id]
+  );
+
+  if (result.length > 0) {
+    socketService.emitToOrganization(result[0].organization_id, SocketEvents.DISPUTE_UPDATED, {
+      disputeId: result[0].id,
+      status: dispute.status,
+      fundsReinstated: true,
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  logger.info('Dispute funds reinstated', { disputeId: dispute.id });
 }
 
 export default app;

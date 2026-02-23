@@ -41,6 +41,7 @@ import eventRoutes from './routes/events';
 import menuRoutes from './routes/menu';
 import preorderRoutes from './routes/preorders';
 import invoiceRoutes from './routes/invoices';
+import disputeRoutes from './routes/disputes';
 import adminErrorRoutes from './routes/admin/errors';
 
 const app = new OpenAPIHono({
@@ -167,6 +168,7 @@ app.route('/', eventRoutes);
 app.route('/', menuRoutes);
 app.route('/', preorderRoutes);
 app.route('/', invoiceRoutes);
+app.route('/', disputeRoutes);
 app.route('/admin/errors', adminErrorRoutes);
 
 app.onError(errorHandler);

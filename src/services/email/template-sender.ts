@@ -693,6 +693,7 @@ export async function sendInvoiceEmail(to: string, invoiceData: {
   memo: string | null;
   hostedUrl: string;
   pdfUrl: string | null;
+  isReminder?: boolean;
 }, vendorBranding?: VendorBranding): Promise<void> {
   const itemsList = invoiceData.items.map(item =>
     `${item.description} — ${item.quantity} × $${item.unitPrice.toFixed(2)} = $${item.amount.toFixed(2)}`
@@ -710,8 +711,14 @@ export async function sendInvoiceEmail(to: string, invoiceData: {
     ? `<br><br><em>${invoiceData.memo}</em>`
     : '';
 
+  const isReminder = invoiceData.isReminder === true;
+
+  const introLine = isReminder
+    ? `This is a friendly reminder that you have an outstanding invoice from <strong>${invoiceData.organizationName}</strong>.`
+    : `You have a new invoice from <strong>${invoiceData.organizationName}</strong>.`;
+
   const emailContent = `Hi ${invoiceData.customerName},<br><br>
-You have a new invoice from <strong>${invoiceData.organizationName}</strong>.<br><br>
+${introLine}<br><br>
 <strong>Invoice #:</strong> ${invoiceData.invoiceNumber}${dueDateLine}<br><br>
 <strong>Items:</strong><br>
 ${itemsList}<br><br>
@@ -720,9 +727,13 @@ Subtotal: $${invoiceData.subtotal.toFixed(2)}${taxLine}<br>
 Click the button below to view and pay your invoice securely.`;
 
   const vars = {
-    subject: `Invoice ${invoiceData.invoiceNumber} from ${invoiceData.organizationName}`,
-    preheader_text: `You have a $${invoiceData.totalAmount.toFixed(2)} invoice from ${invoiceData.organizationName}`,
-    email_title: 'Invoice',
+    subject: isReminder
+      ? `Reminder: Invoice ${invoiceData.invoiceNumber} from ${invoiceData.organizationName}`
+      : `Invoice ${invoiceData.invoiceNumber} from ${invoiceData.organizationName}`,
+    preheader_text: isReminder
+      ? `Reminder: You have a $${invoiceData.totalAmount.toFixed(2)} invoice from ${invoiceData.organizationName}`
+      : `You have a $${invoiceData.totalAmount.toFixed(2)} invoice from ${invoiceData.organizationName}`,
+    email_title: isReminder ? 'Payment Reminder' : 'Invoice',
     email_content: emailContent,
     cta_url: invoiceData.hostedUrl,
     cta_text: 'View & Pay Invoice',
@@ -861,4 +872,37 @@ We hope to serve you again soon!`;
   } else {
     await sendTemplatedEmail(to, vars);
   }
+}
+
+export async function sendDisputeCreatedEmail(to: string, disputeData: {
+  firstName: string;
+  organizationName: string;
+  amount: number;
+  currency: string;
+  reason: string;
+  status: string;
+  stripeDashboardUrl: string;
+  evidenceDueBy: string | null;
+}): Promise<void> {
+  const amountFormatted = `$${(disputeData.amount / 100).toFixed(2)}`;
+  const reasonFormatted = disputeData.reason.replace(/_/g, ' ');
+  const deadlineLine = disputeData.evidenceDueBy
+    ? `<br><strong>Evidence Deadline:</strong> ${new Date(disputeData.evidenceDueBy).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`
+    : '';
+
+  const emailContent = `Hi ${disputeData.firstName},<br><br>
+A payment dispute (chargeback) has been filed against <strong>${disputeData.organizationName}</strong>.<br><br>
+<strong>Amount:</strong> ${amountFormatted}<br>
+<strong>Reason:</strong> ${reasonFormatted}${deadlineLine}<br><br>
+To respond to this dispute and submit evidence, go to your Stripe Dashboard using the button below. Failure to respond before the deadline may result in the funds being permanently returned to the customer.<br><br>
+<strong>Important:</strong> Do not ignore this dispute. Even if you believe the charge was legitimate, you must submit evidence through Stripe.`;
+
+  await sendTemplatedEmail(to, {
+    subject: `Action Required: Payment Dispute - ${amountFormatted}`,
+    preheader_text: `A ${amountFormatted} dispute has been filed. Respond before the deadline.`,
+    email_title: 'Payment Dispute Filed',
+    email_content: emailContent,
+    cta_url: disputeData.stripeDashboardUrl,
+    cta_text: 'View in Stripe Dashboard',
+  });
 }

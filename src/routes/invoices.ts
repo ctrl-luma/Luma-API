@@ -1135,6 +1135,7 @@ app.openapi(sendReminderRoute, async (c) => {
         memo: invoice.memo,
         hostedUrl: invoice.stripe_hosted_url || '',
         pdfUrl: invoice.stripe_pdf_url || null,
+        isReminder: true,
       },
     });
 

@@ -361,4 +361,8 @@ export const SocketEvents = {
   INVOICE_PAYMENT_FAILED: 'invoice:payment_failed',
   INVOICE_VOIDED: 'invoice:voided',
   INVOICE_OVERDUE: 'invoice:overdue',
+  // Dispute events
+  DISPUTE_CREATED: 'dispute:created',
+  DISPUTE_UPDATED: 'dispute:updated',
+  DISPUTE_CLOSED: 'dispute:closed',
 } as const;

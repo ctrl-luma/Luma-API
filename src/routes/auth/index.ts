@@ -813,7 +813,7 @@ app.openapi(changePasswordRoute, async (c) => {
 const UpdateProfileRequestSchema = z.object({
   firstName: z.string().min(1).optional(),
   lastName: z.string().min(1).optional(),
-  phone: z.string().regex(/^\d{10}$/, 'Phone must be 10 digits').optional(),
+  phone: z.string().regex(/^\d{10}$/, 'Phone must be 10 digits').nullable().optional(),
 });
 
 const updateProfileRoute = createRoute({
@@ -932,7 +932,7 @@ app.openapi(updateProfileRoute, async (c) => {
         cognitoAttributes.family_name = validated.lastName;
       }
       
-      if (validated.phone !== undefined) {
+      if (validated.phone !== undefined && validated.phone !== null) {
         cognitoAttributes.phone_number = `+1${validated.phone}`;
       }
 
