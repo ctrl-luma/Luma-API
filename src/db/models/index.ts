@@ -6,6 +6,7 @@ export interface Organization {
   settings: Record<string, any>;
   tap_to_pay_device_ids: string[] | null;
   branding_logo_id: string | null;
+  currency: string; // 3-letter ISO currency code, default 'usd'
   created_at: Date;
   updated_at: Date;
 }

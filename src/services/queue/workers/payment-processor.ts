@@ -74,6 +74,7 @@ export function registerPaymentProcessor() {
           await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
             type: 'order_confirmation',
             to: paymentIntent.receipt_email || '',
+            currency: paymentIntent.currency || 'usd',
             data: {
               orderId,
               amount,

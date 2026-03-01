@@ -48,6 +48,7 @@ const SignupRequestSchema = z.object({
   lastName: z.string().min(1),
   organizationName: z.string().min(2),
   phone: z.string().optional(),
+  country: z.string().length(2).optional().default('US'),
   acceptTerms: z.boolean(),
   acceptPrivacy: z.boolean(),
   subscriptionTier: z.enum(['starter', 'pro', 'enterprise']).default('starter'),
@@ -302,7 +303,10 @@ app.openapi(signupRoute, async (c) => {
       if (cognitoService) {
         try {
           // Format phone number for Cognito (E.164 format)
-          const formattedPhone = validated.phone ? `+1${validated.phone.replace(/\D/g, '')}` : undefined;
+          // If phone already has '+' prefix (from international phone input), use as-is
+          const formattedPhone = validated.phone
+            ? (validated.phone.startsWith('+') ? validated.phone.replace(/[^\d+]/g, '') : `+1${validated.phone.replace(/\D/g, '')}`)
+            : undefined;
           
           const cognitoUser = await cognitoService.createUser({
             email: normalizedEmail,
@@ -520,7 +524,7 @@ app.openapi(signupRoute, async (c) => {
 
       const connectAccount = await stripeService.createConnectedAccount({
         email: normalizedEmail,
-        country: 'US',
+        country: validated.country,
         business_type: 'individual',
         metadata: {
           organization_id: result.organization.id,
@@ -637,6 +641,12 @@ app.openapi(signupRoute, async (c) => {
       });
     }
 
+    // Fetch org currency (may have been set by syncAccountFromStripe)
+    const orgCurrencyResult = await query<{ currency: string | null }>(
+      'SELECT currency FROM organizations WHERE id = $1',
+      [result.organization.id]
+    );
+
     const response = {
       user: {
         id: result.user.id,
@@ -644,6 +654,7 @@ app.openapi(signupRoute, async (c) => {
         firstName: result.user.first_name,
         lastName: result.user.last_name,
         organizationId: result.user.organization_id,
+        currency: orgCurrencyResult[0]?.currency || 'usd',
       },
       organization: {
         id: result.organization.id,

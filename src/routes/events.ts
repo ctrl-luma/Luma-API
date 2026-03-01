@@ -6,6 +6,7 @@ import { query, transaction } from '../db';
 import { logger } from '../utils/logger';
 import { socketService, SocketEvents } from '../services/socket';
 import { calculatePlatformFee, SubscriptionTier } from '../config/platform-fees';
+import { getOrgCurrency, toSmallestUnit, formatCurrency as formatCurrencyUtil } from '../utils/currency';
 import { randomBytes } from 'crypto';
 import { imageService, getImageUrl, type ImageType } from '../services/images';
 import { queueService, QueueName } from '../services/queue';
@@ -429,7 +430,8 @@ app.openapi(listPublicEventsRoute, async (c) => {
         COALESCE((SELECT COUNT(*) FROM tickets t WHERE t.event_id = e.id AND t.status NOT IN ('cancelled', 'refunded')), 0)::int AS tickets_sold,
         (SELECT SUM(tt.max_quantity) FROM ticket_tiers tt WHERE tt.event_id = e.id)::int AS total_capacity,
         (SELECT MIN(tt.price) FROM ticket_tiers tt WHERE tt.event_id = e.id AND tt.is_active = true) AS min_price,
-        o.name AS organization_name
+        o.name AS organization_name,
+        o.currency AS org_currency
        FROM events e
        JOIN organizations o ON e.organization_id = o.id
        WHERE ${whereConditions}${extraWhere}
@@ -443,6 +445,7 @@ app.openapi(listPublicEventsRoute, async (c) => {
         ...formatEvent(row),
         minPrice: row.min_price ? parseFloat(row.min_price) : null,
         organizationName: row.organization_name,
+        currency: row.org_currency || 'usd',
       })),
       pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
     });
@@ -471,7 +474,8 @@ app.openapi(getPublicEventRoute, async (c) => {
   try {
     const rows = await query(
       `SELECT e.*,
-        o.name AS organization_name
+        o.name AS organization_name,
+        o.currency AS org_currency
        FROM events e
        JOIN organizations o ON e.organization_id = o.id
        WHERE e.slug = $1 AND e.status = 'published'`,
@@ -496,6 +500,7 @@ app.openapi(getPublicEventRoute, async (c) => {
       event: {
         ...formatEvent({ ...event, tickets_sold: 0, total_capacity: null }),
         organizationName: event.organization_name,
+        currency: event.org_currency || 'usd',
         tiers: tiers.map(t => ({
           ...formatTier(t),
           available: t.max_quantity ? Math.max(0, parseInt(t.max_quantity) - parseInt(t.sold_count) - parseInt(t.locked_count)) : null,
@@ -836,9 +841,10 @@ app.openapi(purchaseTicketsRoute, async (c) => {
       }
     }
 
+    const orgCurrency = await getOrgCurrency(event.organization_id);
     const unitPrice = parseFloat(tier.price);
     const totalDollars = unitPrice * body.quantity;
-    const totalCents = Math.round(totalDollars * 100);
+    const totalCents = toSmallestUnit(totalDollars, orgCurrency);
 
     // Get subscription tier for platform fees
     const subRows = await query<{ tier: string }>(
@@ -865,7 +871,7 @@ app.openapi(purchaseTicketsRoute, async (c) => {
       const paymentIntent = await stripe.paymentIntents.create(
         {
           amount: totalCents,
-          currency: 'usd',
+          currency: orgCurrency,
           payment_method: clonedPm.id,
           payment_method_types: ['card'],
           confirm: true,
@@ -951,6 +957,7 @@ app.openapi(purchaseTicketsRoute, async (c) => {
       await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
         type: 'ticket_confirmation',
         to: body.customerEmail,
+        currency: orgCurrency,
         vendorBranding: {
           organizationName: event.org_name,
           brandingLogoUrl: getImageUrl(event.branding_logo_id),
@@ -2060,9 +2067,10 @@ app.openapi(refundTicketRoute, async (c) => {
 
     const amountPaid = parseFloat(ticket.amount_paid);
     const refundAmount = body.amount !== undefined ? body.amount : amountPaid;
+    const refundCurrency = await getOrgCurrency(payload.organizationId);
 
     if (refundAmount > amountPaid) {
-      return c.json({ error: `Refund amount cannot exceed amount paid ($${amountPaid.toFixed(2)})` }, 400);
+      return c.json({ error: `Refund amount cannot exceed amount paid (${formatCurrencyUtil(amountPaid, refundCurrency)})` }, 400);
     }
 
     if (refundAmount <= 0) {
@@ -2075,7 +2083,7 @@ app.openapi(refundTicketRoute, async (c) => {
       const Stripe = (await import('stripe')).default;
       const stripe = new Stripe(process.env.STRIPE_SECRET_KEY || '');
 
-      const refundCents = Math.round(refundAmount * 100);
+      const refundCents = toSmallestUnit(refundAmount, refundCurrency);
 
       // Create refund on the connected account
       // NOTE: Platform fee is NOT refunded - Luma keeps it
@@ -2136,6 +2144,7 @@ app.openapi(refundTicketRoute, async (c) => {
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'ticket_refund',
       to: ticket.customer_email,
+      currency: refundCurrency,
       vendorBranding: {
         organizationName: ticket.org_name,
         brandingLogoUrl: getImageUrl(ticket.branding_logo_id),
@@ -2235,10 +2244,12 @@ app.openapi(resendTicketEmailRoute, async (c) => {
     const eventDate = new Date(event.starts_at);
     const eventTimezone = event.timezone || 'America/New_York';
     const totalAmount = tickets.reduce((sum: number, t: any) => sum + parseFloat(t.amount_paid), 0);
+    const resendCurrency = await getOrgCurrency(payload.organizationId);
 
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'ticket_confirmation',
       to: body.customerEmail,
+      currency: resendCurrency,
       vendorBranding: {
         organizationName: event.org_name,
         brandingLogoUrl: getImageUrl(event.branding_logo_id),

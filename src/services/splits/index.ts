@@ -1,6 +1,7 @@
 import { query } from '../../db';
 import { RevenueSplit, RevenueSplitReport, RevenueSplitRecipientType, Catalog } from '../../db/models';
 import { logger } from '../../utils/logger';
+import { toSmallestUnit, getOrgCurrency } from '../../utils/currency';
 
 export interface CreateSplitParams {
   catalogId: string;
@@ -206,8 +207,9 @@ class SplitsService {
       [organizationId, catalogId, startDate, endDate]
     );
 
-    // subtotal is stored in dollars (DECIMAL), convert to cents for API response
-    const grossSales = Math.round(parseFloat(salesResult[0].gross_sales) * 100) || 0;
+    // subtotal is stored in base currency unit (DECIMAL), convert to smallest unit for API response
+    const orgCurrency = await getOrgCurrency(organizationId);
+    const grossSales = toSmallestUnit(parseFloat(salesResult[0].gross_sales), orgCurrency) || 0;
     const orderCount = parseInt(salesResult[0].order_count) || 0;
 
     // Get active splits for this catalog

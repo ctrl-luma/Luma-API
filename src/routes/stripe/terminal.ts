@@ -6,6 +6,7 @@ import { stripe } from '../../services/stripe';
 import { emailService } from '../../services/email';
 import { logger } from '../../utils/logger';
 import { calculatePlatformFee, SubscriptionTier } from '../../config/platform-fees';
+import { getOrgCurrency, toSmallestUnit, formatCurrency as formatCurrencyUtil } from '../../utils/currency';
 
 const app = new OpenAPIHono();
 
@@ -85,7 +86,10 @@ async function getConnectedAccount(authHeader: string | undefined) {
     subscriptionTier,
   });
 
-  return { connectedAccount, payload, subscriptionTier };
+  // Get org currency
+  const orgCurrency = connectedAccount.default_currency || await getOrgCurrency(payload.organizationId);
+
+  return { connectedAccount, payload, subscriptionTier, orgCurrency };
 }
 
 // ============================================
@@ -292,7 +296,7 @@ const createPaymentIntentRoute = createRoute({
         'application/json': {
           schema: z.object({
             amount: z.number().positive().describe('Amount in dollars'),
-            currency: z.string().length(3).optional().default('usd'),
+            currency: z.string().length(3).optional(),
             description: z.string().optional(),
             metadata: z.record(z.string()).optional(),
             receiptEmail: z.preprocess(
@@ -331,16 +335,18 @@ const createPaymentIntentRoute = createRoute({
 
 app.openapi(createPaymentIntentRoute, async (c) => {
   try {
-    const { connectedAccount, payload, subscriptionTier } = await getConnectedAccount(c.req.header('Authorization'));
+    const { connectedAccount, payload, subscriptionTier, orgCurrency } = await getConnectedAccount(c.req.header('Authorization'));
     const body = await c.req.json();
+
+    const currency = body.currency || orgCurrency;
 
     // Validate amount
     if (!body.amount || body.amount < 0.50) {
-      return c.json({ error: 'Amount must be at least $0.50' }, 400);
+      return c.json({ error: `Amount must be at least ${formatCurrencyUtil(0.50, currency)}` }, 400);
     }
 
-    // Convert to cents
-    const amountInCents = Math.round(body.amount * 100);
+    // Convert to smallest currency unit (cents for USD, yen for JPY, etc.)
+    const amountInCents = toSmallestUnit(body.amount, currency);
 
     // Calculate platform fee based on subscription tier
     const platformFee = calculatePlatformFee(amountInCents, subscriptionTier);
@@ -371,7 +377,7 @@ app.openapi(createPaymentIntentRoute, async (c) => {
       paymentIntent = await stripe.paymentIntents.create(
         {
           amount: amountInCents,
-          currency: body.currency || 'usd',
+          currency,
           payment_method_types: ['card'],
           capture_method: captureMethod,
           description: body.description || 'Manual card payment',
@@ -398,7 +404,7 @@ app.openapi(createPaymentIntentRoute, async (c) => {
       paymentIntent = await stripe.paymentIntents.create(
         {
           amount: amountInCents,
-          currency: body.currency || 'usd',
+          currency,
           payment_method_types: ['card_present'],
           capture_method: captureMethod,
           description: body.description || 'Tap to Pay payment',
@@ -803,7 +809,7 @@ app.openapi(sendReceiptRoute, async (c) => {
       date: new Date(charge.created * 1000),
       receiptUrl: receiptUrl || undefined,
       merchantName,
-    });
+    }, paymentIntent.currency || connectedAccount?.default_currency || 'usd');
 
     // Also save/update customer in our database
     // NOTE: We do NOT increment total_orders/total_spent here because that was already
@@ -1092,6 +1098,510 @@ app.openapi(simulatePaymentRoute, async (c) => {
     }
 
     return c.json({ error: 'Failed to simulate payment' }, 500);
+  }
+});
+
+// ============================================
+// GET /stripe/terminal/readers - List registered terminal readers
+// ============================================
+const listReadersRoute = createRoute({
+  method: 'get',
+  path: '/stripe/terminal/readers',
+  summary: 'List registered terminal readers',
+  description: 'Returns all terminal readers registered to the connected Stripe account',
+  tags: ['Stripe Terminal'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: {
+      description: 'Readers retrieved successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            readers: z.array(z.object({
+              id: z.string(),
+              label: z.string().nullable(),
+              deviceType: z.string(),
+              status: z.string().nullable(),
+              ipAddress: z.string().nullable(),
+              locationId: z.string().nullable(),
+              serialNumber: z.string().nullable(),
+            })),
+          }),
+        },
+      },
+    },
+    401: { description: 'Unauthorized' },
+    403: { description: 'Payments not enabled for this account' },
+    404: { description: 'No connected account found' },
+  },
+});
+
+app.openapi(listReadersRoute, async (c) => {
+  try {
+    const { connectedAccount } = await getConnectedAccount(c.req.header('Authorization'));
+
+    const readers = await stripe.terminal.readers.list(
+      { limit: 100 },
+      { stripeAccount: connectedAccount.stripe_account_id }
+    );
+
+    logger.info('Terminal readers listed', {
+      accountId: connectedAccount.stripe_account_id,
+      count: readers.data.length,
+    });
+
+    return c.json({
+      readers: readers.data.map((reader) => ({
+        id: reader.id,
+        label: reader.label || null,
+        deviceType: reader.device_type || 'unknown',
+        status: reader.status || null,
+        ipAddress: reader.ip_address || null,
+        locationId: reader.location ? (typeof reader.location === 'string' ? reader.location : reader.location.id) : null,
+        serialNumber: reader.serial_number || null,
+      })),
+    });
+  } catch (error: any) {
+    logger.error('Error listing terminal readers', { error: error.message });
+
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    if (error.message === 'No connected account found') {
+      return c.json({ error: 'No connected account found' }, 404);
+    }
+    if (error.message === 'Payments are not enabled for this account') {
+      return c.json({ error: 'Payments are not enabled for this account' }, 403);
+    }
+
+    return c.json({ error: 'Failed to list terminal readers' }, 500);
+  }
+});
+
+// ============================================
+// POST /stripe/terminal/readers - Register a new terminal reader
+// ============================================
+const registerReaderRoute = createRoute({
+  method: 'post',
+  path: '/stripe/terminal/readers',
+  summary: 'Register a new terminal reader',
+  description: 'Registers a physical terminal reader using the registration code displayed on the device',
+  tags: ['Stripe Terminal'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    body: {
+      content: {
+        'application/json': {
+          schema: z.object({
+            registrationCode: z.string().min(1).describe('Registration code from the reader device'),
+            label: z.string().optional().describe('Human-readable label for the reader'),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Reader registered successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            id: z.string(),
+            label: z.string().nullable(),
+            deviceType: z.string(),
+            status: z.string().nullable(),
+            locationId: z.string().nullable(),
+          }),
+        },
+      },
+    },
+    400: { description: 'Invalid registration code' },
+    401: { description: 'Unauthorized' },
+    403: { description: 'Payments not enabled for this account' },
+    404: { description: 'No connected account found' },
+  },
+});
+
+app.openapi(registerReaderRoute, async (c) => {
+  try {
+    const { connectedAccount, payload } = await getConnectedAccount(c.req.header('Authorization'));
+    const body = await c.req.json();
+
+    // Get or create a terminal location for this account
+    let locationId: string;
+    const existingLocations = await stripe.terminal.locations.list(
+      { limit: 1 },
+      { stripeAccount: connectedAccount.stripe_account_id }
+    );
+
+    if (existingLocations.data.length > 0) {
+      locationId = existingLocations.data[0].id;
+    } else {
+      const orgRows = await query<{ name: string }>(
+        'SELECT name FROM organizations WHERE id = $1',
+        [payload.organizationId]
+      );
+      const orgName = orgRows.length > 0 ? orgRows[0].name : 'Mobile POS';
+
+      const newLocation = await stripe.terminal.locations.create(
+        {
+          display_name: `${orgName} - Terminal`,
+          address: {
+            line1: '123 Main St',
+            city: 'San Francisco',
+            state: 'CA',
+            postal_code: '94111',
+            country: 'US',
+          },
+        },
+        { stripeAccount: connectedAccount.stripe_account_id }
+      );
+      locationId = newLocation.id;
+    }
+
+    const reader = await stripe.terminal.readers.create(
+      {
+        registration_code: body.registrationCode,
+        label: body.label || 'Terminal Reader',
+        location: locationId,
+      },
+      { stripeAccount: connectedAccount.stripe_account_id }
+    );
+
+    logger.info('Terminal reader registered', {
+      readerId: reader.id,
+      label: reader.label,
+      deviceType: reader.device_type,
+      accountId: connectedAccount.stripe_account_id,
+      organizationId: payload.organizationId,
+    });
+
+    return c.json({
+      id: reader.id,
+      label: reader.label || null,
+      deviceType: reader.device_type || 'unknown',
+      status: reader.status || null,
+      locationId,
+    });
+  } catch (error: any) {
+    logger.error('Error registering terminal reader', { error: error.message });
+
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    if (error.message === 'No connected account found') {
+      return c.json({ error: 'No connected account found' }, 404);
+    }
+    if (error.message === 'Payments are not enabled for this account') {
+      return c.json({ error: 'Payments are not enabled for this account' }, 403);
+    }
+    if (error.type === 'StripeInvalidRequestError') {
+      return c.json({ error: error.message }, 400);
+    }
+
+    return c.json({ error: 'Failed to register terminal reader' }, 500);
+  }
+});
+
+// ============================================
+// DELETE /stripe/terminal/readers/:readerId - Delete/deregister a terminal reader
+// ============================================
+const deleteReaderRoute = createRoute({
+  method: 'delete',
+  path: '/stripe/terminal/readers/{readerId}',
+  summary: 'Delete a terminal reader',
+  description: 'Deregisters a physical terminal reader from the connected Stripe account',
+  tags: ['Stripe Terminal'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    params: z.object({
+      readerId: z.string(),
+    }),
+  },
+  responses: {
+    200: {
+      description: 'Reader deleted successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            deleted: z.boolean(),
+            id: z.string(),
+          }),
+        },
+      },
+    },
+    401: { description: 'Unauthorized' },
+    403: { description: 'Payments not enabled for this account' },
+    404: { description: 'Reader not found' },
+  },
+});
+
+app.openapi(deleteReaderRoute, async (c) => {
+  try {
+    const { readerId } = c.req.param();
+    const { connectedAccount } = await getConnectedAccount(c.req.header('Authorization'));
+
+    const result = await stripe.terminal.readers.del(
+      readerId,
+      { stripeAccount: connectedAccount.stripe_account_id }
+    );
+
+    logger.info('Terminal reader deleted', {
+      readerId,
+      accountId: connectedAccount.stripe_account_id,
+    });
+
+    return c.json({
+      deleted: result.deleted,
+      id: result.id,
+    });
+  } catch (error: any) {
+    logger.error('Error deleting terminal reader', { error: error.message });
+
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    if (error.message === 'No connected account found') {
+      return c.json({ error: 'No connected account found' }, 404);
+    }
+    if (error.message === 'Payments are not enabled for this account') {
+      return c.json({ error: 'Payments are not enabled for this account' }, 403);
+    }
+    if (error.type === 'StripeInvalidRequestError') {
+      if (error.message?.includes('No such terminal.reader')) {
+        return c.json({ error: 'Reader not found' }, 404);
+      }
+      return c.json({ error: error.message }, 400);
+    }
+
+    return c.json({ error: 'Failed to delete terminal reader' }, 500);
+  }
+});
+
+// ============================================
+// POST /stripe/terminal/readers/:readerId/process-payment - Server-driven payment on a physical reader
+// ============================================
+const processReaderPaymentRoute = createRoute({
+  method: 'post',
+  path: '/stripe/terminal/readers/{readerId}/process-payment',
+  summary: 'Process payment on a physical terminal reader (server-driven)',
+  description: 'Sends a payment to a physical terminal reader. Either provide an existing paymentIntentId (from the mobile app checkout flow) or an amount to create a new PaymentIntent (vendor dashboard flow).',
+  tags: ['Stripe Terminal'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    params: z.object({
+      readerId: z.string(),
+    }),
+    body: {
+      content: {
+        'application/json': {
+          schema: z.object({
+            paymentIntentId: z.string().optional().describe('Existing PaymentIntent ID to send to reader (skips PI creation)'),
+            amount: z.number().positive().optional().describe('Amount in dollars (creates new PI)'),
+            currency: z.string().length(3).optional(),
+            description: z.string().optional(),
+            metadata: z.record(z.string()).optional(),
+            customerEmail: z.preprocess(
+              (val) => (typeof val === 'string' && val.trim() === '' ? undefined : val),
+              z.string().email().optional()
+            ),
+          }).refine(data => data.paymentIntentId || data.amount, {
+            message: 'Either paymentIntentId or amount is required',
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: 'Payment sent to reader successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            paymentIntentId: z.string(),
+            readerId: z.string(),
+            readerLabel: z.string().nullable(),
+            actionStatus: z.string(),
+          }),
+        },
+      },
+    },
+    400: { description: 'Invalid request or reader not ready' },
+    401: { description: 'Unauthorized' },
+    403: { description: 'Payments not enabled for this account' },
+    404: { description: 'Reader or connected account not found' },
+  },
+});
+
+app.openapi(processReaderPaymentRoute, async (c) => {
+  try {
+    const { readerId } = c.req.param();
+    const { connectedAccount, payload, subscriptionTier, orgCurrency } = await getConnectedAccount(c.req.header('Authorization'));
+    const body = await c.req.json();
+
+    if (!body.paymentIntentId && !body.amount) {
+      return c.json({ error: 'Either paymentIntentId or amount is required' }, 400);
+    }
+
+    const currency = body.currency || orgCurrency;
+    let paymentIntentId: string;
+
+    if (body.paymentIntentId) {
+      // Mode A: Use an existing PaymentIntent (from mobile app checkout flow)
+      paymentIntentId = body.paymentIntentId;
+      logger.info('Terminal reader: using existing PaymentIntent', {
+        readerId,
+        paymentIntentId,
+        organizationId: payload.organizationId,
+      });
+    } else {
+      // Mode B: Create a new PaymentIntent (vendor dashboard flow)
+      if (body.amount < 0.50) {
+        return c.json({ error: `Amount must be at least ${formatCurrencyUtil(0.50, currency)}` }, 400);
+      }
+
+      const amountInCents = toSmallestUnit(body.amount, currency);
+      const platformFee = calculatePlatformFee(amountInCents, subscriptionTier);
+
+      const paymentIntent = await stripe.paymentIntents.create(
+        {
+          amount: amountInCents,
+          currency,
+          payment_method_types: ['card_present'],
+          capture_method: 'automatic',
+          description: body.description || 'Terminal reader payment',
+          receipt_email: body.customerEmail,
+          application_fee_amount: platformFee > 0 ? platformFee : undefined,
+          metadata: {
+            ...body.metadata,
+            organization_id: payload.organizationId,
+            user_id: payload.userId,
+            source: 'vendor_dashboard',
+            subscription_tier: subscriptionTier,
+            platform_fee_cents: platformFee.toString(),
+            payment_method_type: 'card_present',
+            reader_id: readerId,
+          },
+        },
+        { stripeAccount: connectedAccount.stripe_account_id }
+      );
+
+      paymentIntentId = paymentIntent.id;
+    }
+
+    // Send the PaymentIntent to the reader for processing
+    const reader = await stripe.terminal.readers.processPaymentIntent(
+      readerId,
+      { payment_intent: paymentIntentId },
+      { stripeAccount: connectedAccount.stripe_account_id }
+    );
+
+    logger.info('Terminal reader payment initiated', {
+      readerId,
+      readerLabel: reader.label,
+      paymentIntentId,
+      amount: body.amount,
+      existingPI: !!body.paymentIntentId,
+      subscriptionTier,
+      accountId: connectedAccount.stripe_account_id,
+      organizationId: payload.organizationId,
+      actionStatus: reader.action?.status,
+    });
+
+    return c.json({
+      paymentIntentId,
+      readerId: reader.id,
+      readerLabel: reader.label || null,
+      actionStatus: reader.action?.status || 'in_progress',
+    });
+  } catch (error: any) {
+    logger.error('Error processing reader payment', { error: error.message });
+
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    if (error.message === 'No connected account found') {
+      return c.json({ error: 'No connected account found' }, 404);
+    }
+    if (error.message === 'Payments are not enabled for this account') {
+      return c.json({ error: 'Payments are not enabled for this account' }, 403);
+    }
+    if (error.type === 'StripeInvalidRequestError') {
+      if (error.message?.includes('No such terminal.reader')) {
+        return c.json({ error: 'Reader not found' }, 404);
+      }
+      return c.json({ error: error.message }, 400);
+    }
+
+    return c.json({ error: 'Failed to process reader payment' }, 500);
+  }
+});
+
+// ============================================
+// POST /stripe/terminal/readers/:readerId/cancel-action - Cancel pending action on a reader
+// ============================================
+const cancelReaderActionRoute = createRoute({
+  method: 'post',
+  path: '/stripe/terminal/readers/{readerId}/cancel-action',
+  summary: 'Cancel the current action on a terminal reader',
+  description: 'Cancels any pending payment collection on the reader',
+  tags: ['Stripe Terminal'],
+  security: [{ bearerAuth: [] }],
+  request: {
+    params: z.object({
+      readerId: z.string(),
+    }),
+  },
+  responses: {
+    200: {
+      description: 'Action cancelled successfully',
+      content: {
+        'application/json': {
+          schema: z.object({
+            success: z.boolean(),
+            readerId: z.string(),
+          }),
+        },
+      },
+    },
+    401: { description: 'Unauthorized' },
+    404: { description: 'Reader not found' },
+  },
+});
+
+app.openapi(cancelReaderActionRoute, async (c) => {
+  try {
+    const { readerId } = c.req.param();
+    const { connectedAccount } = await getConnectedAccount(c.req.header('Authorization'));
+
+    await stripe.terminal.readers.cancelAction(
+      readerId,
+      { stripeAccount: connectedAccount.stripe_account_id }
+    );
+
+    logger.info('Terminal reader action cancelled', {
+      readerId,
+      accountId: connectedAccount.stripe_account_id,
+    });
+
+    return c.json({
+      success: true,
+      readerId,
+    });
+  } catch (error: any) {
+    logger.error('Error cancelling reader action', { error: error.message });
+
+    if (error.message === 'Unauthorized' || error.message === 'Invalid token') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    if (error.type === 'StripeInvalidRequestError') {
+      if (error.message?.includes('No such terminal.reader')) {
+        return c.json({ error: 'Reader not found' }, 404);
+      }
+      return c.json({ error: error.message }, 400);
+    }
+
+    return c.json({ error: 'Failed to cancel reader action' }, 500);
   }
 });
 

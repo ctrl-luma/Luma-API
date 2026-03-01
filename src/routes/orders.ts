@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { query, transaction } from '../db';
 import { logger } from '../utils/logger';
 import { socketService, SocketEvents } from '../services/socket';
+import { fromSmallestUnit, toSmallestUnit, getOrgCurrency } from '../utils/currency';
 
 const app = new OpenAPIHono();
 
@@ -123,12 +124,13 @@ app.openapi(createOrderRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
+    const orgCurrency = await getOrgCurrency(payload.organizationId);
 
     const orderNumber = generateOrderNumber();
-    const subtotal = body.subtotal / 100; // Convert cents to dollars for DB
-    const taxAmount = (body.taxAmount || 0) / 100;
-    const tipAmount = (body.tipAmount || 0) / 100;
-    const totalAmount = body.totalAmount / 100;
+    const subtotal = fromSmallestUnit(body.subtotal, orgCurrency);
+    const taxAmount = fromSmallestUnit(body.taxAmount || 0, orgCurrency);
+    const tipAmount = fromSmallestUnit(body.tipAmount || 0, orgCurrency);
+    const totalAmount = fromSmallestUnit(body.totalAmount, orgCurrency);
     const customerEmail = body.customerEmail?.toLowerCase().trim() || null;
 
     const result = await transaction(async (client) => {
@@ -203,7 +205,7 @@ app.openapi(createOrderRoute, async (c) => {
               item.categoryId || null,
               item.name,
               item.quantity,
-              item.unitPrice / 100, // Convert cents to dollars
+              fromSmallestUnit(item.unitPrice, orgCurrency),
               item.notes || null,
             ]
           );
@@ -238,7 +240,7 @@ app.openapi(createOrderRoute, async (c) => {
       orderId: result.order.id,
       orderNumber,
       status: result.order.status,
-      totalAmount: parseFloat(result.order.total_amount) * 100,
+      totalAmount: toSmallestUnit(parseFloat(result.order.total_amount), orgCurrency),
       deviceId: result.order.device_id,
     };
     socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_CREATED, orderEventData);
@@ -248,10 +250,10 @@ app.openapi(createOrderRoute, async (c) => {
       orderNumber: result.order.order_number,
       status: result.order.status,
       paymentMethod: result.order.payment_method,
-      subtotal: parseFloat(result.order.subtotal) * 100, // Return in cents
-      taxAmount: parseFloat(result.order.tax_amount) * 100,
-      tipAmount: parseFloat(result.order.tip_amount) * 100,
-      totalAmount: parseFloat(result.order.total_amount) * 100,
+      subtotal: toSmallestUnit(parseFloat(result.order.subtotal), orgCurrency),
+      taxAmount: toSmallestUnit(parseFloat(result.order.tax_amount), orgCurrency),
+      tipAmount: toSmallestUnit(parseFloat(result.order.tip_amount), orgCurrency),
+      totalAmount: toSmallestUnit(parseFloat(result.order.total_amount), orgCurrency),
       stripePaymentIntentId: result.order.stripe_payment_intent_id,
       customerEmail: result.order.customer_email,
       catalogId: result.order.catalog_id || null,
@@ -292,6 +294,9 @@ const updateOrderPaymentIntentRoute = createRoute({
           schema: z.object({
             stripePaymentIntentId: z.string(),
             paymentMethod: z.enum(['card', 'cash', 'tap_to_pay']).optional(),
+            readerId: z.string().optional(),
+            readerLabel: z.string().optional(),
+            readerType: z.enum(['bluetooth', 'internet', 'tap_to_pay']).optional(),
           }),
         },
       },
@@ -317,6 +322,7 @@ app.openapi(updateOrderPaymentIntentRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
+    const orgCurrency = await getOrgCurrency(payload.organizationId);
 
     logger.info('[ORDER DEBUG] Updating order with payment intent', {
       orderId: id,
@@ -332,6 +338,19 @@ app.openapi(updateOrderPaymentIntentRoute, async (c) => {
     if (body.paymentMethod) {
       params.push(body.paymentMethod);
       setClauses.push(`payment_method = $${params.length}`);
+    }
+
+    if (body.readerId) {
+      params.push(body.readerId);
+      setClauses.push(`reader_id = $${params.length}`);
+    }
+    if (body.readerLabel) {
+      params.push(body.readerLabel);
+      setClauses.push(`reader_label = $${params.length}`);
+    }
+    if (body.readerType) {
+      params.push(body.readerType);
+      setClauses.push(`reader_type = $${params.length}`);
     }
 
     params.push(id, payload.organizationId);
@@ -366,10 +385,10 @@ app.openapi(updateOrderPaymentIntentRoute, async (c) => {
       orderNumber: order.order_number,
       status: order.status,
       paymentMethod: order.payment_method,
-      subtotal: parseFloat(order.subtotal) * 100,
-      taxAmount: parseFloat(order.tax_amount) * 100,
-      tipAmount: parseFloat(order.tip_amount) * 100,
-      totalAmount: parseFloat(order.total_amount) * 100,
+      subtotal: toSmallestUnit(parseFloat(order.subtotal), orgCurrency),
+      taxAmount: toSmallestUnit(parseFloat(order.tax_amount), orgCurrency),
+      tipAmount: toSmallestUnit(parseFloat(order.tip_amount), orgCurrency),
+      totalAmount: toSmallestUnit(parseFloat(order.total_amount), orgCurrency),
       stripePaymentIntentId: order.stripe_payment_intent_id,
       customerEmail: order.customer_email,
       customerId: order.customer_id || null,
@@ -419,6 +438,7 @@ const listHeldOrdersRoute = createRoute({
 app.openapi(listHeldOrdersRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+    const orgCurrency = await getOrgCurrency(payload.organizationId);
     const { deviceId } = c.req.query();
 
     logger.info('Listing held orders', {
@@ -455,10 +475,10 @@ app.openapi(listHeldOrdersRoute, async (c) => {
       orderNumber: order.order_number,
       status: order.status,
       paymentMethod: order.payment_method,
-      subtotal: parseFloat(order.subtotal) * 100,
-      taxAmount: parseFloat(order.tax_amount) * 100,
-      tipAmount: parseFloat(order.tip_amount) * 100,
-      totalAmount: parseFloat(order.total_amount) * 100,
+      subtotal: toSmallestUnit(parseFloat(order.subtotal), orgCurrency),
+      taxAmount: toSmallestUnit(parseFloat(order.tax_amount), orgCurrency),
+      tipAmount: toSmallestUnit(parseFloat(order.tip_amount), orgCurrency),
+      totalAmount: toSmallestUnit(parseFloat(order.total_amount), orgCurrency),
       stripePaymentIntentId: order.stripe_payment_intent_id,
       customerEmail: order.customer_email,
       customerId: order.customer_id || null,
@@ -519,6 +539,7 @@ app.openapi(getOrderRoute, async (c) => {
 
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+    const orgCurrency = await getOrgCurrency(payload.organizationId);
 
     const orderRows = await query(
       `SELECT * FROM orders WHERE id = $1 AND organization_id = $2`,
@@ -546,7 +567,7 @@ app.openapi(getOrderRoute, async (c) => {
       categoryId: item.category_id || null,
       name: item.name,
       quantity: item.quantity,
-      unitPrice: parseFloat(item.unit_price) * 100,
+      unitPrice: toSmallestUnit(parseFloat(item.unit_price), orgCurrency),
       notes: item.notes || null,
       imageUrl: item.image_url || null,
     }));
@@ -556,10 +577,10 @@ app.openapi(getOrderRoute, async (c) => {
       orderNumber: order.order_number,
       status: order.status,
       paymentMethod: order.payment_method,
-      subtotal: parseFloat(order.subtotal) * 100,
-      taxAmount: parseFloat(order.tax_amount) * 100,
-      tipAmount: parseFloat(order.tip_amount) * 100,
-      totalAmount: parseFloat(order.total_amount) * 100,
+      subtotal: toSmallestUnit(parseFloat(order.subtotal), orgCurrency),
+      taxAmount: toSmallestUnit(parseFloat(order.tax_amount), orgCurrency),
+      tipAmount: toSmallestUnit(parseFloat(order.tip_amount), orgCurrency),
+      totalAmount: toSmallestUnit(parseFloat(order.total_amount), orgCurrency),
       stripePaymentIntentId: order.stripe_payment_intent_id,
       customerEmail: order.customer_email,
       customerId: order.customer_id || null,
@@ -620,6 +641,7 @@ const listOrdersRoute = createRoute({
 app.openapi(listOrdersRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+    const orgCurrency = await getOrgCurrency(payload.organizationId);
     const { limit, offset, status, catalogId, customerId, userId, deviceId } = c.req.query();
 
     let whereClause = 'organization_id = $1';
@@ -670,10 +692,10 @@ app.openapi(listOrdersRoute, async (c) => {
       orderNumber: order.order_number,
       status: order.status,
       paymentMethod: order.payment_method,
-      subtotal: parseFloat(order.subtotal) * 100,
-      taxAmount: parseFloat(order.tax_amount) * 100,
-      tipAmount: parseFloat(order.tip_amount) * 100,
-      totalAmount: parseFloat(order.total_amount) * 100,
+      subtotal: toSmallestUnit(parseFloat(order.subtotal), orgCurrency),
+      taxAmount: toSmallestUnit(parseFloat(order.tax_amount), orgCurrency),
+      tipAmount: toSmallestUnit(parseFloat(order.tip_amount), orgCurrency),
+      totalAmount: toSmallestUnit(parseFloat(order.total_amount), orgCurrency),
       stripePaymentIntentId: order.stripe_payment_intent_id,
       customerEmail: order.customer_email,
       customerId: order.customer_id || null,
@@ -753,6 +775,7 @@ app.openapi(holdOrderRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json() as any;
+    const orgCurrency = await getOrgCurrency(payload.organizationId);
 
     // Only pending orders can be held
     const existingOrder = await query(
@@ -788,19 +811,19 @@ app.openapi(holdOrderRoute, async (c) => {
     const params: any[] = [payload.userId, body.holdName || null];
 
     if (body.tipAmount !== undefined) {
-      params.push(body.tipAmount / 100);
+      params.push(fromSmallestUnit(body.tipAmount, orgCurrency));
       setClauses.push(`tip_amount = $${params.length}`);
     }
     if (body.taxAmount !== undefined) {
-      params.push(body.taxAmount / 100);
+      params.push(fromSmallestUnit(body.taxAmount, orgCurrency));
       setClauses.push(`tax_amount = $${params.length}`);
     }
     if (body.subtotal !== undefined) {
-      params.push(body.subtotal / 100);
+      params.push(fromSmallestUnit(body.subtotal, orgCurrency));
       setClauses.push(`subtotal = $${params.length}`);
     }
     if (body.totalAmount !== undefined) {
-      params.push(body.totalAmount / 100);
+      params.push(fromSmallestUnit(body.totalAmount, orgCurrency));
       setClauses.push(`total_amount = $${params.length}`);
     }
     if (body.paymentMethod) {
@@ -871,10 +894,10 @@ app.openapi(holdOrderRoute, async (c) => {
       orderNumber: order.order_number,
       status: order.status,
       paymentMethod: order.payment_method,
-      subtotal: parseFloat(order.subtotal) * 100,
-      taxAmount: parseFloat(order.tax_amount) * 100,
-      tipAmount: parseFloat(order.tip_amount) * 100,
-      totalAmount: parseFloat(order.total_amount) * 100,
+      subtotal: toSmallestUnit(parseFloat(order.subtotal), orgCurrency),
+      taxAmount: toSmallestUnit(parseFloat(order.tax_amount), orgCurrency),
+      tipAmount: toSmallestUnit(parseFloat(order.tip_amount), orgCurrency),
+      totalAmount: toSmallestUnit(parseFloat(order.total_amount), orgCurrency),
       stripePaymentIntentId: order.stripe_payment_intent_id,
       customerEmail: order.customer_email,
       customerId: order.customer_id || null,
@@ -939,6 +962,7 @@ app.openapi(resumeOrderRoute, async (c) => {
 
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
+    const orgCurrency = await getOrgCurrency(payload.organizationId);
 
     logger.info('Resume order - checking order status', {
       orderId: id,
@@ -1011,7 +1035,7 @@ app.openapi(resumeOrderRoute, async (c) => {
       categoryId: item.category_id || null,
       name: item.name,
       quantity: item.quantity,
-      unitPrice: parseFloat(item.unit_price) * 100,
+      unitPrice: toSmallestUnit(parseFloat(item.unit_price), orgCurrency),
       notes: item.notes || null,
       imageUrl: item.image_url || null,
     }));
@@ -1042,10 +1066,10 @@ app.openapi(resumeOrderRoute, async (c) => {
       orderNumber: order.order_number,
       status: order.status,
       paymentMethod: order.payment_method,
-      subtotal: parseFloat(order.subtotal) * 100,
-      taxAmount: parseFloat(order.tax_amount) * 100,
-      tipAmount: parseFloat(order.tip_amount) * 100,
-      totalAmount: parseFloat(order.total_amount) * 100,
+      subtotal: toSmallestUnit(parseFloat(order.subtotal), orgCurrency),
+      taxAmount: toSmallestUnit(parseFloat(order.tax_amount), orgCurrency),
+      tipAmount: toSmallestUnit(parseFloat(order.tip_amount), orgCurrency),
+      totalAmount: toSmallestUnit(parseFloat(order.total_amount), orgCurrency),
       stripePaymentIntentId: order.stripe_payment_intent_id,
       customerEmail: order.customer_email,
       customerId: order.customer_id || null,
@@ -1122,6 +1146,7 @@ app.openapi(completeCashPaymentRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
+    const orgCurrency = await getOrgCurrency(payload.organizationId);
 
     // Get the order
     const existingOrder = await query(
@@ -1134,7 +1159,7 @@ app.openapi(completeCashPaymentRoute, async (c) => {
     }
 
     const order = existingOrder[0] as any;
-    const totalAmountCents = Math.round(parseFloat(order.total_amount) * 100);
+    const totalAmountCents = Math.round(toSmallestUnit(parseFloat(order.total_amount), orgCurrency));
 
     // Check that cash is sufficient
     if (body.cashTendered < totalAmountCents) {
@@ -1174,7 +1199,7 @@ app.openapi(completeCashPaymentRoute, async (c) => {
       [
         id,
         totalAmountCents,
-        Math.round(parseFloat(order.tip_amount) * 100),
+        Math.round(toSmallestUnit(parseFloat(order.tip_amount), orgCurrency)),
         body.cashTendered,
         changeAmount,
         payload.userId,
@@ -1206,10 +1231,10 @@ app.openapi(completeCashPaymentRoute, async (c) => {
         orderNumber: updatedOrder.order_number,
         status: updatedOrder.status,
         paymentMethod: updatedOrder.payment_method,
-        subtotal: parseFloat(updatedOrder.subtotal) * 100,
-        taxAmount: parseFloat(updatedOrder.tax_amount) * 100,
-        tipAmount: parseFloat(updatedOrder.tip_amount) * 100,
-        totalAmount: parseFloat(updatedOrder.total_amount) * 100,
+        subtotal: toSmallestUnit(parseFloat(updatedOrder.subtotal), orgCurrency),
+        taxAmount: toSmallestUnit(parseFloat(updatedOrder.tax_amount), orgCurrency),
+        tipAmount: toSmallestUnit(parseFloat(updatedOrder.tip_amount), orgCurrency),
+        totalAmount: toSmallestUnit(parseFloat(updatedOrder.total_amount), orgCurrency),
         stripePaymentIntentId: updatedOrder.stripe_payment_intent_id,
         customerEmail: updatedOrder.customer_email,
         customerId: updatedOrder.customer_id || null,
@@ -1256,6 +1281,9 @@ const addPaymentRoute = createRoute({
             tipAmount: z.number().int().optional().default(0),
             stripePaymentIntentId: z.string().optional(),
             cashTendered: z.number().int().optional(), // for cash payments
+            readerId: z.string().optional(),
+            readerLabel: z.string().optional(),
+            readerType: z.enum(['bluetooth', 'internet', 'tap_to_pay']).optional(),
           }),
         },
       },
@@ -1295,6 +1323,7 @@ app.openapi(addPaymentRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
+    const orgCurrency = await getOrgCurrency(payload.organizationId);
 
     // Get the order
     const existingOrder = await query(
@@ -1307,7 +1336,7 @@ app.openapi(addPaymentRoute, async (c) => {
     }
 
     const order = existingOrder[0] as any;
-    const totalAmountCents = Math.round(parseFloat(order.total_amount) * 100);
+    const totalAmountCents = Math.round(toSmallestUnit(parseFloat(order.total_amount), orgCurrency));
 
     // Only pending or held orders can receive payments
     if (!['pending', 'held', 'processing'].includes(order.status)) {
@@ -1334,8 +1363,9 @@ app.openapi(addPaymentRoute, async (c) => {
     const paymentResult = await query(
       `INSERT INTO order_payments (
         order_id, payment_method, amount, tip_amount, status,
-        stripe_payment_intent_id, cash_tendered, cash_change, processed_by, device_id
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        stripe_payment_intent_id, cash_tendered, cash_change, processed_by, device_id,
+        reader_id, reader_label, reader_type
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
       RETURNING *`,
       [
         id,
@@ -1348,6 +1378,9 @@ app.openapi(addPaymentRoute, async (c) => {
         cashChange,
         payload.userId,
         order.device_id,
+        body.readerId || null,
+        body.readerLabel || null,
+        body.readerType || null,
       ]
     );
 
@@ -1474,7 +1507,8 @@ app.openapi(getOrderPaymentsRoute, async (c) => {
       return c.json({ error: 'Order not found' }, 404);
     }
 
-    const orderTotal = Math.round(parseFloat((orderResult[0] as any).total_amount) * 100);
+    const orgCurrency = await getOrgCurrency(payload.organizationId);
+    const orderTotal = toSmallestUnit(parseFloat((orderResult[0] as any).total_amount), orgCurrency);
 
     // Get payments
     const paymentRows = await query(

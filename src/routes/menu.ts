@@ -4,6 +4,7 @@ import { query, transaction } from '../db';
 import { logger } from '../utils/logger';
 import { socketService, SocketEvents } from '../services/socket';
 import { calculatePlatformFee, SubscriptionTier } from '../config/platform-fees';
+import { getOrgCurrency, toSmallestUnit, fromSmallestUnit } from '../utils/currency';
 import { randomBytes } from 'crypto';
 import { queueService, QueueName } from '../services/queue';
 import { getImageUrl } from '../services/images';
@@ -126,7 +127,7 @@ app.openapi(getPublicMenuRoute, async (c) => {
   try {
     // Get catalog with preorders enabled
     const catalogs = await query(
-      `SELECT c.*, o.name AS organization_name
+      `SELECT c.*, o.name AS organization_name, o.currency AS org_currency
        FROM catalogs c
        JOIN organizations o ON c.organization_id = o.id
        WHERE c.slug = $1 AND c.preorder_enabled = true AND c.is_active = true`,
@@ -182,6 +183,7 @@ app.openapi(getPublicMenuRoute, async (c) => {
       catalog: {
         ...formatPublicCatalog(catalog),
         canAcceptPayments,
+        currency: catalog.org_currency || 'usd',
         categories: categories.map(formatPublicCategory),
         products: products.map(formatPublicProduct),
       },
@@ -297,11 +299,12 @@ app.openapi(createPreorderRoute, async (c) => {
       }
     }
 
-    // Calculate totals (product.price is stored in cents, convert to dollars)
+    // Calculate totals (product.price is stored in smallest unit, convert to base unit)
+    const orgCurrencyForCalc = await getOrgCurrency(organizationId);
     let subtotal = 0;
     for (const item of body.items) {
       const product = productMap.get(item.catalogProductId);
-      subtotal += (parseFloat(product.price) / 100) * item.quantity;
+      subtotal += fromSmallestUnit(parseFloat(product.price), orgCurrencyForCalc) * item.quantity;
     }
 
     const taxRate = parseFloat(catalog.tax_rate) || 0;
@@ -330,8 +333,9 @@ app.openapi(createPreorderRoute, async (c) => {
     let platformFeeCents = 0;
 
     // Process payment for pay_now orders
+    const orgCurrency = await getOrgCurrency(organizationId);
     if (body.paymentType === 'pay_now' && totalAmount > 0) {
-      const totalCents = Math.round(totalAmount * 100);
+      const totalCents = toSmallestUnit(totalAmount, orgCurrency);
       platformFeeCents = calculatePlatformFee(totalCents, subTier);
 
       const stripeAccounts = await query(
@@ -357,7 +361,7 @@ app.openapi(createPreorderRoute, async (c) => {
       const paymentIntent = await stripe.paymentIntents.create(
         {
           amount: totalCents,
-          currency: 'usd',
+          currency: orgCurrency,
           payment_method: clonedPm.id,
           payment_method_types: ['card'],
           confirm: true,
@@ -421,7 +425,7 @@ app.openapi(createPreorderRoute, async (c) => {
         await client.query(
           `INSERT INTO preorder_items (preorder_id, catalog_product_id, product_id, name, unit_price, quantity, notes)
            VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-          [preorder.id, item.catalogProductId, product.product_id, product.name, parseFloat(product.price) / 100, item.quantity, item.notes || null]
+          [preorder.id, item.catalogProductId, product.product_id, product.name, fromSmallestUnit(parseFloat(product.price), orgCurrencyForCalc), item.quantity, item.notes || null]
         );
       }
 
@@ -496,6 +500,7 @@ app.openapi(createPreorderRoute, async (c) => {
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'preorder_confirmation',
       to: body.customerEmail,
+      currency: orgCurrencyForCalc,
       vendorBranding: {
         organizationName: catalog.org_name,
         brandingLogoUrl: getImageUrl(catalog.branding_logo_id),
@@ -509,7 +514,7 @@ app.openapi(createPreorderRoute, async (c) => {
         items: body.items.map((item: any) => ({
           name: productMap.get(item.catalogProductId).name,
           quantity: item.quantity,
-          unitPrice: parseFloat(productMap.get(item.catalogProductId).price) / 100,
+          unitPrice: fromSmallestUnit(parseFloat(productMap.get(item.catalogProductId).price), orgCurrencyForCalc),
         })),
         subtotal,
         taxAmount,
@@ -528,7 +533,7 @@ app.openapi(createPreorderRoute, async (c) => {
         items: body.items.map((item: any) => ({
           catalogProductId: item.catalogProductId,
           name: productMap.get(item.catalogProductId).name,
-          unitPrice: parseFloat(productMap.get(item.catalogProductId).price) / 100,
+          unitPrice: fromSmallestUnit(parseFloat(productMap.get(item.catalogProductId).price), orgCurrencyForCalc),
           quantity: item.quantity,
           notes: item.notes || null,
         })),
@@ -589,6 +594,9 @@ app.openapi(getPreorderStatusRoute, async (c) => {
 
     const preorder = preorders[0];
 
+    // Get org currency
+    const orgCurrency = await getOrgCurrency(preorder.organization_id);
+
     // Get items
     const items = await query(
       `SELECT * FROM preorder_items WHERE preorder_id = $1`,
@@ -598,6 +606,7 @@ app.openapi(getPreorderStatusRoute, async (c) => {
     return c.json({
       preorder: {
         ...formatPreorder(preorder),
+        currency: orgCurrency,
         catalogName: preorder.catalog_name,
         catalogLocation: preorder.catalog_location,
         pickupInstructions: preorder.pickup_instructions,

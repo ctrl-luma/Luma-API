@@ -1,6 +1,7 @@
 import { Resend } from 'resend';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
+import { formatCurrency, formatSmallestUnit } from '../../utils/currency';
 
 // Initialize Resend client
 const resend = config.email.resendApiKey ? new Resend(config.email.resendApiKey) : null;
@@ -90,16 +91,16 @@ export class EmailService {
   }
 
   // Helper methods for specific email types
-  async sendOrderConfirmation(to: string, orderData: any): Promise<void> {
+  async sendOrderConfirmation(to: string, orderData: any, currency: string = 'usd'): Promise<void> {
     const html = `
       <h1>Order Confirmation</h1>
       <p>Thank you for your order!</p>
       <p>Order ID: ${orderData.orderId}</p>
-      <p>Total: $${orderData.total.toFixed(2)}</p>
+      <p>Total: ${formatCurrency(orderData.total, currency)}</p>
       <p>Items:</p>
       <ul>
         ${orderData.items.map((item: any) => `
-          <li>${item.name} x ${item.quantity} - $${item.price.toFixed(2)}</li>
+          <li>${item.name} x ${item.quantity} - ${formatCurrency(item.price, currency)}</li>
         `).join('')}
       </ul>
     `;
@@ -108,7 +109,7 @@ export class EmailService {
       to,
       subject: `Order Confirmation - ${orderData.orderId}`,
       html,
-      text: `Order Confirmation\n\nThank you for your order!\nOrder ID: ${orderData.orderId}\nTotal: $${orderData.total.toFixed(2)}`,
+      text: `Order Confirmation\n\nThank you for your order!\nOrder ID: ${orderData.orderId}\nTotal: ${formatCurrency(orderData.total, currency)}`,
     });
   }
 
@@ -121,15 +122,15 @@ export class EmailService {
     date: Date;
     receiptUrl?: string;
     merchantName?: string;
-  }): Promise<void> {
-    const formattedAmount = (receiptData.amount / 100).toFixed(2);
+  }, currency: string = 'usd'): Promise<void> {
+    const formattedAmount = formatSmallestUnit(receiptData.amount, currency);
     const formattedRefundedAmount = receiptData.amountRefunded
-      ? (receiptData.amountRefunded / 100).toFixed(2)
+      ? formatSmallestUnit(receiptData.amountRefunded, currency)
       : null;
     const isFullyRefunded = receiptData.amountRefunded === receiptData.amount;
     const isPartiallyRefunded = receiptData.amountRefunded && receiptData.amountRefunded < receiptData.amount;
     const netAmount = receiptData.amountRefunded
-      ? ((receiptData.amount - receiptData.amountRefunded) / 100).toFixed(2)
+      ? formatSmallestUnit(receiptData.amount - receiptData.amountRefunded, currency)
       : null;
     const formattedDate = receiptData.date.toLocaleDateString('en-US', {
       year: 'numeric',
@@ -166,15 +167,15 @@ export class EmailService {
                   <td style="padding: 32px 24px 16px; text-align: center;">
                     ${isFullyRefunded ? `
                     <p style="margin: 0 0 8px; color: #6b7280; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px;">Amount Refunded</p>
-                    <p style="margin: 0; color: #111827; font-size: 48px; font-weight: 700;">$${formattedRefundedAmount}</p>
+                    <p style="margin: 0; color: #111827; font-size: 48px; font-weight: 700;">${formattedRefundedAmount}</p>
                     ` : isPartiallyRefunded ? `
                     <p style="margin: 0 0 8px; color: #6b7280; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px;">Original Amount</p>
-                    <p style="margin: 0; color: #111827; font-size: 48px; font-weight: 700;">$${formattedAmount}</p>
-                    <p style="margin: 12px 0 0; color: #dc2626; font-size: 18px; font-weight: 600;">Refunded: $${formattedRefundedAmount}</p>
-                    <p style="margin: 4px 0 0; color: #16a34a; font-size: 16px; font-weight: 500;">Net: $${netAmount}</p>
+                    <p style="margin: 0; color: #111827; font-size: 48px; font-weight: 700;">${formattedAmount}</p>
+                    <p style="margin: 12px 0 0; color: #dc2626; font-size: 18px; font-weight: 600;">Refunded: ${formattedRefundedAmount}</p>
+                    <p style="margin: 4px 0 0; color: #16a34a; font-size: 16px; font-weight: 500;">Net: ${netAmount}</p>
                     ` : `
                     <p style="margin: 0 0 8px; color: #6b7280; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px;">Amount Paid</p>
-                    <p style="margin: 0; color: #111827; font-size: 48px; font-weight: 700;">$${formattedAmount}</p>
+                    <p style="margin: 0; color: #111827; font-size: 48px; font-weight: 700;">${formattedAmount}</p>
                     `}
                   </td>
                 </tr>
@@ -257,13 +258,13 @@ export class EmailService {
     const subjectPrefix = isFullyRefunded ? 'Refund' : isPartiallyRefunded ? 'Updated' : 'Payment';
     const subject = receiptData.orderNumber
       ? `${subjectPrefix} Receipt for Order #${receiptData.orderNumber}`
-      : `${subjectPrefix} Receipt - $${isFullyRefunded ? formattedRefundedAmount : formattedAmount}`;
+      : `${subjectPrefix} Receipt - ${isFullyRefunded ? formattedRefundedAmount : formattedAmount}`;
 
     const textRefundInfo = isFullyRefunded
-      ? `Amount Refunded: $${formattedRefundedAmount}`
+      ? `Amount Refunded: ${formattedRefundedAmount}`
       : isPartiallyRefunded
-        ? `Original Amount: $${formattedAmount}\nRefunded: $${formattedRefundedAmount}\nNet: $${netAmount}`
-        : `Amount: $${formattedAmount}`;
+        ? `Original Amount: ${formattedAmount}\nRefunded: ${formattedRefundedAmount}\nNet: ${netAmount}`
+        : `Amount: ${formattedAmount}`;
 
     await this.sendEmail({
       to,
@@ -273,20 +274,20 @@ export class EmailService {
     });
   }
 
-  async sendPayoutConfirmation(to: string, payoutData: any): Promise<void> {
+  async sendPayoutConfirmation(to: string, payoutData: any, currency: string = 'usd'): Promise<void> {
     const html = `
       <h1>Payout Confirmation</h1>
       <p>Your payout has been processed!</p>
       <p>Payout ID: ${payoutData.payoutId}</p>
-      <p>Amount: $${payoutData.amount.toFixed(2)}</p>
+      <p>Amount: ${formatCurrency(payoutData.amount, currency)}</p>
       <p>Expected Arrival: ${payoutData.expectedArrival}</p>
     `;
 
     await this.sendEmail({
       to,
-      subject: `Payout Confirmation - $${payoutData.amount.toFixed(2)}`,
+      subject: `Payout Confirmation - ${formatCurrency(payoutData.amount, currency)}`,
       html,
-      text: `Payout Confirmation\n\nYour payout has been processed!\nPayout ID: ${payoutData.payoutId}\nAmount: $${payoutData.amount.toFixed(2)}\nExpected Arrival: ${payoutData.expectedArrival}`,
+      text: `Payout Confirmation\n\nYour payout has been processed!\nPayout ID: ${payoutData.payoutId}\nAmount: ${formatCurrency(payoutData.amount, currency)}\nExpected Arrival: ${payoutData.expectedArrival}`,
     });
   }
 

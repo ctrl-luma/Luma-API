@@ -26,6 +26,7 @@ export interface JobData {
     to: string;
     data: Record<string, any>;
     vendorBranding?: { organizationName: string; brandingLogoUrl: string | null };
+    currency?: string;
   };
   [QueueName.WEBHOOK_DELIVERY]: {
     url: string;

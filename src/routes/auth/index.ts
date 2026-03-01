@@ -169,8 +169,8 @@ app.openapi(loginRoute, async (c) => {
     const tokens = await authService.login(validated.email, validated.password, validated.source);
 
     // Fetch organization data
-    const orgRows = await query<{ id: string; name: string; settings: any }>(
-      'SELECT id, name, settings FROM organizations WHERE id = $1',
+    const orgRows = await query<{ id: string; name: string; settings: any; currency: string | null }>(
+      'SELECT id, name, settings, currency FROM organizations WHERE id = $1',
       [user.organization_id]
     );
     const org = orgRows[0];
@@ -299,6 +299,7 @@ app.openapi(loginRoute, async (c) => {
         weeklyReports: user.weekly_reports,
         avatarUrl: imageService.getUrl(user.avatar_image_id),
         onboardingCompleted: user.onboarding_completed ?? false,
+        currency: org?.currency || 'usd',
       },
       organization: org ? {
         id: org.id,
@@ -749,14 +750,17 @@ app.openapi(getCurrentUserRoute, async (c) => {
         : dbUser.created_at.toISOString(),
       // Include subscription info so frontend has it immediately
       subscription,
-      tapToPayDeviceIds: await (async () => {
-        const orgResult = await query<{ tap_to_pay_device_ids: string[] | null }>(
-          'SELECT tap_to_pay_device_ids FROM organizations WHERE id = $1',
+      ...await (async () => {
+        const orgResult = await query<{ tap_to_pay_device_ids: string[] | null; currency: string }>(
+          'SELECT tap_to_pay_device_ids, currency FROM organizations WHERE id = $1',
           [dbUser.organization_id]
         );
-        return orgResult.length > 0 && Array.isArray(orgResult[0].tap_to_pay_device_ids)
-          ? orgResult[0].tap_to_pay_device_ids
-          : [];
+        return {
+          tapToPayDeviceIds: orgResult.length > 0 && Array.isArray(orgResult[0].tap_to_pay_device_ids)
+            ? orgResult[0].tap_to_pay_device_ids
+            : [],
+          currency: orgResult[0]?.currency || 'usd',
+        };
       })(),
     });
   } catch (error: any) {

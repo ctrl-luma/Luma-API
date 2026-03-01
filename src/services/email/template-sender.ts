@@ -3,6 +3,7 @@ import { join } from 'path';
 import { emailService } from './index';
 import { logger } from '../../utils/logger';
 import { config } from '../../config';
+import { formatCurrency, formatSmallestUnit } from '../../utils/currency';
 
 // Vendor branding for customer-facing emails
 export interface VendorBranding {
@@ -270,10 +271,10 @@ If you didn't request this password reset, please ignore this email or contact s
   });
 }
 
-export async function sendOrderConfirmationEmail(to: string, orderData: any, vendorBranding?: VendorBranding): Promise<void> {
+export async function sendOrderConfirmationEmail(to: string, orderData: any, vendorBranding?: VendorBranding, currency: string = 'usd'): Promise<void> {
   // Format items as a simple list
   const itemsList = orderData.items.map((item: any) =>
-    `${item.name} - ${item.quantity} × $${item.price.toFixed(2)}`
+    `${item.name} - ${item.quantity} × ${formatCurrency(item.price, currency)}`
   ).join('<br>');
 
   const emailContent = `Thank you for your order at ${orderData.eventName}!<br><br>
@@ -281,7 +282,7 @@ export async function sendOrderConfirmationEmail(to: string, orderData: any, ven
 <strong>Date:</strong> ${new Date(orderData.date).toLocaleString()}<br><br>
 <strong>Items:</strong><br>
 ${itemsList}<br><br>
-<strong>Total:</strong> $${orderData.total.toFixed(2)}<br>
+<strong>Total:</strong> ${formatCurrency(orderData.total, currency)}<br>
 <strong>Payment Method:</strong> ${orderData.paymentMethod}`;
 
   const vars = {
@@ -298,13 +299,13 @@ ${itemsList}<br><br>
   }
 }
 
-export async function sendReceiptEmail(to: string, receiptData: any, vendorBranding?: VendorBranding): Promise<void> {
+export async function sendReceiptEmail(to: string, receiptData: any, vendorBranding?: VendorBranding, currency: string = 'usd'): Promise<void> {
   // Format items as a simple list
   const itemsList = receiptData.items.map((item: any) =>
-    `${item.quantity} ${item.name} - $${item.subtotal.toFixed(2)}`
+    `${item.quantity} ${item.name} - ${formatCurrency(item.subtotal, currency)}`
   ).join('<br>');
 
-  const tipLine = receiptData.tip ? `<br>Tip: $${receiptData.tip.toFixed(2)}` : '';
+  const tipLine = receiptData.tip ? `<br>Tip: ${formatCurrency(receiptData.tip, currency)}` : '';
 
   const emailContent = `<strong>${receiptData.businessName}</strong><br>
 ${receiptData.eventName}<br><br>
@@ -313,9 +314,9 @@ ${receiptData.eventName}<br><br>
 <strong>Cashier:</strong> ${receiptData.cashierName}<br><br>
 <strong>Items:</strong><br>
 ${itemsList}<br><br>
-Subtotal: $${receiptData.subtotal.toFixed(2)}<br>
-Tax: $${receiptData.tax.toFixed(2)}${tipLine}<br>
-<strong>TOTAL: $${receiptData.total.toFixed(2)}</strong><br><br>
+Subtotal: ${formatCurrency(receiptData.subtotal, currency)}<br>
+Tax: ${formatCurrency(receiptData.tax, currency)}${tipLine}<br>
+<strong>TOTAL: ${formatCurrency(receiptData.total, currency)}</strong><br><br>
 Payment: ${receiptData.paymentMethod} ${receiptData.last4 ? `****${receiptData.last4}` : ''}<br><br>
 Thank you for your purchase!`;
 
@@ -333,9 +334,9 @@ Thank you for your purchase!`;
   }
 }
 
-export async function sendPayoutEmail(to: string, payoutData: any): Promise<void> {
+export async function sendPayoutEmail(to: string, payoutData: any, currency: string = 'usd'): Promise<void> {
   const emailContent = `Great news! Your payout has been processed.<br><br>
-<strong>Payout Amount:</strong> $${payoutData.amount.toFixed(2)}<br>
+<strong>Payout Amount:</strong> ${formatCurrency(payoutData.amount, currency)}<br>
 <strong>Payout ID:</strong> ${payoutData.payoutId}<br>
 <strong>Processing Date:</strong> ${new Date(payoutData.date).toLocaleDateString()}<br>
 <strong>Expected Arrival:</strong> ${payoutData.expectedArrival}<br>
@@ -344,7 +345,7 @@ The funds should arrive in your bank account by ${payoutData.expectedArrival}. P
 You can view all your payouts and transaction history in your dashboard.`;
 
   await sendTemplatedEmail(to, {
-    subject: `Payout Processed - $${payoutData.amount.toFixed(2)}`,
+    subject: `Payout Processed - ${formatCurrency(payoutData.amount, currency)}`,
     preheader_text: 'Your payout has been processed',
     email_title: 'Payout Confirmation',
     email_content: emailContent,
@@ -388,7 +389,7 @@ export async function sendTicketConfirmationEmail(to: string, ticketData: {
   tickets: { id: string; qrCode: string }[];
   eventSlug: string;
   apiUrl: string;
-}, vendorBranding?: VendorBranding): Promise<void> {
+}, vendorBranding?: VendorBranding, currency: string = 'usd'): Promise<void> {
   const ticketRows = ticketData.tickets.map((t, i) => `
     <div style="border: 1px solid #374151; border-radius: 12px; padding: 16px; margin-bottom: 12px; text-align: center;">
       <img src="${ticketData.apiUrl}/tickets/${t.id}/qr.png" alt="QR Code" width="180" height="180" style="display: block; margin: 0 auto 12px;" />
@@ -414,7 +415,7 @@ Your ticket${ticketData.quantity > 1 ? 's are' : ' is'} confirmed for <strong>${
 <strong>Date:</strong> ${ticketData.eventDate}<br>
 <strong>Time:</strong> ${ticketData.eventTime}${locationLine}<br>
 <strong>Ticket:</strong> ${ticketData.tierName} × ${ticketData.quantity}<br>
-<strong>Total:</strong> ${ticketData.totalAmount === 0 ? 'Free' : `$${ticketData.totalAmount.toFixed(2)}`}<br><br>
+<strong>Total:</strong> ${ticketData.totalAmount === 0 ? 'Free' : formatCurrency(ticketData.totalAmount, currency)}<br><br>
 Show the QR code${ticketData.quantity > 1 ? 's' : ''} below at the door:<br><br>
 ${ticketRows}`;
 
@@ -460,7 +461,7 @@ export async function sendTicketRefundEmail(to: string, refundData: {
   refundAmount: number;
   isFullRefund: boolean;
   reason?: string;
-}, vendorBranding?: VendorBranding): Promise<void> {
+}, vendorBranding?: VendorBranding, currency: string = 'usd'): Promise<void> {
   const reasonLine = refundData.reason
     ? `<br><strong>Reason:</strong> ${refundData.reason}`
     : '';
@@ -473,13 +474,13 @@ ${refundData.isFullRefund
 <strong>Event:</strong> ${refundData.eventName}<br>
 <strong>Date:</strong> ${refundData.eventDate}<br>
 <strong>Ticket:</strong> ${refundData.tierName}<br>
-<strong>Refund Amount:</strong> $${refundData.refundAmount.toFixed(2)}${reasonLine}<br><br>
+<strong>Refund Amount:</strong> ${formatCurrency(refundData.refundAmount, currency)}${reasonLine}<br><br>
 The refund will be credited back to your original payment method within 5-10 business days, depending on your bank.<br><br>
 If you have any questions, please contact the event organizer.`;
 
   const vars = {
     subject: `Refund Processed - ${refundData.eventName}`,
-    preheader_text: `Your $${refundData.refundAmount.toFixed(2)} refund has been processed`,
+    preheader_text: `Your ${formatCurrency(refundData.refundAmount, currency)} refund has been processed`,
     email_title: 'Refund Processed',
     email_content: emailContent,
   };
@@ -592,13 +593,13 @@ export async function sendPreorderConfirmationEmail(to: string, preorderData: {
   estimatedReadyAt: string | null;
   pickupInstructions: string | null;
   trackingUrl: string;
-}, vendorBranding?: VendorBranding): Promise<void> {
+}, vendorBranding?: VendorBranding, currency: string = 'usd'): Promise<void> {
   const itemsList = preorderData.items.map(item =>
-    `${item.quantity} × ${item.name} — $${item.unitPrice.toFixed(2)}`
+    `${item.quantity} × ${item.name} — ${formatCurrency(item.unitPrice, currency)}`
   ).join('<br>');
 
   const tipLine = preorderData.tipAmount > 0
-    ? `<br>Tip: $${preorderData.tipAmount.toFixed(2)}`
+    ? `<br>Tip: ${formatCurrency(preorderData.tipAmount, currency)}`
     : '';
 
   const paymentStatusLine = preorderData.paymentType === 'pay_now'
@@ -619,9 +620,9 @@ Your pre-order has been received! Here are your order details:<br><br>
 <strong>Menu:</strong> ${preorderData.catalogName}${estimatedTime}<br><br>
 <strong>Items:</strong><br>
 ${itemsList}<br><br>
-Subtotal: $${preorderData.subtotal.toFixed(2)}<br>
-Tax: $${preorderData.taxAmount.toFixed(2)}${tipLine}<br>
-<strong>Total: $${preorderData.totalAmount.toFixed(2)}</strong>${paymentStatusLine}${pickupInfo}<br><br>
+Subtotal: ${formatCurrency(preorderData.subtotal, currency)}<br>
+Tax: ${formatCurrency(preorderData.taxAmount, currency)}${tipLine}<br>
+<strong>Total: ${formatCurrency(preorderData.totalAmount, currency)}</strong>${paymentStatusLine}${pickupInfo}<br><br>
 Track your order status in real-time using the button below. We'll also email you when your order is ready!`;
 
   const vars = {
@@ -649,9 +650,9 @@ export async function sendPreorderReadyEmail(to: string, preorderData: {
   paymentType: 'pay_now' | 'pay_at_pickup';
   pickupInstructions: string | null;
   trackingUrl: string;
-}, vendorBranding?: VendorBranding): Promise<void> {
+}, vendorBranding?: VendorBranding, currency: string = 'usd'): Promise<void> {
   const paymentReminder = preorderData.paymentType === 'pay_at_pickup'
-    ? `<br><br><strong>Payment:</strong> $${preorderData.totalAmount.toFixed(2)} due at pickup`
+    ? `<br><br><strong>Payment:</strong> ${formatCurrency(preorderData.totalAmount, currency)} due at pickup`
     : '';
 
   const pickupInfo = preorderData.pickupInstructions
@@ -694,13 +695,13 @@ export async function sendInvoiceEmail(to: string, invoiceData: {
   hostedUrl: string;
   pdfUrl: string | null;
   isReminder?: boolean;
-}, vendorBranding?: VendorBranding): Promise<void> {
+}, vendorBranding?: VendorBranding, currency: string = 'usd'): Promise<void> {
   const itemsList = invoiceData.items.map(item =>
-    `${item.description} — ${item.quantity} × $${item.unitPrice.toFixed(2)} = $${item.amount.toFixed(2)}`
+    `${item.description} — ${item.quantity} × ${formatCurrency(item.unitPrice, currency)} = ${formatCurrency(item.amount, currency)}`
   ).join('<br>');
 
   const taxLine = invoiceData.taxAmount > 0
-    ? `<br>Tax: $${invoiceData.taxAmount.toFixed(2)}`
+    ? `<br>Tax: ${formatCurrency(invoiceData.taxAmount, currency)}`
     : '';
 
   const dueDateLine = invoiceData.dueDate
@@ -722,8 +723,8 @@ ${introLine}<br><br>
 <strong>Invoice #:</strong> ${invoiceData.invoiceNumber}${dueDateLine}<br><br>
 <strong>Items:</strong><br>
 ${itemsList}<br><br>
-Subtotal: $${invoiceData.subtotal.toFixed(2)}${taxLine}<br>
-<strong>Total Due: $${invoiceData.totalAmount.toFixed(2)}</strong>${memoLine}<br><br>
+Subtotal: ${formatCurrency(invoiceData.subtotal, currency)}${taxLine}<br>
+<strong>Total Due: ${formatCurrency(invoiceData.totalAmount, currency)}</strong>${memoLine}<br><br>
 Click the button below to view and pay your invoice securely.`;
 
   const vars = {
@@ -731,8 +732,8 @@ Click the button below to view and pay your invoice securely.`;
       ? `Reminder: Invoice ${invoiceData.invoiceNumber} from ${invoiceData.organizationName}`
       : `Invoice ${invoiceData.invoiceNumber} from ${invoiceData.organizationName}`,
     preheader_text: isReminder
-      ? `Reminder: You have a $${invoiceData.totalAmount.toFixed(2)} invoice from ${invoiceData.organizationName}`
-      : `You have a $${invoiceData.totalAmount.toFixed(2)} invoice from ${invoiceData.organizationName}`,
+      ? `Reminder: You have a ${formatCurrency(invoiceData.totalAmount, currency)} invoice from ${invoiceData.organizationName}`
+      : `You have a ${formatCurrency(invoiceData.totalAmount, currency)} invoice from ${invoiceData.organizationName}`,
     email_title: isReminder ? 'Payment Reminder' : 'Invoice',
     email_content: emailContent,
     cta_url: invoiceData.hostedUrl,
@@ -752,18 +753,18 @@ export async function sendInvoicePaidEmail(to: string, invoiceData: {
   organizationName: string;
   totalAmount: number;
   pdfUrl: string | null;
-}, vendorBranding?: VendorBranding): Promise<void> {
+}, vendorBranding?: VendorBranding, currency: string = 'usd'): Promise<void> {
   const pdfLine = invoiceData.pdfUrl
     ? `<br><br><a href="${invoiceData.pdfUrl}" style="color: #60A5FA; text-decoration: underline;">Download PDF Receipt</a>`
     : '';
 
   const emailContent = `Hi ${invoiceData.customerName},<br><br>
-Thank you! Your payment of <strong>$${invoiceData.totalAmount.toFixed(2)}</strong> for invoice <strong>${invoiceData.invoiceNumber}</strong> from <strong>${invoiceData.organizationName}</strong> has been received.<br><br>
+Thank you! Your payment of <strong>${formatCurrency(invoiceData.totalAmount, currency)}</strong> for invoice <strong>${invoiceData.invoiceNumber}</strong> from <strong>${invoiceData.organizationName}</strong> has been received.<br><br>
 No further action is needed.${pdfLine}`;
 
   const vars = {
     subject: `Payment Received - Invoice ${invoiceData.invoiceNumber}`,
-    preheader_text: `Your payment of $${invoiceData.totalAmount.toFixed(2)} has been received`,
+    preheader_text: `Your payment of ${formatCurrency(invoiceData.totalAmount, currency)} has been received`,
     email_title: 'Payment Received',
     email_content: emailContent,
   };
@@ -781,9 +782,9 @@ export async function sendInvoicePaymentFailedEmail(to: string, invoiceData: {
   organizationName: string;
   totalAmount: number;
   hostedUrl: string;
-}, vendorBranding?: VendorBranding): Promise<void> {
+}, vendorBranding?: VendorBranding, currency: string = 'usd'): Promise<void> {
   const emailContent = `Hi ${invoiceData.customerName},<br><br>
-We were unable to process your payment of <strong>$${invoiceData.totalAmount.toFixed(2)}</strong> for invoice <strong>${invoiceData.invoiceNumber}</strong> from <strong>${invoiceData.organizationName}</strong>.<br><br>
+We were unable to process your payment of <strong>${formatCurrency(invoiceData.totalAmount, currency)}</strong> for invoice <strong>${invoiceData.invoiceNumber}</strong> from <strong>${invoiceData.organizationName}</strong>.<br><br>
 Please try again using the button below. If you continue to experience issues, contact the vendor directly.`;
 
   const vars = {
@@ -809,15 +810,15 @@ export async function sendInvoiceRefundedEmail(to: string, invoiceData: {
   refundAmount: number;
   totalAmount: number;
   isFullRefund: boolean;
-}, vendorBranding?: VendorBranding): Promise<void> {
+}, vendorBranding?: VendorBranding, currency: string = 'usd'): Promise<void> {
   const refundType = invoiceData.isFullRefund ? 'full' : 'partial';
   const emailContent = `Hi ${invoiceData.customerName},<br><br>
-A ${refundType} refund of <strong>$${invoiceData.refundAmount.toFixed(2)}</strong> has been issued for invoice <strong>${invoiceData.invoiceNumber}</strong> from <strong>${invoiceData.organizationName}</strong>.<br><br>
+A ${refundType} refund of <strong>${formatCurrency(invoiceData.refundAmount, currency)}</strong> has been issued for invoice <strong>${invoiceData.invoiceNumber}</strong> from <strong>${invoiceData.organizationName}</strong>.<br><br>
 The refund will be returned to your original payment method. Please allow 5-10 business days for the refund to appear on your statement.`;
 
   const vars = {
     subject: `Refund Issued - Invoice ${invoiceData.invoiceNumber}`,
-    preheader_text: `A refund of $${invoiceData.refundAmount.toFixed(2)} has been issued`,
+    preheader_text: `A refund of ${formatCurrency(invoiceData.refundAmount, currency)} has been issued`,
     email_title: 'Refund Issued',
     email_content: emailContent,
   };
@@ -838,7 +839,7 @@ export async function sendPreorderCancelledEmail(to: string, preorderData: {
   paymentType: 'pay_now' | 'pay_at_pickup';
   refundIssued: boolean;
   cancellationReason?: string;
-}, vendorBranding?: VendorBranding): Promise<void> {
+}, vendorBranding?: VendorBranding, currency: string = 'usd'): Promise<void> {
   const reasonLine = preorderData.cancellationReason
     ? `<br><strong>Reason:</strong> ${preorderData.cancellationReason}`
     : '';
@@ -846,7 +847,7 @@ export async function sendPreorderCancelledEmail(to: string, preorderData: {
   const isRefund = preorderData.refundIssued;
 
   const refundInfo = isRefund
-    ? `<br><br>A refund of <strong>$${preorderData.totalAmount.toFixed(2)}</strong> has been issued to your original payment method. Please allow 5-10 business days for the refund to appear on your statement.`
+    ? `<br><br>A refund of <strong>${formatCurrency(preorderData.totalAmount, currency)}</strong> has been issued to your original payment method. Please allow 5-10 business days for the refund to appear on your statement.`
     : '';
 
   const titleText = isRefund ? 'Order Refunded' : 'Order Cancelled';
@@ -884,7 +885,7 @@ export async function sendDisputeCreatedEmail(to: string, disputeData: {
   stripeDashboardUrl: string;
   evidenceDueBy: string | null;
 }): Promise<void> {
-  const amountFormatted = `$${(disputeData.amount / 100).toFixed(2)}`;
+  const amountFormatted = formatSmallestUnit(disputeData.amount, disputeData.currency);
   const reasonFormatted = disputeData.reason.replace(/_/g, ' ');
   const deadlineLine = disputeData.evidenceDueBy
     ? `<br><strong>Evidence Deadline:</strong> ${new Date(disputeData.evidenceDueBy).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })}`

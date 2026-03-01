@@ -10,6 +10,7 @@ import { emailService } from '../../services/email';
 import { queueService, QueueName } from '../../services/queue';
 import { getImageUrl } from '../../services/images';
 import { cacheService } from '../../services/redis/cache';
+import { getOrgCurrency, formatCurrency as formatCurrencyUtil, fromSmallestUnit, toSmallestUnit } from '../../utils/currency';
 import Stripe from 'stripe';
 
 const app = new OpenAPIHono();
@@ -184,14 +185,15 @@ async function syncAccountFromStripe(account: Stripe.Account, organizationId: st
       queryParams
     );
 
-    // Also update the organization's stripe fields for backward compatibility
+    // Also update the organization's stripe fields and currency for backward compatibility
     await client.query(
       `UPDATE organizations SET
         stripe_account_id = $1,
         stripe_onboarding_completed = $2,
+        currency = COALESCE(NULLIF($4, ''), currency),
         updated_at = NOW()
       WHERE id = $3`,
-      [account.id, isComplete, organizationId]
+      [account.id, isComplete, organizationId, account.default_currency || null]
     );
   });
 
@@ -229,6 +231,8 @@ const getConnectStatusRoute = createRoute({
             payoutStatus: z.string().nullable(),
             payoutFailureCode: z.string().nullable(),
             payoutFailureMessage: z.string().nullable(),
+            defaultCurrency: z.string().optional(),
+            country: z.string().optional(),
           }),
         },
       },
@@ -275,6 +279,8 @@ app.openapi(getConnectStatusRoute, async (c) => {
         payoutStatus: null,
         payoutFailureCode: null,
         payoutFailureMessage: null,
+        defaultCurrency: 'usd',
+        country: 'US',
       });
     }
 
@@ -324,6 +330,8 @@ app.openapi(getConnectStatusRoute, async (c) => {
             payoutStatus: updated.payout_status,
             payoutFailureCode: updated.payout_failure_code,
             payoutFailureMessage: updated.payout_failure_message,
+            defaultCurrency: updated.default_currency || 'usd',
+            country: updated.country || 'US',
           });
         }
       } catch (error) {
@@ -348,6 +356,8 @@ app.openapi(getConnectStatusRoute, async (c) => {
       payoutStatus: connectedAccount.payout_status,
       payoutFailureCode: connectedAccount.payout_failure_code,
       payoutFailureMessage: connectedAccount.payout_failure_message,
+      defaultCurrency: connectedAccount.default_currency || 'usd',
+      country: connectedAccount.country || 'US',
     });
   } catch (error) {
     logger.error('Error getting connect status', { error });
@@ -734,10 +744,10 @@ app.openapi(getBalanceRoute, async (c) => {
     // Get balance from Stripe
     const balance = await stripeService.getConnectedAccountBalance(connectedAccount.stripe_account_id);
 
-    // Convert amounts from cents to dollars
+    // Convert amounts from smallest unit to base unit
     const formatBalance = (balanceItems: Array<{ amount: number; currency: string }>) =>
       balanceItems.map((item) => ({
-        amount: item.amount / 100,
+        amount: fromSmallestUnit(item.amount, item.currency || 'usd'),
         currency: item.currency,
       }));
 
@@ -864,7 +874,7 @@ app.openapi(listPayoutsRoute, async (c) => {
 
       return {
         id: payout.id,
-        amount: payout.amount / 100, // Convert from cents
+        amount: fromSmallestUnit(payout.amount, payout.currency || 'usd'),
         currency: payout.currency,
         status: payout.status,
         method: payout.method || 'standard',
@@ -976,9 +986,10 @@ app.openapi(createPayoutRoute, async (c) => {
     const body = await c.req.json();
 
     // Get current balance to validate
+    const orgCurrency = connectedAccount.default_currency || await getOrgCurrency(payload.organizationId);
     const balance = await stripeService.getConnectedAccountBalance(connectedAccount.stripe_account_id);
-    const availableUSD = balance.available.find((b) => b.currency === 'usd');
-    const availableAmount = availableUSD ? availableUSD.amount / 100 : 0;
+    const availableBal = balance.available.find((b) => b.currency === orgCurrency) || balance.available[0];
+    const availableAmount = availableBal ? fromSmallestUnit(availableBal.amount, orgCurrency) : 0;
 
     // Determine payout amount
     let payoutAmount = body.amount || availableAmount;
@@ -989,18 +1000,18 @@ app.openapi(createPayoutRoute, async (c) => {
 
     if (payoutAmount > availableAmount) {
       return c.json({
-        error: `Insufficient balance. Available: $${availableAmount.toFixed(2)}, Requested: $${payoutAmount.toFixed(2)}`
+        error: `Insufficient balance. Available: ${formatCurrencyUtil(availableAmount, orgCurrency)}, Requested: ${formatCurrencyUtil(payoutAmount, orgCurrency)}`
       }, 400);
     }
 
     // For instant payouts, check if instant balance is available
     if (body.method === 'instant') {
-      const instantAvailable = balance.instant_available?.find((b) => b.currency === 'usd');
-      const instantAmount = instantAvailable ? instantAvailable.amount / 100 : 0;
+      const instantAvailable = balance.instant_available?.find((b) => b.currency === orgCurrency) || balance.instant_available?.[0];
+      const instantAmount = instantAvailable ? fromSmallestUnit(instantAvailable.amount, orgCurrency) : 0;
 
       if (payoutAmount > instantAmount) {
         return c.json({
-          error: `Insufficient instant payout balance. Available for instant: $${instantAmount.toFixed(2)}`
+          error: `Insufficient instant payout balance. Available for instant: ${formatCurrencyUtil(instantAmount, orgCurrency)}`
         }, 400);
       }
     }
@@ -1010,7 +1021,7 @@ app.openapi(createPayoutRoute, async (c) => {
       connectedAccount.stripe_account_id,
       {
         amount: payoutAmount,
-        currency: 'usd',
+        currency: orgCurrency,
         method: body.method || 'standard',
         description: body.description || `Manual payout - ${new Date().toLocaleDateString()}`,
         metadata: {
@@ -1049,7 +1060,7 @@ app.openapi(createPayoutRoute, async (c) => {
 
     return c.json({
       id: payout.id,
-      amount: payout.amount / 100,
+      amount: fromSmallestUnit(payout.amount, payout.currency || 'usd'),
       currency: payout.currency,
       status: payout.status,
       method: payout.method || 'standard',
@@ -1480,11 +1491,12 @@ app.openapi(listTransactionsRoute, async (c) => {
     ]);
 
     // Format response: merge DB data with Stripe charge details
+    const txCurrency = connectedAccount?.default_currency || 'usd';
     const formattedTransactions = orders.map((order) => {
       const charge = order.stripe_charge_id
         ? chargeMap.get(order.stripe_charge_id) || null
         : (order.source_type === 'order' ? orderChargeMap.get(order.id) || null : null);
-      const totalAmount = Math.round(parseFloat(order.total_amount) * 100);
+      const totalAmount = toSmallestUnit(parseFloat(order.total_amount), txCurrency);
 
       // Determine status based on source type
       let status: 'succeeded' | 'pending' | 'failed' | 'refunded' | 'partially_refunded' | 'cancelled' = 'succeeded';
@@ -1549,7 +1561,7 @@ app.openapi(listTransactionsRoute, async (c) => {
         id: order.id,
         amount: totalAmount,
         amountRefunded: charge?.amount_refunded || 0,
-        currency: charge?.currency || 'usd',
+        currency: charge?.currency || connectedAccount?.default_currency || 'usd',
         status,
         description: charge?.description || null,
         customerEmail: order.customer_email || charge?.billing_details?.email || charge?.receipt_email || null,
@@ -1690,6 +1702,7 @@ app.openapi(getTransactionRoute, async (c) => {
     }
 
     const connectedAccount = accountRows[0];
+    const detailCurrency = connectedAccount.default_currency || 'usd';
 
     // Look up order by ID (transaction IDs are now order IDs)
     const orderRows = await query<{
@@ -1794,8 +1807,8 @@ app.openapi(getTransactionRoute, async (c) => {
 
           // Format invoice as transaction detail
           const invoice = invoiceRows[0];
-          const invoiceAmount = Math.round(parseFloat(invoice.total_amount) * 100);
-          const invoiceTax = Math.round(parseFloat(invoice.tax_amount || '0') * 100);
+          const invoiceAmount = toSmallestUnit(parseFloat(invoice.total_amount), detailCurrency);
+          const invoiceTax = toSmallestUnit(parseFloat(invoice.tax_amount || '0'), detailCurrency);
 
           let invoiceCharge: Stripe.Charge | null = null;
           if (invoice.stripe_charge_id) {
@@ -1843,14 +1856,14 @@ app.openapi(getTransactionRoute, async (c) => {
             productId: item.product_id,
             name: item.description,
             quantity: item.quantity,
-            unitPrice: Math.round(parseFloat(item.unit_price) * 100),
+            unitPrice: toSmallestUnit(parseFloat(item.unit_price), detailCurrency),
           }));
 
           return c.json({
             id: invoice.id,
             amount: invoiceAmount,
             amountRefunded: invoiceCharge?.amount_refunded || 0,
-            currency: invoiceCharge?.currency || 'usd',
+            currency: invoiceCharge?.currency || connectedAccount?.default_currency || 'usd',
             status: invoice.status === 'paid' ? 'succeeded' : invoice.status,
             description: `Invoice #${invoice.invoice_number}`,
             customerEmail: invoice.customer_email || null,
@@ -1875,7 +1888,7 @@ app.openapi(getTransactionRoute, async (c) => {
 
         // Format ticket as transaction detail
         const ticket = ticketRows[0];
-        const ticketAmount = Math.round(parseFloat(ticket.amount_paid) * 100);
+        const ticketAmount = toSmallestUnit(parseFloat(ticket.amount_paid), detailCurrency);
         let ticketStatus: string = 'succeeded';
         if (ticket.status === 'refunded') ticketStatus = 'refunded';
 
@@ -1901,7 +1914,7 @@ app.openapi(getTransactionRoute, async (c) => {
           id: ticket.id,
           amount: ticketAmount,
           amountRefunded: ticketCharge?.amount_refunded || 0,
-          currency: ticketCharge?.currency || 'usd',
+          currency: ticketCharge?.currency || connectedAccount?.default_currency || 'usd',
           status: ticketStatus,
           description: `${ticket.event_name} — ${ticket.tier_name}`,
           customerEmail: ticket.customer_email || null,
@@ -1922,9 +1935,9 @@ app.openapi(getTransactionRoute, async (c) => {
 
       // Format preorder as transaction detail
       const preorder = preorderRows[0];
-      const preorderTotal = Math.round(parseFloat(preorder.total_amount) * 100);
-      const preorderTip = Math.round(parseFloat(preorder.tip_amount || '0') * 100);
-      const preorderTax = Math.round(parseFloat(preorder.tax_amount || '0') * 100);
+      const preorderTotal = toSmallestUnit(parseFloat(preorder.total_amount), detailCurrency);
+      const preorderTip = toSmallestUnit(parseFloat(preorder.tip_amount || '0'), detailCurrency);
+      const preorderTax = toSmallestUnit(parseFloat(preorder.tax_amount || '0'), detailCurrency);
 
       let preorderStatus: string = 'succeeded';
       if (preorder.status === 'picked_up') preorderStatus = 'succeeded';
@@ -1975,7 +1988,7 @@ app.openapi(getTransactionRoute, async (c) => {
         productId: item.product_id,
         name: item.name,
         quantity: item.quantity,
-        unitPrice: Math.round(parseFloat(item.unit_price) * 100),
+        unitPrice: toSmallestUnit(parseFloat(item.unit_price), detailCurrency),
       }));
 
       // Catalog name
@@ -1999,7 +2012,7 @@ app.openapi(getTransactionRoute, async (c) => {
         id: preorder.id,
         amount: preorderTotal,
         amountRefunded: preorderCharge?.amount_refunded || 0,
-        currency: preorderCharge?.currency || 'usd',
+        currency: preorderCharge?.currency || connectedAccount?.default_currency || 'usd',
         status: preorderStatus,
         description: `Preorder #${preorder.order_number}${preorder.daily_number ? ` (#${preorder.daily_number})` : ''}`,
         customerEmail: preorder.customer_email || null,
@@ -2024,7 +2037,7 @@ app.openapi(getTransactionRoute, async (c) => {
     }
 
     const order = orderRows[0];
-    const totalAmount = Math.round(parseFloat(order.total_amount) * 100);
+    const totalAmount = toSmallestUnit(parseFloat(order.total_amount), detailCurrency);
     const orderMetadata = typeof order.metadata === 'string' ? JSON.parse(order.metadata) : (order.metadata || {});
 
     // Fetch Stripe charge — from order directly, or from order_payments for split payments
@@ -2159,7 +2172,7 @@ app.openapi(getTransactionRoute, async (c) => {
           productId: item.product_id,
           name: item.name,
           quantity: item.quantity,
-          unitPrice: Math.round(parseFloat(item.unit_price) * 100),
+          unitPrice: toSmallestUnit(parseFloat(item.unit_price), detailCurrency),
         }))
       : undefined;
 
@@ -2206,14 +2219,14 @@ app.openapi(getTransactionRoute, async (c) => {
       : undefined;
 
     const isQuickCharge = orderMetadata?.isQuickCharge || false;
-    const tipAmount = Math.round(parseFloat(order.tip_amount || '0') * 100);
-    const taxAmount = Math.round(parseFloat(order.tax_amount || '0') * 100);
+    const tipAmount = toSmallestUnit(parseFloat(order.tip_amount || '0'), detailCurrency);
+    const taxAmount = toSmallestUnit(parseFloat(order.tax_amount || '0'), detailCurrency);
 
     return c.json({
       id: order.id,
       amount: totalAmount,
       amountRefunded: charge?.amount_refunded || 0,
-      currency: charge?.currency || 'usd',
+      currency: charge?.currency || connectedAccount?.default_currency || 'usd',
       status,
       description: charge?.description || null,
       customerEmail: order.customer_email || charge?.billing_details?.email || charge?.receipt_email || null,
@@ -2381,15 +2394,16 @@ app.openapi(refundTransactionRoute, async (c) => {
         }
 
         const amountPaid = parseFloat(ticket.amount_paid);
-        const refundAmountDollars = body.amount ? body.amount / 100 : amountPaid;
+        const ticketCurrency = await getOrgCurrency(payload.organizationId);
+        const refundAmountDollars = body.amount ? fromSmallestUnit(body.amount, ticketCurrency) : amountPaid;
 
         if (refundAmountDollars > amountPaid) {
-          return c.json({ error: `Refund amount cannot exceed amount paid ($${amountPaid.toFixed(2)})` }, 400);
+          return c.json({ error: `Refund amount cannot exceed amount paid (${formatCurrencyUtil(amountPaid, ticketCurrency)})` }, 400);
         }
 
         // Stripe refund if charge exists
         let stripeRefundId: string | null = null;
-        let refundAmountCents = Math.round(refundAmountDollars * 100);
+        let refundAmountCents = toSmallestUnit(refundAmountDollars, ticketCurrency);
 
         if (ticket.stripe_charge_id) {
           const refund = await stripeService.createConnectedAccountRefund(
@@ -2432,7 +2446,7 @@ app.openapi(refundTransactionRoute, async (c) => {
         socketService.emitToOrganization(payload.organizationId, SocketEvents.TICKET_REFUNDED, {
           eventId: ticket.event_id,
           ticketId: ticket.id,
-          refundAmount: refundAmountCents / 100,
+          refundAmount: fromSmallestUnit(refundAmountCents, ticketCurrency),
           isFullRefund,
           timestamp: new Date().toISOString(),
         });
@@ -2443,6 +2457,7 @@ app.openapi(refundTransactionRoute, async (c) => {
         await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
           type: 'ticket_refund',
           to: ticket.customer_email,
+          currency: ticketCurrency,
           vendorBranding,
           data: {
             customerName: ticket.customer_name || ticket.customer_email,
@@ -2529,9 +2544,11 @@ app.openapi(refundTransactionRoute, async (c) => {
         });
 
         // Queue cancellation email
+        const preorderCurrency = connectedAccount?.default_currency || 'usd';
         await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
           type: 'preorder_cancelled',
           to: preorder.customer_email,
+          currency: preorderCurrency,
           vendorBranding,
           data: {
             orderNumber: preorder.order_number,
@@ -2544,8 +2561,7 @@ app.openapi(refundTransactionRoute, async (c) => {
             totalAmount: parseFloat(preorder.total_amount),
           },
         });
-
-        const totalCents = Math.round(parseFloat(preorder.total_amount) * 100);
+        const totalCents = toSmallestUnit(parseFloat(preorder.total_amount), preorderCurrency);
         return c.json({
           id: `preorder_refund_${preorder.id}`,
           amount: totalCents,
@@ -2579,7 +2595,7 @@ app.openapi(refundTransactionRoute, async (c) => {
       socketService.emitToOrganization(payload.organizationId, SocketEvents.PREORDER_CANCELLED, {
         preorderId: preorder.id,
         orderNumber: preorder.order_number,
-        refundAmount: refund.amount / 100,
+        refundAmount: fromSmallestUnit(refund.amount, refund.currency || 'usd'),
         timestamp: new Date().toISOString(),
       });
 
@@ -2592,6 +2608,7 @@ app.openapi(refundTransactionRoute, async (c) => {
       await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
         type: 'preorder_cancelled',
         to: preorder.customer_email,
+        currency: connectedAccount?.default_currency || 'usd',
         vendorBranding,
         data: {
           orderNumber: preorder.order_number,
@@ -2626,7 +2643,8 @@ app.openapi(refundTransactionRoute, async (c) => {
 
     // Cash payments: refund via DB only (no Stripe charge to refund)
     if (!order.stripe_charge_id) {
-      const orderTotalCents = Math.round(parseFloat(order.total_amount) * 100);
+      const refundCurrency = connectedAccount?.default_currency || 'usd';
+      const orderTotalCents = toSmallestUnit(parseFloat(order.total_amount), refundCurrency);
       const refundAmount = body.amount || orderTotalCents;
       const isFullRefund = refundAmount >= orderTotalCents;
       const newStatus = isFullRefund ? 'refunded' : 'partially_refunded';
@@ -2639,7 +2657,7 @@ app.openapi(refundTransactionRoute, async (c) => {
       socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_REFUNDED, {
         orderId: order.id,
         orderNumber: order.order_number,
-        refundAmount: refundAmount / 100,
+        refundAmount: fromSmallestUnit(refundAmount, refundCurrency),
         isFullRefund,
         timestamp: new Date().toISOString(),
       });
@@ -2693,7 +2711,7 @@ app.openapi(refundTransactionRoute, async (c) => {
     socketService.emitToOrganization(payload.organizationId, SocketEvents.ORDER_REFUNDED, {
       orderId: order.id,
       orderNumber: order.order_number,
-      refundAmount: refund.amount / 100,
+      refundAmount: fromSmallestUnit(refund.amount, refund.currency || 'usd'),
       isFullRefund,
       timestamp: new Date().toISOString(),
     });
@@ -2853,7 +2871,8 @@ app.openapi(sendReceiptRoute, async (c) => {
       let receiptUrl: string | null = null;
       let cardBrand: string | undefined;
       let cardLast4: string | undefined;
-      let amount = Math.round(parseFloat(order.total_amount) * 100);
+      const receiptCurrency = connectedAccount?.default_currency || 'usd';
+      let amount = toSmallestUnit(parseFloat(order.total_amount), receiptCurrency);
       let amountRefunded = 0;
 
       if (order.stripe_charge_id) {
@@ -2881,7 +2900,7 @@ app.openapi(sendReceiptRoute, async (c) => {
         date: new Date(order.created_at),
         receiptUrl: receiptUrl || undefined,
         merchantName,
-      });
+      }, receiptCurrency);
 
       logger.info('Receipt email sent successfully', {
         transactionId, email, organizationId: payload.organizationId,
@@ -2906,10 +2925,11 @@ app.openapi(sendReceiptRoute, async (c) => {
     if (preorderRows.length > 0) {
       const preorder = preorderRows[0];
 
+      const receiptCurrency = connectedAccount?.default_currency || 'usd';
       let receiptUrl: string | null = null;
       let cardBrand: string | undefined;
       let cardLast4: string | undefined;
-      let amount = Math.round(parseFloat(preorder.total_amount) * 100);
+      let amount = toSmallestUnit(parseFloat(preorder.total_amount), receiptCurrency);
       let amountRefunded = 0;
 
       if (preorder.stripe_charge_id) {
@@ -2936,7 +2956,7 @@ app.openapi(sendReceiptRoute, async (c) => {
         date: new Date(preorder.created_at),
         receiptUrl: receiptUrl || undefined,
         merchantName,
-      });
+      }, receiptCurrency);
 
       logger.info('Preorder receipt email sent successfully', {
         transactionId, email, organizationId: payload.organizationId, amount,
@@ -2969,10 +2989,11 @@ app.openapi(sendReceiptRoute, async (c) => {
 
     const ticket = ticketRows[0];
 
+    const receiptCurrency = connectedAccount?.default_currency || 'usd';
     let receiptUrl: string | null = null;
     let cardBrand: string | undefined;
     let cardLast4: string | undefined;
-    let amount = Math.round(parseFloat(ticket.amount_paid) * 100);
+    let amount = toSmallestUnit(parseFloat(ticket.amount_paid), receiptCurrency);
     let amountRefunded = 0;
 
     if (ticket.stripe_charge_id) {
@@ -3001,7 +3022,7 @@ app.openapi(sendReceiptRoute, async (c) => {
       date: new Date(ticket.purchased_at),
       receiptUrl: receiptUrl || undefined,
       merchantName,
-    });
+    }, receiptCurrency);
 
     logger.info('Ticket receipt email sent successfully', {
       transactionId, email, organizationId: payload.organizationId, amount,
@@ -3229,12 +3250,15 @@ app.openapi(dashboardRoute, async (c) => {
       stripeService.getConnectedAccountBalance(connectedAccount.stripe_account_id),
     ]);
 
+    // Get org's currency for conversions
+    const dashCurrency = connectedAccount.default_currency || 'usd';
+
     // Calculate today's metrics (orders + preorders + tickets + invoices)
-    const todayOrderSalesCents = todayRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
-    const todayPreorderSalesCents = todayPreorderRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
-    const todayTicketSalesCents = todayTicketRows.reduce((sum, o) => sum + Math.round(parseFloat(o.amount_paid) * 100), 0);
-    const todayInvoiceSalesCents = todayInvoiceRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
-    const todaySales = (todayOrderSalesCents + todayPreorderSalesCents + todayTicketSalesCents + todayInvoiceSalesCents) / 100;
+    const todayOrderSalesCents = todayRows.reduce((sum, o) => sum + toSmallestUnit(parseFloat(o.total_amount), dashCurrency), 0);
+    const todayPreorderSalesCents = todayPreorderRows.reduce((sum, o) => sum + toSmallestUnit(parseFloat(o.total_amount), dashCurrency), 0);
+    const todayTicketSalesCents = todayTicketRows.reduce((sum, o) => sum + toSmallestUnit(parseFloat(o.amount_paid), dashCurrency), 0);
+    const todayInvoiceSalesCents = todayInvoiceRows.reduce((sum, o) => sum + toSmallestUnit(parseFloat(o.total_amount), dashCurrency), 0);
+    const todaySales = fromSmallestUnit(todayOrderSalesCents + todayPreorderSalesCents + todayTicketSalesCents + todayInvoiceSalesCents, dashCurrency);
     const todayOrders = todayRows.length + todayPreorderRows.length + todayTicketRows.length + todayInvoiceRows.length;
     const todayAvgOrder = todayOrders > 0 ? todaySales / todayOrders : 0;
     const todayCustomerEmails = new Set([
@@ -3246,11 +3270,11 @@ app.openapi(dashboardRoute, async (c) => {
     const todayCustomers = todayCustomerEmails.size;
 
     // Calculate yesterday's metrics (orders + preorders + tickets + invoices)
-    const yesterdayOrderSalesCents = yesterdayRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
-    const yesterdayPreorderSalesCents = yesterdayPreorderRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
-    const yesterdayTicketSalesCents = yesterdayTicketRows.reduce((sum, o) => sum + Math.round(parseFloat(o.amount_paid) * 100), 0);
-    const yesterdayInvoiceSalesCents = yesterdayInvoiceRows.reduce((sum, o) => sum + Math.round(parseFloat(o.total_amount) * 100), 0);
-    const yesterdaySales = (yesterdayOrderSalesCents + yesterdayPreorderSalesCents + yesterdayTicketSalesCents + yesterdayInvoiceSalesCents) / 100;
+    const yesterdayOrderSalesCents = yesterdayRows.reduce((sum, o) => sum + toSmallestUnit(parseFloat(o.total_amount), dashCurrency), 0);
+    const yesterdayPreorderSalesCents = yesterdayPreorderRows.reduce((sum, o) => sum + toSmallestUnit(parseFloat(o.total_amount), dashCurrency), 0);
+    const yesterdayTicketSalesCents = yesterdayTicketRows.reduce((sum, o) => sum + toSmallestUnit(parseFloat(o.amount_paid), dashCurrency), 0);
+    const yesterdayInvoiceSalesCents = yesterdayInvoiceRows.reduce((sum, o) => sum + toSmallestUnit(parseFloat(o.total_amount), dashCurrency), 0);
+    const yesterdaySales = fromSmallestUnit(yesterdayOrderSalesCents + yesterdayPreorderSalesCents + yesterdayTicketSalesCents + yesterdayInvoiceSalesCents, dashCurrency);
     const yesterdayOrders = yesterdayRows.length + yesterdayPreorderRows.length + yesterdayTicketRows.length + yesterdayInvoiceRows.length;
     const yesterdayCustomerEmails = new Set([
       ...yesterdayRows.map(o => o.customer_email).filter((e): e is string => !!e),
@@ -3260,12 +3284,12 @@ app.openapi(dashboardRoute, async (c) => {
     ]);
     const yesterdayCustomers = yesterdayCustomerEmails.size;
 
-    // Get balance amounts (default to USD)
+    // Get balance amounts using org's currency
     const availableBalance = balance.available?.length > 0
-      ? (balance.available.find(b => b.currency === 'usd') || balance.available[0])
+      ? (balance.available.find(b => b.currency === dashCurrency) || balance.available[0])
       : null;
     const pendingBalance = balance.pending?.length > 0
-      ? (balance.pending.find(b => b.currency === 'usd') || balance.pending[0])
+      ? (balance.pending.find(b => b.currency === dashCurrency) || balance.pending[0])
       : null;
 
     // Format and merge recent transactions from all sources
@@ -3274,7 +3298,7 @@ app.openapi(dashboardRoute, async (c) => {
         id: order.id,
         orderNumber: order.order_number || null,
         amount: Math.round(parseFloat(order.total_amount) * 100) / 100,
-        currency: 'usd',
+        currency: dashCurrency,
         status: order.status === 'completed' ? 'succeeded' : order.status,
         type: 'order' as const,
         customerName: null as string | null,
@@ -3285,7 +3309,7 @@ app.openapi(dashboardRoute, async (c) => {
         id: preorder.id,
         orderNumber: preorder.order_number || null,
         amount: Math.round(parseFloat(preorder.total_amount) * 100) / 100,
-        currency: 'usd',
+        currency: dashCurrency,
         status: preorder.status === 'picked_up' ? 'succeeded' : preorder.status,
         type: 'preorder' as const,
         customerName: preorder.customer_name || null,
@@ -3296,7 +3320,7 @@ app.openapi(dashboardRoute, async (c) => {
         id: ticket.id,
         orderNumber: null as string | null,
         amount: Math.round(parseFloat(ticket.amount_paid) * 100) / 100,
-        currency: 'usd',
+        currency: dashCurrency,
         status: 'succeeded' as string,
         type: 'ticket' as const,
         customerName: ticket.customer_name || null,
@@ -3307,7 +3331,7 @@ app.openapi(dashboardRoute, async (c) => {
         id: inv.id,
         orderNumber: inv.invoice_number || null,
         amount: Math.round(parseFloat(inv.total_amount) * 100) / 100,
-        currency: 'usd',
+        currency: dashCurrency,
         status: 'succeeded' as string,
         type: 'invoice' as const,
         customerName: inv.customer_name || null,
@@ -3332,9 +3356,9 @@ app.openapi(dashboardRoute, async (c) => {
         customers: yesterdayCustomers,
       },
       balance: {
-        available: availableBalance ? availableBalance.amount / 100 : 0,
-        pending: pendingBalance ? pendingBalance.amount / 100 : 0,
-        currency: availableBalance?.currency || pendingBalance?.currency || 'usd',
+        available: availableBalance ? fromSmallestUnit(availableBalance.amount, dashCurrency) : 0,
+        pending: pendingBalance ? fromSmallestUnit(pendingBalance.amount, dashCurrency) : 0,
+        currency: availableBalance?.currency || pendingBalance?.currency || dashCurrency,
       },
       recentTransactions,
     });

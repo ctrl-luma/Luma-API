@@ -1,6 +1,7 @@
 import Stripe from 'stripe';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
+import { toSmallestUnit, fromSmallestUnit } from '../../utils/currency';
 
 export const stripe = new Stripe(config.stripe.secretKey);
 
@@ -32,7 +33,7 @@ export class StripeService {
   async createPaymentIntent(params: CreatePaymentIntentParams) {
     try {
       const paymentIntent = await stripe.paymentIntents.create({
-        amount: Math.round(params.amount * 100),
+        amount: toSmallestUnit(params.amount, params.currency || 'usd'),
         currency: params.currency || 'usd',
         customer: params.customer,
         description: params.description,
@@ -73,18 +74,18 @@ export class StripeService {
     }
   }
 
-  async createRefund(chargeId: string, amount?: number, reason?: string) {
+  async createRefund(chargeId: string, amount?: number, reason?: string, currency: string = 'usd') {
     try {
       const refund = await stripe.refunds.create({
         charge: chargeId,
-        amount: amount ? Math.round(amount * 100) : undefined,
+        amount: amount ? toSmallestUnit(amount, currency) : undefined,
         reason: reason as Stripe.RefundCreateParams.Reason,
       });
 
       logger.info('Refund created', {
         refundId: refund.id,
         chargeId,
-        amount: refund.amount / 100,
+        amount: fromSmallestUnit(refund.amount, currency),
       });
 
       return refund;
@@ -216,7 +217,7 @@ export class StripeService {
   }) {
     try {
       const transfer = await stripe.transfers.create({
-        amount: Math.round(params.amount * 100),
+        amount: toSmallestUnit(params.amount, params.currency || 'usd'),
         currency: params.currency || 'usd',
         destination: params.destination,
         description: params.description,
@@ -246,7 +247,7 @@ export class StripeService {
   }) {
     try {
       const payout = await stripe.payouts.create({
-        amount: Math.round(params.amount * 100),
+        amount: toSmallestUnit(params.amount, params.currency || 'usd'),
         currency: params.currency || 'usd',
         destination: params.destination,
         description: params.description,
@@ -616,7 +617,7 @@ export class StripeService {
     try {
       const payout = await stripe.payouts.create(
         {
-          amount: Math.round(params.amount * 100), // Convert to cents
+          amount: toSmallestUnit(params.amount, params.currency || 'usd'),
           currency: params.currency || 'usd',
           description: params.description,
           destination: params.destination,
@@ -783,7 +784,7 @@ export class StripeService {
       logger.info('Created connected account refund', {
         stripeAccountId,
         refundId: refund.id,
-        amount: refund.amount / 100,
+        amount: fromSmallestUnit(refund.amount, refund.currency || 'usd'),
       });
 
       return refund;

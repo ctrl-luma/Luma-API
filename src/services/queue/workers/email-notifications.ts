@@ -7,7 +7,7 @@ export function registerEmailNotifications() {
   return queueService.registerWorker(
     QueueName.EMAIL_NOTIFICATIONS,
     async (job: Job<JobData[QueueName.EMAIL_NOTIFICATIONS]>) => {
-      const { type, to, data, vendorBranding: brandingData } = job.data;
+      const { type, to, data, vendorBranding: brandingData, currency = 'usd' } = job.data;
 
       logger.info('Processing email notification', {
         type,
@@ -29,20 +29,20 @@ export function registerEmailNotifications() {
             break;
 
           case 'payout_confirmation':
-            await sendPayoutConfirmation(to, data);
+            await sendPayoutConfirmation(to, data, currency);
             break;
 
           // Customer-facing emails (with vendor branding)
           case 'order_confirmation':
-            await sendOrderConfirmationEmail(to, data as any, vendorBranding);
+            await sendOrderConfirmationEmail(to, data as any, vendorBranding, currency);
             break;
 
           case 'receipt':
-            await sendReceiptEmail(to, data as any, vendorBranding);
+            await sendReceiptEmail(to, data as any, vendorBranding, currency);
             break;
 
           case 'ticket_confirmation':
-            await sendTicketConfirmationEmail(to, data as any, vendorBranding);
+            await sendTicketConfirmationEmail(to, data as any, vendorBranding, currency);
             break;
 
           case 'ticket_reminder':
@@ -50,35 +50,35 @@ export function registerEmailNotifications() {
             break;
 
           case 'ticket_refund':
-            await sendTicketRefundEmail(to, data as any, vendorBranding);
+            await sendTicketRefundEmail(to, data as any, vendorBranding, currency);
             break;
 
           case 'preorder_confirmation':
-            await sendPreorderConfirmationEmail(to, data as any, vendorBranding);
+            await sendPreorderConfirmationEmail(to, data as any, vendorBranding, currency);
             break;
 
           case 'preorder_ready':
-            await sendPreorderReadyEmail(to, data as any, vendorBranding);
+            await sendPreorderReadyEmail(to, data as any, vendorBranding, currency);
             break;
 
           case 'preorder_cancelled':
-            await sendPreorderCancelledEmail(to, data as any, vendorBranding);
+            await sendPreorderCancelledEmail(to, data as any, vendorBranding, currency);
             break;
 
           case 'invoice_sent':
-            await sendInvoiceEmail(to, data as any, vendorBranding);
+            await sendInvoiceEmail(to, data as any, vendorBranding, currency);
             break;
 
           case 'invoice_paid':
-            await sendInvoicePaidEmail(to, data as any, vendorBranding);
+            await sendInvoicePaidEmail(to, data as any, vendorBranding, currency);
             break;
 
           case 'invoice_payment_failed':
-            await sendInvoicePaymentFailedEmail(to, data as any, vendorBranding);
+            await sendInvoicePaymentFailedEmail(to, data as any, vendorBranding, currency);
             break;
 
           case 'invoice_refunded':
-            await sendInvoiceRefundedEmail(to, data as any, vendorBranding);
+            await sendInvoiceRefundedEmail(to, data as any, vendorBranding, currency);
             break;
 
           case 'dispute_created':
@@ -98,6 +98,6 @@ export function registerEmailNotifications() {
   );
 }
 
-async function sendPayoutConfirmation(to: string, data: Record<string, any>) {
-  await sendPayoutEmail(to, data);
+async function sendPayoutConfirmation(to: string, data: Record<string, any>, currency: string = 'usd') {
+  await sendPayoutEmail(to, data, currency);
 }

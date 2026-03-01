@@ -365,4 +365,7 @@ export const SocketEvents = {
   DISPUTE_CREATED: 'dispute:created',
   DISPUTE_UPDATED: 'dispute:updated',
   DISPUTE_CLOSED: 'dispute:closed',
+  // Terminal reader events
+  TERMINAL_PAYMENT_SUCCEEDED: 'terminal:payment_succeeded',
+  TERMINAL_PAYMENT_FAILED: 'terminal:payment_failed',
 } as const;

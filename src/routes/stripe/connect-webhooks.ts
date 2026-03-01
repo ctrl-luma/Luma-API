@@ -8,6 +8,7 @@ import { socketService, SocketEvents } from '../../services/socket';
 import { queueService, QueueName } from '../../services/queue';
 import { getImageUrl } from '../../services/images';
 import { redisService } from '../../services/redis';
+import { fromSmallestUnit } from '../../utils/currency';
 
 const app = new Hono();
 
@@ -135,6 +136,15 @@ app.post('/stripe/webhook-connect', async (c) => {
         await handleInvoiceOverdue(event.data.object, event.account);
         break;
 
+      // Terminal reader events (server-driven payments)
+      case 'terminal.reader.action_succeeded':
+        await handleTerminalReaderActionSucceeded(event.data.object, event.account);
+        break;
+
+      case 'terminal.reader.action_failed':
+        await handleTerminalReaderActionFailed(event.data.object, event.account);
+        break;
+
       // Dispute events
       case 'charge.dispute.created':
         await handleDisputeCreated(event.data.object, event.account);
@@ -252,7 +262,7 @@ async function handleBalanceAvailable(balance: any, connectedAccountId: string |
 
   logger.info('Connected account balance available', {
     accountId: connectedAccountId,
-    availableAmount: availableAmount / 100,
+    availableAmount: fromSmallestUnit(availableAmount, balance.available?.[0]?.currency || 'usd'),
     pending: balance.pending,
   });
 
@@ -293,7 +303,7 @@ async function handleConnectPayoutCreated(payout: any, connectedAccountId: strin
       [
         org.id,
         payout.id,
-        payout.amount / 100,
+        fromSmallestUnit(payout.amount, payout.currency || 'usd'),
         `Automatic payout to ${payout.destination}`,
       ]
     );
@@ -308,7 +318,7 @@ async function handleConnectPayoutCreated(payout: any, connectedAccountId: strin
         'payout',
         payoutResult.rows[0].id,
         {
-          amount: payout.amount / 100,
+          amount: fromSmallestUnit(payout.amount, payout.currency || 'usd'),
           currency: payout.currency,
           arrival_date: payout.arrival_date,
           method: payout.method,
@@ -320,7 +330,7 @@ async function handleConnectPayoutCreated(payout: any, connectedAccountId: strin
   logger.info('Connect payout created', {
     accountId: connectedAccountId,
     payoutId: payout.id,
-    amount: payout.amount / 100,
+    amount: fromSmallestUnit(payout.amount, payout.currency || 'usd'),
     arrivalDate: new Date(payout.arrival_date * 1000),
   });
 }
@@ -364,7 +374,7 @@ async function handleConnectPayoutFailed(payout: any, connectedAccountId: string
           {
             failure_code: payout.failure_code,
             failure_message: payout.failure_message,
-            amount: payout.amount / 100,
+            amount: fromSmallestUnit(payout.amount, payout.currency || 'usd'),
           },
         ]
       );
@@ -385,7 +395,7 @@ async function handleConnectTransferCreated(transfer: any, connectedAccountId: s
   logger.info('Connect transfer created', {
     accountId: connectedAccountId,
     transferId: transfer.id,
-    amount: transfer.amount / 100,
+    amount: fromSmallestUnit(transfer.amount, transfer.currency || 'usd'),
     destination: transfer.destination,
   });
 
@@ -407,7 +417,7 @@ async function checkAndCreateAutomaticPayout(
       // Create manual payout if balance exceeds threshold
       logger.info('Creating automatic payout for high balance', {
         accountId: connectedAccountId,
-        amount: availableAmount / 100,
+        amount: availableAmount, // already in smallest unit from balance webhook
       });
 
       // Note: Actual payout creation would happen through Stripe API
@@ -423,7 +433,7 @@ async function handlePaymentIntentSucceeded(paymentIntent: any, connectedAccount
   logger.info('[CONNECT WEBHOOK DEBUG] PaymentIntent details', {
     id: paymentIntent.id,
     amount: paymentIntent.amount,
-    amountInDollars: paymentIntent.amount / 100,
+    amountInDollars: fromSmallestUnit(paymentIntent.amount, paymentIntent.currency || 'usd'),
     currency: paymentIntent.currency,
     status: paymentIntent.status,
     latestCharge: paymentIntent.latest_charge,
@@ -534,7 +544,7 @@ async function handlePaymentIntentSucceeded(paymentIntent: any, connectedAccount
 
 // Fallback: handle invoice payment from payment_intent.succeeded when invoice.paid/payment_succeeded webhook doesn't arrive
 async function handleInvoicePaymentFromPI(client: any, paymentIntent: any, stripeInvoiceId: string) {
-  const amountPaid = (paymentIntent.amount_received || paymentIntent.amount || 0) / 100;
+  const amountPaid = fromSmallestUnit(paymentIntent.amount_received || paymentIntent.amount || 0, paymentIntent.currency || 'usd');
 
   const updatedRows = await client.query(
     `UPDATE invoices SET
@@ -578,6 +588,7 @@ async function handleInvoicePaymentFromPI(client: any, paymentIntent: any, strip
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'invoice_paid',
       to: inv.customer_email,
+      currency: paymentIntent.currency || 'usd',
       vendorBranding: {
         organizationName: orgName,
         brandingLogoUrl: getImageUrl(brandingLogoId),
@@ -722,7 +733,7 @@ async function handlePaymentIntentFailed(paymentIntent: any, connectedAccountId:
 }
 
 async function handleChargeRefunded(charge: any, connectedAccountId: string | undefined) {
-  const refundAmount = charge.amount_refunded / 100;
+  const refundAmount = fromSmallestUnit(charge.amount_refunded, charge.currency || 'usd');
   const isFullRefund = charge.refunded === true;
 
   await transaction(async (client) => {
@@ -808,7 +819,7 @@ async function handleInvoicePaid(stripeInvoice: any, _connectedAccountId: string
   const lumaInvoiceId = stripeInvoice.metadata?.luma_invoice_id;
   if (!lumaInvoiceId) return;
 
-  const amountPaid = (stripeInvoice.amount_paid || 0) / 100;
+  const amountPaid = fromSmallestUnit(stripeInvoice.amount_paid || 0, stripeInvoice.currency || 'usd');
 
   const updatedRows = await query<{
     organization_id: string;
@@ -869,6 +880,7 @@ async function handleInvoicePaid(stripeInvoice: any, _connectedAccountId: string
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'invoice_paid',
       to: inv.customer_email,
+      currency: stripeInvoice.currency || 'usd',
       vendorBranding: {
         organizationName: orgName,
         brandingLogoUrl: getImageUrl(brandingLogoId),
@@ -934,6 +946,7 @@ async function handleInvoicePaymentFailed(stripeInvoice: any, _connectedAccountI
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'invoice_payment_failed',
       to: inv.customer_email,
+      currency: stripeInvoice.currency || 'usd',
       vendorBranding: {
         organizationName: orgName,
         brandingLogoUrl: getImageUrl(brandingLogoId),
@@ -1020,6 +1033,86 @@ async function handleInvoiceOverdue(stripeInvoice: any, _connectedAccountId: str
   }
 
   logger.info('Invoice overdue via webhook — status set to past_due', { lumaInvoiceId, stripeInvoiceId: stripeInvoice.id });
+}
+
+// ─── Terminal Reader Webhook Handlers ──────────────────────────────────────────
+
+async function handleTerminalReaderActionSucceeded(reader: any, connectedAccountId: string | undefined) {
+  const accountId = connectedAccountId;
+  if (!accountId) {
+    logger.warn('Terminal reader action succeeded but no connected account ID', { readerId: reader.id });
+    return;
+  }
+
+  // Find the organization by stripe_account_id
+  const orgRows = await query<{ id: string }>(
+    'SELECT id FROM organizations WHERE stripe_account_id = $1',
+    [accountId]
+  );
+
+  if (orgRows.length === 0) {
+    logger.warn('Organization not found for terminal reader action', { accountId, readerId: reader.id });
+    return;
+  }
+
+  const orgId = orgRows[0].id;
+  const action = reader.action;
+
+  socketService.emitToOrganization(orgId, SocketEvents.TERMINAL_PAYMENT_SUCCEEDED, {
+    readerId: reader.id,
+    readerLabel: reader.label,
+    actionType: action?.type,
+    paymentIntentId: action?.process_payment_intent?.payment_intent,
+    timestamp: new Date().toISOString(),
+  });
+
+  logger.info('Terminal reader action succeeded', {
+    readerId: reader.id,
+    readerLabel: reader.label,
+    organizationId: orgId,
+    actionType: action?.type,
+    paymentIntentId: action?.process_payment_intent?.payment_intent,
+  });
+}
+
+async function handleTerminalReaderActionFailed(reader: any, connectedAccountId: string | undefined) {
+  const accountId = connectedAccountId;
+  if (!accountId) {
+    logger.warn('Terminal reader action failed but no connected account ID', { readerId: reader.id });
+    return;
+  }
+
+  const orgRows = await query<{ id: string }>(
+    'SELECT id FROM organizations WHERE stripe_account_id = $1',
+    [accountId]
+  );
+
+  if (orgRows.length === 0) {
+    logger.warn('Organization not found for terminal reader action failure', { accountId, readerId: reader.id });
+    return;
+  }
+
+  const orgId = orgRows[0].id;
+  const action = reader.action;
+
+  socketService.emitToOrganization(orgId, SocketEvents.TERMINAL_PAYMENT_FAILED, {
+    readerId: reader.id,
+    readerLabel: reader.label,
+    actionType: action?.type,
+    failureCode: action?.failure_code,
+    failureMessage: action?.failure_message,
+    paymentIntentId: action?.process_payment_intent?.payment_intent,
+    timestamp: new Date().toISOString(),
+  });
+
+  logger.info('Terminal reader action failed', {
+    readerId: reader.id,
+    readerLabel: reader.label,
+    organizationId: orgId,
+    actionType: action?.type,
+    failureCode: action?.failure_code,
+    failureMessage: action?.failure_message,
+  });
 }
 
 // ─── Dispute Webhook Handlers ─────────────────────────────────────────────────
@@ -1148,6 +1241,7 @@ async function handleDisputeCreated(dispute: any, connectedAccountId: string | u
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'dispute_created',
       to: ownerRows[0].email,
+      currency: dispute.currency || 'usd',
       data: {
         firstName: ownerRows[0].first_name,
         organizationName: org.name,

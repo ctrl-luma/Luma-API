@@ -6,6 +6,7 @@ import { socketService, SocketEvents } from '../services/socket';
 import { queueService, QueueName } from '../services/queue';
 import { stripe } from '../services/stripe';
 import { getImageUrl } from '../services/images';
+import { getOrgCurrency } from '../utils/currency';
 
 const app = new OpenAPIHono();
 
@@ -479,9 +480,11 @@ app.openapi(updatePreorderStatusRoute, async (c) => {
       );
 
       // Queue ready notification email
+      const readyCurrency = await getOrgCurrency(payload.organizationId);
       await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
         type: 'preorder_ready',
         to: updatedPreorder.customer_email,
+        currency: readyCurrency,
         vendorBranding: {
           organizationName: orgs[0]?.name || '',
           brandingLogoUrl: getImageUrl(orgs[0]?.branding_logo_id ?? null),
@@ -818,9 +821,11 @@ app.openapi(cancelPreorderVendorRoute, async (c) => {
     );
 
     // Queue cancellation email to customer
+    const cancelCurrency = await getOrgCurrency(payload.organizationId);
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'preorder_cancelled',
       to: preorder.customer_email,
+      currency: cancelCurrency,
       vendorBranding: {
         organizationName: orgs[0]?.name || '',
         brandingLogoUrl: getImageUrl(orgs[0]?.branding_logo_id ?? null),

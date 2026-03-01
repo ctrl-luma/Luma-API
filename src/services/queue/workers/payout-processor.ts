@@ -3,6 +3,7 @@ import { QueueName, JobData, queueService } from '../index';
 import { stripeService } from '../../stripe';
 import { query, transaction } from '../../../db';
 import { logger } from '../../../utils/logger';
+import { fromSmallestUnit } from '../../../utils/currency';
 
 export function registerPayoutProcessor() {
   return queueService.registerWorker(
@@ -111,6 +112,7 @@ export function registerPayoutProcessor() {
               await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
                 type: 'payout_confirmation',
                 to: userResult.rows[0].email,
+                currency: transfer.currency || 'usd',
                 data: {
                   payoutId,
                   amount,
@@ -121,10 +123,10 @@ export function registerPayoutProcessor() {
           }
         });
 
-        return { 
-          status: 'completed', 
+        return {
+          status: 'completed',
           transferId: transfer.id,
-          amount: transfer.amount / 100,
+          amount: fromSmallestUnit(transfer.amount, transfer.currency || 'usd'),
         };
       } catch (error) {
         logger.error('Payout processing error', { eventId, userId, error });

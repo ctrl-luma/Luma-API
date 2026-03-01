@@ -345,7 +345,7 @@ image_id, image_url
 **catalog_products** - Per-catalog pricing
 ```sql
 id, catalog_id FK, product_id FK, category_id FK,
-price DECIMAL(10,2),               -- In dollars (NOT cents)
+price DECIMAL(10,2),               -- In base currency unit (dollars for USD, yen for JPY)
 sort_order, is_active,
 UNIQUE(catalog_id, product_id)
 ```
@@ -354,7 +354,7 @@ UNIQUE(catalog_id, product_id)
 ```sql
 id, organization_id FK, catalog_id FK, customer_id FK, user_id FK,
 order_number, status, payment_method,
-subtotal, tax_amount, tip_amount, total_amount DECIMAL(10,2),  -- All in dollars
+subtotal, tax_amount, tip_amount, total_amount DECIMAL(10,2),  -- All in base currency unit
 stripe_payment_intent_id, stripe_charge_id,
 customer_email, notes, metadata JSONB
 ```
@@ -382,7 +382,7 @@ organization_id UUID FK, catalog_id UUID FK,
 order_number VARCHAR(20),          -- Format: PRE-YYYYMMDD-XXXX
 customer_name, customer_email, customer_phone,
 payment_type VARCHAR(20),          -- 'pay_now' | 'pay_at_pickup'
-subtotal, tax_amount, tip_amount, total_amount DECIMAL(10,2), -- All in DOLLARS
+subtotal, tax_amount, tip_amount, total_amount DECIMAL(10,2), -- All in base currency unit
 stripe_payment_intent_id, stripe_charge_id,
 platform_fee_cents INTEGER DEFAULT 0,
 status preorder_status DEFAULT 'pending',
@@ -401,7 +401,7 @@ id UUID PRIMARY KEY,
 preorder_id UUID FK → preorders ON DELETE CASCADE,
 catalog_product_id UUID, product_id UUID,
 name VARCHAR(255),                 -- Snapshot at time of order
-unit_price DECIMAL(10,2),          -- In dollars
+unit_price DECIMAL(10,2),          -- In base currency unit
 quantity INTEGER CHECK (quantity > 0),
 notes TEXT                         -- Per-item customer notes (e.g., "no onions")
 ```
@@ -415,7 +415,7 @@ customer_name, customer_email, customer_phone,
 stripe_invoice_id, stripe_customer_id,
 stripe_hosted_url, stripe_pdf_url,
 stripe_payment_intent_id, stripe_charge_id,
-subtotal, tax_amount, total_amount DECIMAL(10,2),  -- In dollars
+subtotal, tax_amount, total_amount DECIMAL(10,2),  -- In base currency unit
 amount_paid, amount_due, amount_refunded DECIMAL(10,2),
 platform_fee_cents INTEGER,
 status VARCHAR(30),  -- 'draft' | 'open' | 'paid' | 'void' | 'uncollectible' | 'past_due' | 'refunded'
@@ -439,10 +439,11 @@ external_account_last4, external_account_bank_name
 - Products are **org-level** (no price); pricing is **per-catalog** via `catalog_products`
 - Categories are **catalog-specific** (not reusable org-wide)
 - **Two monetary formats exist:**
-  - `orders` table (`subtotal`, `tip_amount`, `total_amount`, `tax_amount`): **`DECIMAL(10,2)` in dollars** — use `parseFloat()`, do NOT divide by 100
-  - `order_payments` table (`amount`, `tip_amount`): **`INTEGER` in cents** — use `parseInt()`, divide by 100 to display
-  - Stripe API responses: **Integer cents** — divide by 100 to display
+  - `orders` table (`subtotal`, `tip_amount`, `total_amount`, `tax_amount`): **`DECIMAL(10,2)` in base currency unit** (dollars for USD, yen for JPY) — use `parseFloat()`, do NOT divide by 100
+  - `order_payments` table (`amount`, `tip_amount`): **`INTEGER` in smallest unit** (cents for USD, yen for JPY) — use `parseInt()`
+  - Stripe API responses: **Smallest unit integers** — use `fromSmallestUnit(amount, currency)` to convert
 - Customers auto-created on first purchase
+- **Organization currency** stored in `organizations.currency` (VARCHAR 3, default `'usd'`)
 
 ---
 
@@ -581,6 +582,58 @@ npm run test:coverage
 | Redis | 6379 |
 | PgAdmin | 5050 |
 | Redis Commander | 8081 |
+
+---
+
+## Multi-Currency Support (MANDATORY)
+
+Luma supports multiple currencies per organization. The org currency is stored in `organizations.currency` (3-letter ISO code, default `'usd'`). Zero-decimal currencies (JPY, KRW, VND, etc.) have no fractional units — Stripe sends and expects whole units.
+
+### Currency Utility Functions (`src/utils/currency.ts`)
+
+| Function | Purpose | Example |
+|----------|---------|---------|
+| `isZeroDecimalCurrency(currency)` | Check if currency has no subunits | `isZeroDecimalCurrency('jpy') → true` |
+| `toSmallestUnit(amount, currency)` | Base unit → Stripe unit | USD: `10.99 → 1099`, JPY: `1099 → 1099` |
+| `fromSmallestUnit(amount, currency)` | Stripe unit → base unit | USD: `1099 → 10.99`, JPY: `1099 → 1099` |
+| `getOrgCurrency(organizationId)` | Fetch org currency from DB | Returns `'usd'`, `'jpy'`, etc. |
+| `formatCurrency(amount, currency)` | Format base-unit amount for display | `formatCurrency(10.99, 'usd') → "$10.99"` |
+| `formatSmallestUnit(amount, currency)` | Format smallest-unit amount | `formatSmallestUnit(1099, 'usd') → "$10.99"` |
+| `getCurrencySymbol(currency)` | Get symbol for display | `getCurrencySymbol('eur') → "€"` |
+
+### Rules
+
+1. **NEVER** use raw `/ 100` or `* 100` for currency conversions — always use `fromSmallestUnit()` / `toSmallestUnit()`
+2. **NEVER** use `.default('usd')` on Zod currency fields — this preempts runtime fallbacks like `body.currency || orgCurrency`, making the org currency unreachable. Use `.optional()` instead.
+3. **ALWAYS** get the org currency dynamically via `getOrgCurrency(organizationId)` in route handlers
+4. **Webhook handlers** should use the currency from the Stripe object itself (e.g., `paymentIntent.currency`, `charge.currency`, `payout.currency`)
+5. **Email functions** must receive and pass the currency parameter — never assume USD
+
+### Pattern — Route Handler
+
+```typescript
+import { fromSmallestUnit, toSmallestUnit, getOrgCurrency } from '../utils/currency';
+
+app.openapi(myRoute, async (c) => {
+  const payload = await verifyAuth(c.req.header('Authorization'));
+  const orgCurrency = await getOrgCurrency(payload.organizationId);
+
+  // Converting from Stripe (smallest unit) to DB (base unit):
+  const subtotal = fromSmallestUnit(body.subtotal, orgCurrency);
+
+  // Converting from DB (base unit) to API response (smallest unit):
+  const responseAmount = toSmallestUnit(parseFloat(order.total_amount), orgCurrency);
+});
+```
+
+### Pattern — Webhook Handler
+
+```typescript
+import { fromSmallestUnit } from '../../utils/currency';
+
+// Use the currency from the Stripe object, NOT the org:
+const amount = fromSmallestUnit(paymentIntent.amount, paymentIntent.currency || 'usd');
+```
 
 ---
 

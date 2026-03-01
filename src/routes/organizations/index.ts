@@ -32,6 +32,7 @@ const getOrganizationRoute = createRoute({
             stripeOnboardingCompleted: z.boolean(),
             settings: z.record(z.any()),
             brandingLogoUrl: z.string().nullable(),
+            currency: z.string(),
             createdAt: z.string(),
             updatedAt: z.string(),
           }),
@@ -122,6 +123,7 @@ app.openapi(getOrganizationRoute, async (c) => {
       stripeOnboardingCompleted: org.stripe_onboarding_completed,
       settings: org.settings,
       brandingLogoUrl: imageService.getUrl(org.branding_logo_id),
+      currency: org.currency || 'usd',
       createdAt: org.created_at.toISOString(),
       updatedAt: org.updated_at.toISOString(),
     });
@@ -159,6 +161,7 @@ const updateOrganizationRoute = createRoute({
           schema: z.object({
             name: z.string().min(2).optional(),
             settings: z.record(z.any()).optional(),
+            currency: z.string().length(3).toLowerCase().optional(),
           }),
         },
       },
@@ -176,6 +179,7 @@ const updateOrganizationRoute = createRoute({
             stripeOnboardingCompleted: z.boolean(),
             settings: z.record(z.any()),
             brandingLogoUrl: z.string().nullable(),
+            currency: z.string(),
             createdAt: z.string(),
             updatedAt: z.string(),
           }),
@@ -235,6 +239,12 @@ app.openapi(updateOrganizationRoute, async (c) => {
       paramCount++;
     }
 
+    if (body.currency !== undefined) {
+      updates.push(`currency = $${paramCount}`);
+      values.push(body.currency.toLowerCase());
+      paramCount++;
+    }
+
     if (updates.length === 0) {
       return c.json({ error: 'No fields to update' }, 400);
     }
@@ -278,6 +288,7 @@ app.openapi(updateOrganizationRoute, async (c) => {
       stripeOnboardingCompleted: org.stripe_onboarding_completed,
       settings: org.settings,
       brandingLogoUrl: imageService.getUrl(org.branding_logo_id),
+      currency: org.currency || 'usd',
       createdAt: org.created_at.toISOString(),
       updatedAt: org.updated_at.toISOString(),
     });

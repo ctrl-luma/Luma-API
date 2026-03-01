@@ -8,6 +8,7 @@ import { queueService, QueueName } from '../services/queue';
 import { stripe } from '../services/stripe';
 import { calculatePlatformFee, SubscriptionTier } from '../config/platform-fees';
 import { getImageUrl } from '../services/images';
+import { toSmallestUnit, getOrgCurrency } from '../utils/currency';
 
 const app = new OpenAPIHono();
 
@@ -751,6 +752,9 @@ app.openapi(sendInvoiceRoute, async (c) => {
       return c.json({ error: 'Only draft invoices can be sent' }, 400);
     }
 
+    // Get org currency for proper Stripe unit conversion
+    const orgCurrency = await getOrgCurrency(payload.organizationId);
+
     // Get connected account
     const connectedAccountId = await getConnectedAccount(payload.organizationId);
     if (!connectedAccountId) {
@@ -764,7 +768,7 @@ app.openapi(sendInvoiceRoute, async (c) => {
     );
 
     // Calculate platform fee
-    const totalCents = Math.round(parseFloat(invoice.total_amount as any) * 100);
+    const totalCents = toSmallestUnit(parseFloat(invoice.total_amount as any), orgCurrency);
     const platformFeeCents = calculatePlatformFee(totalCents, (sub.tier as SubscriptionTier) || 'pro');
 
     // Get or create Stripe customer on connected account
@@ -804,7 +808,7 @@ app.openapi(sendInvoiceRoute, async (c) => {
         invoice: stripeInvoice.id,
         description: item.description,
         quantity: item.quantity,
-        unit_amount_decimal: String(Math.round(parseFloat(item.unit_price as any) * 100)),
+        unit_amount_decimal: String(toSmallestUnit(parseFloat(item.unit_price as any), orgCurrency)),
         metadata: { luma_item_id: item.id },
       }, { stripeAccount: connectedAccountId });
     }
@@ -817,7 +821,7 @@ app.openapi(sendInvoiceRoute, async (c) => {
         invoice: stripeInvoice.id,
         description: 'Tax',
         quantity: 1,
-        unit_amount_decimal: String(Math.round(taxAmount * 100)),
+        unit_amount_decimal: String(toSmallestUnit(taxAmount, orgCurrency)),
       }, { stripeAccount: connectedAccountId });
     }
 
@@ -862,6 +866,7 @@ app.openapi(sendInvoiceRoute, async (c) => {
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'invoice_sent',
       to: invoice.customer_email,
+      currency: orgCurrency,
       vendorBranding: {
         organizationName: orgName,
         brandingLogoUrl: getImageUrl(brandingLogoId),
@@ -1110,10 +1115,12 @@ app.openapi(sendReminderRoute, async (c) => {
     );
     const orgName = orgRows[0]?.name || 'Your vendor';
     const brandingLogoId = orgRows[0]?.branding_logo_id || null;
+    const reminderCurrency = await getOrgCurrency(payload.organizationId);
 
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'invoice_sent',
       to: invoice.customer_email,
+      currency: reminderCurrency,
       vendorBranding: {
         organizationName: orgName,
         brandingLogoUrl: getImageUrl(brandingLogoId),
@@ -1313,6 +1320,7 @@ app.openapi(refundInvoiceRoute, async (c) => {
       return c.json({ error: 'Only paid invoices can be refunded' }, 400);
     }
 
+    const orgCurrency = await getOrgCurrency(payload.organizationId);
     const amountPaid = parseFloat(invoice.amount_paid);
     const alreadyRefunded = parseFloat(invoice.amount_refunded) || 0;
     const refundableAmount = amountPaid - alreadyRefunded;
@@ -1339,7 +1347,7 @@ app.openapi(refundInvoiceRoute, async (c) => {
     const paymentIntentId = invoice.stripe_payment_intent_id;
 
     if (chargeId || paymentIntentId) {
-      const refundCents = Math.round(refundAmount * 100);
+      const refundCents = toSmallestUnit(refundAmount, orgCurrency);
       const refundParams: any = {
         amount: refundCents,
         reason: 'requested_by_customer',
@@ -1412,6 +1420,7 @@ app.openapi(refundInvoiceRoute, async (c) => {
     await queueService.addJob(QueueName.EMAIL_NOTIFICATIONS, {
       type: 'invoice_refunded',
       to: invoice.customer_email,
+      currency: orgCurrency,
       vendorBranding: {
         organizationName: orgName,
         brandingLogoUrl: getImageUrl(brandingLogoId),

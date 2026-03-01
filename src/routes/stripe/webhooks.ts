@@ -8,6 +8,7 @@ import { PRICING_BY_TIER, DEFAULT_FEATURES_BY_TIER } from '../../db/models/subsc
 import { socketService, SocketEvents } from '../../services/socket';
 import { staffService } from '../../services/staff';
 import { cacheService, CacheKeys } from '../../services/redis/cache';
+import { fromSmallestUnit } from '../../utils/currency';
 import { redisService } from '../../services/redis';
 
 const app = new Hono();
@@ -160,7 +161,7 @@ async function handlePaymentIntentSucceeded(paymentIntent: any) {
   logger.info('[WEBHOOK DEBUG] PaymentIntent details', {
     id: paymentIntent.id,
     amount: paymentIntent.amount,
-    amountInDollars: paymentIntent.amount / 100,
+    amountInDollars: fromSmallestUnit(paymentIntent.amount, paymentIntent.currency || 'usd'),
     currency: paymentIntent.currency,
     status: paymentIntent.status,
     latestCharge: paymentIntent.latest_charge,
@@ -254,7 +255,7 @@ async function handlePaymentIntentSucceeded(paymentIntent: any) {
 
     logger.info('[WEBHOOK DEBUG] Payment intent succeeded handler completed', {
       paymentIntentId: paymentIntent.id,
-      amount: paymentIntent.amount / 100,
+      amount: fromSmallestUnit(paymentIntent.amount, paymentIntent.currency || 'usd'),
       orderFound: result.rows.length > 0,
     });
   });
@@ -435,7 +436,7 @@ async function handlePreorderPaymentFailed(paymentIntent: any) {
 }
 
 async function handleChargeRefunded(charge: any) {
-  const refundAmount = charge.amount_refunded / 100;
+  const refundAmount = fromSmallestUnit(charge.amount_refunded, charge.currency || 'usd');
 
   await transaction(async (client) => {
     // First try to find in orders table
@@ -541,7 +542,7 @@ async function handleAccountAuthorized(account: any) {
 async function handleTransferCreated(transfer: any) {
   logger.info('Transfer created', {
     transferId: transfer.id,
-    amount: transfer.amount / 100,
+    amount: fromSmallestUnit(transfer.amount, transfer.currency || 'usd'),
     destination: transfer.destination,
   });
 }
@@ -558,7 +559,7 @@ async function handlePayoutCreated(payout: any) {
 
   logger.info('Payout created', {
     payoutId: payout.id,
-    amount: payout.amount / 100,
+    amount: fromSmallestUnit(payout.amount, payout.currency || 'usd'),
   });
 }
 
@@ -574,7 +575,7 @@ async function handlePayoutPaid(payout: any) {
 
   logger.info('Payout paid', {
     payoutId: payout.id,
-    amount: payout.amount / 100,
+    amount: fromSmallestUnit(payout.amount, payout.currency || 'usd'),
   });
 }
 
@@ -589,7 +590,7 @@ async function handlePayoutFailed(payout: any) {
 
   logger.error('Payout failed', {
     payoutId: payout.id,
-    amount: payout.amount / 100,
+    amount: fromSmallestUnit(payout.amount, payout.currency || 'usd'),
     failureCode: payout.failure_code,
     failureMessage: payout.failure_message,
   });
@@ -936,7 +937,7 @@ async function handleInvoicePaymentSucceeded(invoice: any) {
     logger.info('Invoice payment succeeded', {
       invoiceId: invoice.id,
       subscriptionId: invoice.subscription,
-      amount: invoice.amount_paid / 100,
+      amount: fromSmallestUnit(invoice.amount_paid, invoice.currency || 'usd'),
     });
   });
 }
@@ -978,7 +979,7 @@ async function handleInvoicePaymentFailed(invoice: any) {
             sub.id,
             {
               invoiceId: invoice.id,
-              amountDue: invoice.amount_due / 100,
+              amountDue: fromSmallestUnit(invoice.amount_due, invoice.currency || 'usd'),
               attemptCount: invoice.attempt_count,
             },
           ]
@@ -1003,7 +1004,7 @@ async function handleInvoicePaymentFailed(invoice: any) {
   logger.error('Invoice payment failed', {
     invoiceId: invoice.id,
     subscriptionId: invoice.subscription,
-    amountDue: invoice.amount_due / 100,
+    amountDue: fromSmallestUnit(invoice.amount_due, invoice.currency || 'usd'),
   });
 }
 

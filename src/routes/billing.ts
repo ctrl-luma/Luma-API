@@ -9,6 +9,7 @@ import { query } from '../db';
 import type { SubscriptionPlatform } from '../db/models/subscription';
 import { cacheService, CacheKeys } from '../services/redis/cache';
 import { socketService, SocketEvents } from '../services/socket';
+import { getOrgCurrency } from '../utils/currency';
 
 // ============================================================================
 // Google Play API Client for IAP validation
@@ -491,6 +492,7 @@ app.openapi(paymentInfoRoute, async (c) => {
         userId: user.id,
         platform,
       });
+      const mobileCurrency = await getOrgCurrency(user.organization_id);
       return c.json({
         payment_method: null,
         manage_payment_url: null,
@@ -499,7 +501,7 @@ app.openapi(paymentInfoRoute, async (c) => {
         current_plan: dbSubscription?.tier === 'pro' ? {
           name: 'Pro Plan',
           price: 2999, // $29.99 in cents
-          currency: 'usd',
+          currency: mobileCurrency,
           interval: 'month' as const,
           description: 'Managed via ' + (platform === 'apple' ? 'App Store' : 'Google Play'),
         } : null,
@@ -938,10 +940,11 @@ app.openapi(subscriptionInfoRoute, async (c) => {
             : 'Unlimited features for your business',
       };
     } else if (isActiveSubscription && dbSubscription.tier === 'enterprise') {
+      const enterpriseCurrency = stripeSubscriptionCurrency || await getOrgCurrency(user.organization_id);
       currentPlan = {
         name: 'Enterprise Plan',
         price: dbSubscription.monthly_price || 29900,
-        currency: 'usd',
+        currency: enterpriseCurrency,
         interval: 'month' as const,
         description: 'Custom enterprise solution',
       };
