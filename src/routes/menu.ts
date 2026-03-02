@@ -336,7 +336,7 @@ app.openapi(createPreorderRoute, async (c) => {
     const orgCurrency = await getOrgCurrency(organizationId);
     if (body.paymentType === 'pay_now' && totalAmount > 0) {
       const totalCents = toSmallestUnit(totalAmount, orgCurrency);
-      platformFeeCents = calculatePlatformFee(totalCents, subTier);
+      platformFeeCents = calculatePlatformFee(totalCents, subTier, orgCurrency);
 
       const stripeAccounts = await query(
         `SELECT stripe_account_id FROM stripe_connected_accounts

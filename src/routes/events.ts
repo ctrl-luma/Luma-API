@@ -852,7 +852,7 @@ app.openapi(purchaseTicketsRoute, async (c) => {
       [event.organization_id]
     );
     const subTier = (subRows[0]?.tier || 'starter') as SubscriptionTier;
-    const platformFeeCents = calculatePlatformFee(totalCents, subTier);
+    const platformFeeCents = calculatePlatformFee(totalCents, subTier, orgCurrency);
 
     let paymentIntentId: string | null = null;
     let chargeId: string | null = null;

@@ -769,7 +769,7 @@ app.openapi(sendInvoiceRoute, async (c) => {
 
     // Calculate platform fee
     const totalCents = toSmallestUnit(parseFloat(invoice.total_amount as any), orgCurrency);
-    const platformFeeCents = calculatePlatformFee(totalCents, (sub.tier as SubscriptionTier) || 'pro');
+    const platformFeeCents = calculatePlatformFee(totalCents, (sub.tier as SubscriptionTier) || 'pro', orgCurrency);
 
     // Get or create Stripe customer on connected account
     const stripeCustomerId = await getOrCreateStripeCustomer(

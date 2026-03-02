@@ -497,14 +497,45 @@ SUBSCRIPTION_UPDATED, SESSION_KICKED
 
 ## Platform Fees
 
-```typescript
-// Applied via application_fee_amount on Stripe charges
-PLATFORM_FEES = {
-  starter:    { percentRate: 0.002, fixedCents: 3 },   // 0.2% + $0.03
-  pro:        { percentRate: 0.001, fixedCents: 1 },   // 0.1% + $0.01
-  enterprise: { percentRate: 0, fixedCents: 0 }        // Custom
-}
+Applied via `application_fee_amount` on Stripe charges. Source: `src/config/platform-fees.ts`.
+
+`calculatePlatformFee(amountCents, tier, currency?)` accepts an optional currency to apply regional overrides.
+
+**Default (US/CA/AU/NZ/SG/MY):**
 ```
+starter:    0.2% + 3 smallest units
+pro:        0.1% + 1 smallest unit
+enterprise: custom (0)
+```
+
+**EU/UK override (EUR/GBP/CHF/SEK/DKK/NOK/CZK):**
+```
+starter:    0.5% + 5 (scaled per currency)
+pro:        0.4% + 2 (scaled per currency)
+```
+
+EU/UK markup is higher because Stripe's base rate is ~1.4% (vs 2.7% in US). Total customer-facing rates remain well below US levels.
+
+### Stripe Base Rates (Terminal / Tap to Pay)
+
+| Region | Terminal Base | TTP Surcharge | Online (card) |
+|--------|-------------|---------------|---------------|
+| US/CA | 2.7% + $0.05 | +$0.10–$0.15 | 2.9% + $0.30 |
+| EU (EUR) | 1.4% + €0.10 | +€0.10 | 1.5% + €0.25 |
+| UK | 1.4% + £0.10 | +£0.10 | 1.5% + £0.20 |
+| AU | 1.7% + A$0.10 | 1.95% + A$0.15* | 1.75% + A$0.30 |
+| NZ | 2.6% + NZ$0.05 | +NZ$0.15 | 2.65% + NZ$0.30 |
+| CH | 1.4% + CHF 0.10 | +CHF 0.10 | 2.9% + CHF 0.30 |
+| SE | 1.4% + 1.00 kr | +1.05 kr | 1.5% + 1.80 kr |
+| DK | 1.4% + 0.75 kr | +0.70 kr | 1.5% + 1.80 kr |
+| NO | 1.4% + 1.00 kr | +1.05 kr | 2.4% + 2.00 kr |
+| CZ | 1.4% + 2.25 Kč | +2.20 Kč | 1.5% + 4.50 Kč |
+| SG | 3.4% + S$0.50 | +S$0.15 | 3.4% + S$0.50 |
+| MY | 2.8% + RM 0.50 | +RM 0.45 | 3.0% + RM 1.00 |
+
+*AU Tap to Pay has a separate rate (not a surcharge on terminal base).
+
+Rates sourced from official Stripe pricing pages (March 2026). Full per-country data also stored in `Luma-Marketing/lib/stripe-rates.ts`.
 
 ---
 

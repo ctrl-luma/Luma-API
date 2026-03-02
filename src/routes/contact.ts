@@ -10,10 +10,11 @@ const app = new OpenAPIHono();
 app.use('/', contactRateLimit);
 
 const ContactRequestSchema = z.object({
-  name: z.string().min(1).max(100),
+  name: z.string().max(100).optional(),
   email: z.string().email().max(254),
-  company: z.string().min(1).max(200),
+  company: z.string().max(200).optional(),
   message: z.string().min(1).max(5000),
+  subject: z.string().max(200).optional(),
 });
 
 const contactRoute = createRoute({
@@ -56,7 +57,9 @@ app.openapi(contactRoute, async (c) => {
   
   try {
     const validatedData = ContactRequestSchema.parse(body);
-    const { name, email, company, message } = validatedData;
+    const { email, message, subject: customSubject } = validatedData;
+    const name = validatedData.name || '';
+    const company = validatedData.company || '';
 
     const supportEmail = process.env.SUPPORT_EMAIL || 'support@lumapos.co';
 
@@ -68,43 +71,50 @@ app.openapi(contactRoute, async (c) => {
     const safeName = sanitizeName(name);
     const safeCompany = sanitizeName(company);
 
-    const html = `
-      <h2>New Contact Request</h2>
-      <p><strong>Name:</strong> ${escapeHtml(safeName)}</p>
-      <p><strong>Email:</strong> ${escapeHtml(email)}</p>
-      <p><strong>Company:</strong> ${escapeHtml(safeCompany)}</p>
-      <p><strong>Message:</strong></p>
-      <p>${escapeHtml(message).replace(/\n/g, '<br>')}</p>
-      <hr>
-      <p style="color: #666; font-size: 12px;">
-        This message was sent from the Luma POS contact form.
-      </p>
-    `;
+    const htmlParts = [
+      `<h2>${customSubject ? escapeHtml(customSubject) : 'New Contact Request'}</h2>`,
+      name ? `<p><strong>Name:</strong> ${escapeHtml(safeName)}</p>` : '',
+      `<p><strong>Email:</strong> ${escapeHtml(email)}</p>`,
+      company ? `<p><strong>Company:</strong> ${escapeHtml(safeCompany)}</p>` : '',
+      `<p><strong>Message:</strong></p>`,
+      `<p>${escapeHtml(message).replace(/\n/g, '<br>')}</p>`,
+      `<hr>`,
+      `<p style="color: #666; font-size: 12px;">This message was sent from the Luma POS website.</p>`,
+    ];
+    const html = htmlParts.filter(Boolean).join('\n');
 
-    const text = `New Contact Request
+    const textParts = [
+      customSubject || 'New Contact Request',
+      '',
+      name ? `Name: ${safeName}` : null,
+      `Email: ${email}`,
+      company ? `Company: ${safeCompany}` : null,
+      '',
+      'Message:',
+      message,
+      '',
+      '---',
+      'This message was sent from the Luma POS website.',
+    ];
+    const text = textParts.filter(v => v !== null).join('\n');
 
-Name: ${safeName}
-Email: ${email}
-Company: ${safeCompany}
-
-Message:
-${message}
-
----
-This message was sent from the Luma POS contact form.`;
+    const emailSubject = customSubject
+      ? `${customSubject} — ${email}`
+      : `Contact Request from ${safeName || email}${safeCompany ? ` (${safeCompany})` : ''}`;
 
     await emailService.sendEmail({
       to: supportEmail,
-      subject: `Contact Request from ${safeName} (${safeCompany})`,
+      subject: emailSubject,
       html,
       text,
       replyTo: email
     });
 
     logger.info('Contact request sent', {
-      name,
+      name: name || undefined,
       email,
-      company,
+      company: company || undefined,
+      subject: customSubject || undefined,
       supportEmail
     });
 

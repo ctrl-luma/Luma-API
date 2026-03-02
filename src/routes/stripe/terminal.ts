@@ -348,8 +348,8 @@ app.openapi(createPaymentIntentRoute, async (c) => {
     // Convert to smallest currency unit (cents for USD, yen for JPY, etc.)
     const amountInCents = toSmallestUnit(body.amount, currency);
 
-    // Calculate platform fee based on subscription tier
-    const platformFee = calculatePlatformFee(amountInCents, subscriptionTier);
+    // Calculate platform fee based on subscription tier and currency
+    const platformFee = calculatePlatformFee(amountInCents, subscriptionTier, currency);
 
     // Determine payment method type and capture method
     const paymentMethodType = body.paymentMethodType || 'card_present';
@@ -1008,8 +1008,8 @@ app.openapi(simulatePaymentRoute, async (c) => {
         { stripeAccount: connectedAccount.stripe_account_id }
       );
 
-      // Calculate platform fee based on subscription tier
-      const platformFee = calculatePlatformFee(paymentIntent.amount, subscriptionTier);
+      // Calculate platform fee based on subscription tier and currency
+      const platformFee = calculatePlatformFee(paymentIntent.amount, subscriptionTier, paymentIntent.currency);
 
       // Create a new payment intent with card payment method
       const newPaymentIntent = await stripe.paymentIntents.create(
@@ -1461,7 +1461,7 @@ app.openapi(processReaderPaymentRoute, async (c) => {
       }
 
       const amountInCents = toSmallestUnit(body.amount, currency);
-      const platformFee = calculatePlatformFee(amountInCents, subscriptionTier);
+      const platformFee = calculatePlatformFee(amountInCents, subscriptionTier, currency);
 
       const paymentIntent = await stripe.paymentIntents.create(
         {

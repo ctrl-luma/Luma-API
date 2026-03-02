@@ -13,6 +13,7 @@ import { cacheService, CacheKeys } from '../../services/redis/cache';
 import { imageService } from '../../services/images';
 import { stripe } from '../../services/stripe';
 import { loginRateLimit, forgotPasswordRateLimit, resetPasswordRateLimit, checkRateLimit } from '../../middleware/rate-limit';
+import { getComputedRates } from '../../config/stripe-rates';
 
 const app = new OpenAPIHono({
   defaultHook: (result, c) => {
@@ -755,11 +756,13 @@ app.openapi(getCurrentUserRoute, async (c) => {
           'SELECT tap_to_pay_device_ids, currency FROM organizations WHERE id = $1',
           [dbUser.organization_id]
         );
+        const currency = orgResult[0]?.currency || 'usd';
         return {
           tapToPayDeviceIds: orgResult.length > 0 && Array.isArray(orgResult[0].tap_to_pay_device_ids)
             ? orgResult[0].tap_to_pay_device_ids
             : [],
-          currency: orgResult[0]?.currency || 'usd',
+          currency,
+          rates: getComputedRates(currency),
         };
       })(),
     });
