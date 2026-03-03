@@ -5,6 +5,7 @@ import { createClient } from 'redis';
 import { config } from '../../config';
 import { logger } from '../../utils/logger';
 import { authService } from '../auth';
+import { cacheService, CacheKeys } from '../redis/cache';
 
 export interface SocketUser {
   userId: string;
@@ -224,6 +225,13 @@ export class SocketService {
         totalConnectedUsers: this.connectedUsers.size,
       });
     }
+
+    // Invalidate analytics Redis cache for events that affect revenue data
+    if (ANALYTICS_INVALIDATING_EVENTS.has(event)) {
+      cacheService.invalidateByPattern(CacheKeys.analyticsPattern(organizationId)).catch(err => {
+        logger.error('Failed to invalidate analytics cache', { organizationId, event, error: err });
+      });
+    }
   }
 
   emitToEvent(eventId: string, event: string, data: any) {
@@ -303,6 +311,25 @@ export class SocketService {
 }
 
 export const socketService = new SocketService();
+
+// Events that affect analytics data — triggers Redis analytics cache invalidation
+const ANALYTICS_INVALIDATING_EVENTS = new Set([
+  'order:created',
+  'order:completed',
+  'order:refunded',
+  'order:deleted',
+  'payment:received',
+  'revenue:update',
+  'ticket:purchased',
+  'ticket:refunded',
+  'preorder:created',
+  'preorder:completed',
+  'preorder:cancelled',
+  'invoice:paid',
+  'invoice:updated',
+  'invoice:voided',
+  'terminal:payment_succeeded',
+]);
 
 export const SocketEvents = {
   // Order events

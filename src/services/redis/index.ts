@@ -201,6 +201,24 @@ export class RedisService {
     }
   }
 
+  async deleteByPattern(pattern: string): Promise<number> {
+    try {
+      let deleted = 0;
+      let cursor = 0;
+      do {
+        const result = await this.client.scan(cursor, { MATCH: pattern, COUNT: 100 });
+        cursor = result.cursor;
+        if (result.keys.length > 0) {
+          deleted += await this.client.del(result.keys);
+        }
+      } while (cursor !== 0);
+      return deleted;
+    } catch (error) {
+      logger.error('Redis deleteByPattern error:', { pattern, error });
+      return 0;
+    }
+  }
+
   async flushall(): Promise<void> {
     try {
       await this.client.flushAll();

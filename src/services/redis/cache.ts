@@ -61,8 +61,16 @@ export class CacheService {
     }
   }
 
-  async invalidate(_pattern: string, _options?: CacheOptions): Promise<void> {
-    logger.warn('Cache invalidation not implemented for pattern matching');
+  async invalidateByPattern(pattern: string): Promise<number> {
+    const fullPattern = `${this.keyPrefix}${pattern}`;
+    try {
+      const deleted = await redisService.deleteByPattern(fullPattern);
+      logger.debug('Cache invalidated by pattern', { pattern: fullPattern, deleted });
+      return deleted;
+    } catch (error) {
+      logger.error('Cache invalidateByPattern error', { pattern: fullPattern, error });
+      return 0;
+    }
   }
 
   async remember<T>(
@@ -99,4 +107,5 @@ export const CacheKeys = {
   user: (id: string) => cacheKey('user', id),
   userByEmail: (email: string) => cacheKey('user', 'email', email),
   sessionVersion: (userId: string) => cacheKey('session', 'version', userId),
+  analyticsPattern: (orgId: string) => `analytics:${orgId}:*`,
 } as const;

@@ -710,8 +710,8 @@ app.openapi(cancelPreorderRoute, async (c) => {
 
     logger.info('Preorder cancelled by customer', { preorderId: id });
 
-    // Emit socket event
-    socketService.emitToOrganization(preorder.organization_id, SocketEvents.PREORDER_UPDATED, {
+    // Emit socket event (use PREORDER_CANCELLED so analytics cache is invalidated)
+    socketService.emitToOrganization(preorder.organization_id, SocketEvents.PREORDER_CANCELLED, {
       preorderId: id,
       status: 'cancelled',
       cancelledBy: 'customer',
