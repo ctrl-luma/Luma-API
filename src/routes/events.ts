@@ -79,6 +79,7 @@ function formatEvent(row: any) {
     refundPolicy: row.refund_policy || null,
     contactEmail: row.contact_email || null,
     ageRestriction: row.age_restriction || null,
+    isRsvpOnly: row.is_rsvp_only ?? false,
     ticketsSold: parseInt(row.tickets_sold) || 0,
     ticketsScanned: parseInt(row.tickets_scanned) || 0,
     totalCapacity: parseInt(row.total_capacity) || null,
@@ -151,6 +152,7 @@ const eventResponseSchema = z.object({
   refundPolicy: z.string().nullable(),
   contactEmail: z.string().nullable(),
   ageRestriction: z.string().nullable(),
+  isRsvpOnly: z.boolean(),
   ticketsSold: z.number(),
   totalCapacity: z.number().nullable(),
   timezone: z.string(),
@@ -188,6 +190,7 @@ const createEventSchema = z.object({
   refundPolicy: z.string().max(300).nullable().optional(),
   contactEmail: z.string().email().max(255).nullable().optional(),
   ageRestriction: z.string().max(100).nullable().optional(),
+  isRsvpOnly: z.boolean().optional().default(false),
   tiers: z.array(tierSchema).min(1),
 });
 
@@ -211,6 +214,7 @@ const updateEventSchema = z.object({
   refundPolicy: z.string().max(300).nullable().optional(),
   contactEmail: z.string().email().max(255).nullable().optional(),
   ageRestriction: z.string().max(100).nullable().optional(),
+  isRsvpOnly: z.boolean().optional(),
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -295,6 +299,11 @@ app.openapi(createEventRoute, async (c) => {
 
     const body = await c.req.json();
 
+    // Force all tier prices to 0 for RSVP-only events
+    if (body.isRsvpOnly) {
+      for (const tier of body.tiers) { tier.price = 0; }
+    }
+
     // Generate or validate slug
     let slug = body.slug ? body.slug : generateSlug(body.name);
     // Ensure unique slug
@@ -321,8 +330,9 @@ app.openapi(createEventRoute, async (c) => {
           location_name, location_address, latitude, longitude,
           starts_at, ends_at, sales_start_at, sales_end_at,
           image_url, banner_url, visibility, timezone, status, created_by,
-          max_tickets_per_order, refund_policy, contact_email, age_restriction
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'draft',$17,$18,$19,$20,$21)
+          max_tickets_per_order, refund_policy, contact_email, age_restriction,
+          is_rsvp_only
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'draft',$17,$18,$19,$20,$21,$22)
         RETURNING *`,
         [
           payload.organizationId, body.name, slug, body.description || null,
@@ -335,6 +345,7 @@ app.openapi(createEventRoute, async (c) => {
           payload.userId,
           body.maxTicketsPerOrder ?? 10, body.refundPolicy || null,
           body.contactEmail || null, body.ageRestriction || null,
+          body.isRsvpOnly ?? false,
         ]
       );
       const event = eventResult.rows[0];
@@ -811,7 +822,7 @@ app.openapi(purchaseTicketsRoute, async (c) => {
 
     const event = events[0];
     const connectedAccountId = event.connected_account_id;
-    if (!connectedAccountId) {
+    if (!connectedAccountId && !event.is_rsvp_only) {
       return c.json({ error: 'This organization cannot accept payments yet' }, 400);
     }
 
@@ -1565,6 +1576,7 @@ app.openapi(updateEventRoute, async (c) => {
       maxTicketsPerOrder: 'max_tickets_per_order',
       refundPolicy: 'refund_policy', contactEmail: 'contact_email',
       ageRestriction: 'age_restriction',
+      isRsvpOnly: 'is_rsvp_only',
     };
 
     const updates: string[] = [];
@@ -1611,6 +1623,11 @@ app.openapi(updateEventRoute, async (c) => {
     );
 
     if (!rows[0]) return c.json({ error: 'Event not found' }, 404);
+
+    // When switching to RSVP-only, force all existing tier prices to 0
+    if (body.isRsvpOnly === true) {
+      await query('UPDATE ticket_tiers SET price = 0, updated_at = NOW() WHERE event_id = $1', [id]);
+    }
 
     socketService.emitToOrganization(payload.organizationId, SocketEvents.EVENT_UPDATED, {
       eventId: rows[0].id,
