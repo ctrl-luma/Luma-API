@@ -422,7 +422,7 @@ const paymentInfoRoute = createRoute({
             manage_subscription_url: z.string().optional(),
             cancel_at: z.string().nullable(),
             canceled_at: z.string().nullable(),
-            platform: z.enum(['stripe', 'apple', 'google']).optional(),
+            platform: z.enum(['stripe', 'apple', 'google', 'manual']).optional(),
           }),
         },
       },
@@ -486,24 +486,27 @@ app.openapi(paymentInfoRoute, async (c) => {
       trialEligible,
     });
 
-    // For Apple/Google subscriptions, return minimal info (managed in-app)
-    if (platform === 'apple' || platform === 'google') {
-      logger.info('User has mobile subscription, returning platform-specific info', {
+    // For Apple/Google/Manual subscriptions, return minimal info (no Stripe portal)
+    if (platform === 'apple' || platform === 'google' || platform === 'manual') {
+      logger.info('User has non-Stripe subscription, returning platform-specific info', {
         userId: user.id,
         platform,
       });
       const mobileCurrency = await getOrgCurrency(user.organization_id);
+      const platformDescription = platform === 'apple' ? 'Managed via App Store'
+        : platform === 'google' ? 'Managed via Google Play'
+        : 'Managed by Luma';
       return c.json({
         payment_method: null,
         manage_payment_url: null,
         next_billing_date: dbSubscription?.current_period_end?.toISOString() || null,
         subscription_status: dbSubscription?.status || 'none',
-        current_plan: dbSubscription?.tier === 'pro' ? {
-          name: 'Pro Plan',
-          price: 2999, // $29.99 in cents
+        current_plan: dbSubscription?.tier !== 'starter' ? {
+          name: dbSubscription?.tier === 'enterprise' ? 'Enterprise Plan' : 'Pro Plan',
+          price: dbSubscription?.tier === 'enterprise' ? 0 : 2999,
           currency: mobileCurrency,
           interval: 'month' as const,
-          description: 'Managed via ' + (platform === 'apple' ? 'App Store' : 'Google Play'),
+          description: platformDescription,
         } : null,
         manage_subscription_url: null,
         cancel_at: dbSubscription?.cancel_at?.toISOString() || null,
@@ -765,7 +768,7 @@ const subscriptionInfoRoute = createRoute({
           schema: z.object({
             tier: z.enum(['starter', 'pro', 'enterprise', 'none']),
             status: z.enum(['active', 'past_due', 'canceled', 'trialing', 'none']),
-            platform: z.enum(['stripe', 'apple', 'google']),
+            platform: z.enum(['stripe', 'apple', 'google', 'manual']),
             current_plan: z.object({
               name: z.string(),
               price: z.number(),
@@ -937,7 +940,9 @@ app.openapi(subscriptionInfoRoute, async (c) => {
           ? 'Managed via App Store'
           : platform === 'google'
             ? 'Managed via Google Play'
-            : 'Unlimited features for your business',
+            : platform === 'manual'
+              ? 'Managed by Luma'
+              : 'Unlimited features for your business',
       };
     } else if (isActiveSubscription && dbSubscription.tier === 'enterprise') {
       const enterpriseCurrency = stripeSubscriptionCurrency || await getOrgCurrency(user.organization_id);
@@ -1067,10 +1072,10 @@ app.openapi(createUpgradeSessionRoute, async (c) => {
       const isCanceledButStillValid = existingSub.status === 'canceled' && periodEnd && periodEnd > now;
       const isCurrentlyActive = isStatusActive || isCanceledButStillValid;
 
-      const isMobilePlatform = existingSub.platform === 'apple' || existingSub.platform === 'google';
+      const isNonStripePlatform = existingSub.platform === 'apple' || existingSub.platform === 'google' || existingSub.platform === 'manual';
 
-      if (isCurrentlyActive && isMobilePlatform && existingSub.tier !== 'starter') {
-        const storeName = existingSub.platform === 'apple' ? 'App Store' : 'Google Play';
+      if (isCurrentlyActive && isNonStripePlatform && existingSub.tier !== 'starter') {
+        const storeName = existingSub.platform === 'apple' ? 'App Store' : existingSub.platform === 'google' ? 'Google Play' : 'Luma';
         logger.info('User tried to create Stripe upgrade but has active mobile subscription', {
           userId: user.id,
           platform: existingSub.platform,
@@ -1515,13 +1520,13 @@ app.openapi(validateReceiptRoute, async (c) => {
     );
     const existingSub = existingSubRows[0];
 
-    // Check if user is on the Stripe platform - they are locked to Stripe forever
-    // Once a user signs up via website OR purchases a Stripe subscription, they cannot use IAP
+    // Check if user is on Stripe or manual platform - they are locked out of IAP
+    // Once a user signs up via website, purchases a Stripe subscription, or has a manual sub, they cannot use IAP
     // This prevents platform switching and ensures consistent billing management
-    const isStripePlatformUser = existingSub && existingSub.platform === 'stripe';
+    const isLockedPlatformUser = existingSub && (existingSub.platform === 'stripe' || existingSub.platform === 'manual');
 
-    if (isStripePlatformUser) {
-      logger.warn('User is on Stripe platform, cannot use IAP', {
+    if (isLockedPlatformUser) {
+      logger.warn('User is on locked platform, cannot use IAP', {
         userId: user.id,
         existingTier: existingSub.tier,
         existingPlatform: existingSub.platform,

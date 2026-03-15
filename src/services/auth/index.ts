@@ -91,7 +91,20 @@ export class AuthService {
 
   async login(email: string, password: string, source: 'app' | 'web' = 'web'): Promise<AuthTokens & { sessionVersion: number }> {
     const user = await this.getUserByEmail(email);
-    if (!user || !user.is_active) {
+    if (!user) {
+      throw new Error('Invalid credentials');
+    }
+
+    // If account has pending deletion, cancel the deletion and reactivate on login
+    if (!user.is_active && user.deletion_requested_at) {
+      await query(
+        `UPDATE users SET is_active = true, deletion_requested_at = NULL, deletion_reminder_sent = false, updated_at = NOW() WHERE id = $1`,
+        [user.id]
+      );
+      await cacheService.del(CacheKeys.user(user.id));
+      await cacheService.del(CacheKeys.userByEmail(user.email));
+      logger.info('Account deletion canceled via login', { userId: user.id, email: user.email });
+    } else if (!user.is_active) {
       throw new Error('Invalid credentials');
     }
 

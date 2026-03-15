@@ -5,14 +5,15 @@ import { query, transaction } from '../db';
 // import { Event, TicketTier, Ticket } from '../db/models';
 import { logger } from '../utils/logger';
 import { socketService, SocketEvents } from '../services/socket';
-import { calculatePlatformFee, SubscriptionTier } from '../config/platform-fees';
-import { getOrgCurrency, toSmallestUnit, formatCurrency as formatCurrencyUtil } from '../utils/currency';
+import { SubscriptionTier } from '../config/platform-fees';
+import { getOrgCurrency, toSmallestUnit, fromSmallestUnit, formatCurrency as formatCurrencyUtil } from '../utils/currency';
 import { randomBytes } from 'crypto';
 import { imageService, getImageUrl, type ImageType } from '../services/images';
 import { queueService, QueueName } from '../services/queue';
 import QRCode from 'qrcode';
 import { generateAppleWalletPass, generateGoogleWalletUrl, isAppleWalletAvailable, isGoogleWalletAvailable } from '../services/wallet';
 import { geocodeAddress } from '../services/geocoder';
+import { clawbackReferralEarnings } from '../services/referrals';
 
 const app = new OpenAPIHono();
 
@@ -857,13 +858,36 @@ app.openapi(purchaseTicketsRoute, async (c) => {
     const totalDollars = unitPrice * body.quantity;
     const totalCents = toSmallestUnit(totalDollars, orgCurrency);
 
-    // Get subscription tier for platform fees
-    const subRows = await query<{ tier: string }>(
-      `SELECT tier FROM subscriptions WHERE organization_id = $1 AND status IN ('active', 'trialing') LIMIT 1`,
-      [event.organization_id]
-    );
-    const subTier = (subRows[0]?.tier || 'starter') as SubscriptionTier;
-    const platformFeeCents = calculatePlatformFee(totalCents, subTier, orgCurrency);
+    // Luma platform fee: $1.00 flat per ticket (100 smallest units)
+    // Stripe processing fee passed through to customer via gross-up
+    const LUMA_FEE_PER_TICKET_CENTS = 100;
+    const lumaFeePerTicketCents = totalCents > 0 ? LUMA_FEE_PER_TICKET_CENTS : 0;
+    const lumaFeeTotalCents = lumaFeePerTicketCents * body.quantity;
+
+    // Estimated Stripe online card rates by currency
+    const STRIPE_ONLINE_RATES: Record<string, { percent: number; fixed: number }> = {
+      usd: { percent: 0.029, fixed: 30 }, cad: { percent: 0.029, fixed: 30 },
+      gbp: { percent: 0.015, fixed: 20 }, eur: { percent: 0.015, fixed: 25 },
+      aud: { percent: 0.0175, fixed: 30 }, nzd: { percent: 0.0265, fixed: 30 },
+      sek: { percent: 0.015, fixed: 180 }, dkk: { percent: 0.015, fixed: 180 },
+      nok: { percent: 0.024, fixed: 200 }, chf: { percent: 0.029, fixed: 30 },
+      czk: { percent: 0.015, fixed: 450 }, sgd: { percent: 0.034, fixed: 50 },
+      myr: { percent: 0.030, fixed: 100 },
+    };
+    const stripeRate = STRIPE_ONLINE_RATES[orgCurrency.toLowerCase()] || STRIPE_ONLINE_RATES.usd;
+
+    // Gross-up: vendor nets exactly the ticket subtotal
+    // Iterate to account for Stripe's independent fee rounding
+    let grandTotalCents = 0;
+    if (totalCents > 0) {
+      grandTotalCents = Math.ceil((totalCents + lumaFeeTotalCents + stripeRate.fixed) / (1 - stripeRate.percent));
+      for (let i = 0; i < 10; i++) {
+        const estStripeFee = Math.round(grandTotalCents * stripeRate.percent) + stripeRate.fixed;
+        if (grandTotalCents - lumaFeeTotalCents - estStripeFee >= totalCents) break;
+        grandTotalCents++;
+      }
+    }
+    const grandTotalDollars = fromSmallestUnit(grandTotalCents, orgCurrency);
 
     let paymentIntentId: string | null = null;
     let chargeId: string | null = null;
@@ -881,12 +905,12 @@ app.openapi(purchaseTicketsRoute, async (c) => {
 
       const paymentIntent = await stripe.paymentIntents.create(
         {
-          amount: totalCents,
+          amount: grandTotalCents,
           currency: orgCurrency,
           payment_method: clonedPm.id,
           payment_method_types: ['card'],
           confirm: true,
-          application_fee_amount: platformFeeCents,
+          application_fee_amount: lumaFeeTotalCents,
           receipt_email: body.customerEmail,
           metadata: {
             event_id: event.id,
@@ -923,7 +947,7 @@ app.openapi(purchaseTicketsRoute, async (c) => {
             body.tierId, event.id, event.organization_id,
             customerEmail, body.customerName, qrCode,
             paymentIntentId, chargeId,
-            unitPrice, Math.round(platformFeeCents / body.quantity),
+            unitPrice, lumaFeePerTicketCents,
             customerIp,
           ]
         );
@@ -950,7 +974,9 @@ app.openapi(purchaseTicketsRoute, async (c) => {
       logger.info('Tickets purchased', {
         eventId: event.id,
         quantity: body.quantity,
-        totalAmount: totalDollars,
+        subtotal: totalDollars,
+        serviceFee: fromSmallestUnit(lumaFeeTotalCents, orgCurrency),
+        totalCharged: grandTotalDollars,
         customerEmail: body.customerEmail,
       });
 
@@ -982,10 +1008,13 @@ app.openapi(purchaseTicketsRoute, async (c) => {
           eventLocationAddress: event.location_address,
           tierName: tier.name,
           quantity: body.quantity,
-          totalAmount: totalDollars,
+          totalAmount: grandTotalDollars,
+          serviceFee: fromSmallestUnit(lumaFeeTotalCents, orgCurrency),
+          subtotal: totalDollars,
           tickets: tickets.map(t => ({ id: t.id, qrCode: t.qr_code })),
           eventSlug: event.slug,
           apiUrl: process.env.API_URL || 'http://localhost:3334',
+          eventImageUrl: event.image_url || null,
         },
       });
 
@@ -1009,6 +1038,7 @@ app.openapi(purchaseTicketsRoute, async (c) => {
             tickets: tickets.map(t => ({ id: t.id, qrCode: t.qr_code })),
             eventSlug: event.slug,
             apiUrl: process.env.API_URL || 'http://localhost:3334',
+            eventImageUrl: event.image_url || null,
           },
         }, { delay: msUntilReminder });
       }
@@ -1016,7 +1046,9 @@ app.openapi(purchaseTicketsRoute, async (c) => {
       return c.json({
         tickets: tickets.map(t => formatTicket({ ...t, tier_name: tier.name })),
         paymentIntentId,
-        totalAmount: totalDollars,
+        totalAmount: grandTotalDollars,
+        subtotal: totalDollars,
+        serviceFee: fromSmallestUnit(lumaFeeTotalCents, orgCurrency),
         customerEmail: body.customerEmail,
       });
     });
@@ -2102,8 +2134,8 @@ app.openapi(refundTicketRoute, async (c) => {
 
       const refundCents = toSmallestUnit(refundAmount, refundCurrency);
 
-      // Create refund on the connected account
-      // NOTE: Platform fee is NOT refunded - Luma keeps it
+      // Create refund on the connected account (vendor pays)
+      // NOTE: Service fee is NOT refunded - Luma keeps it
       const refund = await stripe.refunds.create(
         {
           charge: ticket.stripe_charge_id,
@@ -2154,6 +2186,15 @@ app.openapi(refundTicketRoute, async (c) => {
       refundAmount,
       isFullRefund,
     });
+
+    // Clawback referral earnings for this ticket sale
+    if (ticket.stripe_payment_intent_id) {
+      try {
+        await clawbackReferralEarnings(ticket.stripe_payment_intent_id, 'Ticket refunded');
+      } catch (clawbackErr) {
+        logger.error('[Events] Failed to clawback referral earnings on ticket refund', { error: clawbackErr, ticketId });
+      }
+    }
 
     // Queue refund notification email
     const eventDate = new Date(ticket.starts_at);
@@ -2284,6 +2325,7 @@ app.openapi(resendTicketEmailRoute, async (c) => {
         tickets: tickets.map((t: any) => ({ id: t.id, qrCode: t.qr_code })),
         eventSlug: event.slug,
         apiUrl: process.env.API_URL || 'http://localhost:3334',
+        eventImageUrl: event.image_url || null,
       },
     });
 

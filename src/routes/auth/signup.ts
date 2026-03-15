@@ -15,6 +15,7 @@ import { queueService, QueueName } from '../../services/queue';
 import Stripe from 'stripe';
 import { syncAccountFromStripe } from '../stripe/connect';
 import { signupRateLimit } from '../../middleware/rate-limit';
+import { socketService, SocketEvents } from '../../services/socket';
 
 const app = new OpenAPIHono({
   defaultHook: (result, c) => {
@@ -65,6 +66,8 @@ const SignupRequestSchema = z.object({
   iapReceipt: z.string().optional(), // Purchase token (Android) or receipt (iOS)
   iapTransactionId: z.string().optional(), // Transaction ID from the IAP
   iapProductId: z.string().optional(), // Product ID (e.g., 'lumaproplan')
+  // Referral code from referral link
+  referralCode: z.string().optional(),
 });
 
 const SignupResponseSchema = z.object({
@@ -249,7 +252,8 @@ app.openapi(signupRoute, async (c) => {
     }
 
     let paymentIntentClientSecret: string | undefined;
-    
+    let referrerUser: any = null;
+
     const result = await transaction(async (client) => {
       // 1. Create organization
       const orgResult = await client.query(
@@ -297,6 +301,49 @@ app.openapi(signupRoute, async (c) => {
         ]
       );
       const user = userResult.rows[0];
+
+      // 3.5. Handle referral code
+      if (validated.referralCode) {
+        const referrerResult = await client.query(
+          `SELECT id, email, first_name, organization_id FROM users
+           WHERE LOWER(referral_code) = LOWER(TRIM($1)) AND is_active = true`,
+          [validated.referralCode]
+        );
+
+        if (referrerResult.rows.length > 0) {
+          referrerUser = referrerResult.rows[0];
+
+          // Prevent self-referral (normalize both sides to catch +aliases, casing)
+          if (normalizeEmail(referrerUser.email) !== normalizedEmail) {
+            // Set referred_by on the new user
+            await client.query(
+              `UPDATE users SET referred_by_user_id = $1 WHERE id = $2`,
+              [referrerUser.id, user.id]
+            );
+
+            // Create referral record
+            await client.query(
+              `INSERT INTO referrals (referrer_user_id, referred_user_id, referral_code, status, expires_at)
+               VALUES ($1, $2, $3, 'pending', NOW() + INTERVAL '90 days')`,
+              [referrerUser.id, user.id, validated.referralCode.trim()]
+            );
+
+            logger.info('[Signup] Referral recorded', {
+              referrerId: referrerUser.id,
+              referredUserId: user.id,
+              referralCode: validated.referralCode,
+            });
+          } else {
+            logger.warn('[Signup] Self-referral attempted', { email: normalizedEmail });
+            referrerUser = null; // Reset so we don't notify
+          }
+        } else {
+          logger.warn('[Signup] Invalid referral code used during signup', {
+            referralCode: validated.referralCode,
+            email: normalizedEmail,
+          });
+        }
+      }
 
       // 4. Create Cognito user
       let cognitoUserId: string | undefined;
@@ -553,6 +600,18 @@ app.openapi(signupRoute, async (c) => {
         organizationId: result.organization.id,
         email: normalizedEmail,
       });
+    }
+
+    // 7.6. Notify referrer about new referral (non-blocking)
+    if (referrerUser) {
+      try {
+        socketService.emitToUser(referrerUser.id, SocketEvents.REFERRAL_CREATED, {
+          referredFirstName: validated.firstName,
+          timestamp: new Date(),
+        });
+      } catch (err) {
+        logger.error('[Signup] Failed to notify referrer', { error: err });
+      }
     }
 
     // 8. Authenticate user with Cognito to get tokens

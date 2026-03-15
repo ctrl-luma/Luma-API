@@ -37,6 +37,8 @@ export interface User {
   invite_token: string | null;
   invite_expires_at: Date | null;
   invite_accepted_at: Date | null;
+  deletion_requested_at: Date | null;
+  deletion_reminder_sent: boolean;
   created_at: Date;
   updated_at: Date;
 }

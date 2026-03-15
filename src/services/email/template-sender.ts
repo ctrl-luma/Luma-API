@@ -295,7 +295,7 @@ ${itemsList}<br><br>
   if (vendorBranding) {
     await sendVendorTemplatedEmail(to, vars, vendorBranding);
   } else {
-    await sendTemplatedEmail(to, vars);
+    await sendVendorTemplatedEmail(to, vars, { organizationName: 'Order', brandingLogoUrl: null });
   }
 }
 
@@ -330,7 +330,7 @@ Thank you for your purchase!`;
   if (vendorBranding) {
     await sendVendorTemplatedEmail(to, vars, vendorBranding);
   } else {
-    await sendTemplatedEmail(to, vars);
+    await sendVendorTemplatedEmail(to, vars, { organizationName: 'Receipt', brandingLogoUrl: null });
   }
 }
 
@@ -389,6 +389,7 @@ export async function sendTicketConfirmationEmail(to: string, ticketData: {
   tickets: { id: string; qrCode: string }[];
   eventSlug: string;
   apiUrl: string;
+  eventImageUrl?: string | null;
 }, vendorBranding?: VendorBranding, currency: string = 'usd'): Promise<void> {
   const ticketRows = ticketData.tickets.map((t, i) => `
     <div style="border: 1px solid #374151; border-radius: 12px; padding: 16px; margin-bottom: 12px; text-align: center;">
@@ -410,7 +411,11 @@ export async function sendTicketConfirmationEmail(to: string, ticketData: {
     ? `<br><strong>Location:</strong> ${ticketData.eventLocation}<br><span style="font-size: 12px;"><a href="${appleMapsUrl}" style="color: #60A5FA; text-decoration: underline;" target="_blank">Apple Maps</a> · <a href="${googleMapsUrl}" style="color: #60A5FA; text-decoration: underline;" target="_blank">Google Maps</a></span>`
     : '';
 
-  const emailContent = `Hi ${ticketData.customerName},<br><br>
+  const eventBanner = ticketData.eventImageUrl
+    ? `<div style="margin: 0 0 24px 0; border-radius: 12px; overflow: hidden;"><img src="${ticketData.eventImageUrl}" alt="${ticketData.eventName}" width="520" style="display: block; width: 100%; height: auto; border-radius: 12px;" /></div>`
+    : '';
+
+  const emailContent = `${eventBanner}Hi ${ticketData.customerName},<br><br>
 Your ticket${ticketData.quantity > 1 ? 's are' : ' is'} confirmed for <strong>${ticketData.eventName}</strong>!<br><br>
 <strong>Date:</strong> ${ticketData.eventDate}<br>
 <strong>Time:</strong> ${ticketData.eventTime}${locationLine}<br>
@@ -433,7 +438,8 @@ ${ticketRows}`;
   if (vendorBranding) {
     await sendVendorTemplatedEmail(to, vars, vendorBranding);
   } else {
-    await sendTemplatedEmail(to, vars);
+    // Always use vendor template for customer-facing ticket emails
+    await sendVendorTemplatedEmail(to, vars, { organizationName: 'Event', brandingLogoUrl: null });
   }
 }
 
@@ -488,7 +494,7 @@ If you have any questions, please contact the event organizer.`;
   if (vendorBranding) {
     await sendVendorTemplatedEmail(to, vars, vendorBranding);
   } else {
-    await sendTemplatedEmail(to, vars);
+    await sendVendorTemplatedEmail(to, vars, { organizationName: 'Event', brandingLogoUrl: null });
   }
 }
 
@@ -502,6 +508,7 @@ export async function sendTicketReminderEmail(to: string, ticketData: {
   tickets: { id: string; qrCode: string }[];
   eventSlug: string;
   apiUrl: string;
+  eventImageUrl?: string | null;
 }, vendorBranding?: VendorBranding): Promise<void> {
   // Use address for maps link if available, fallback to location name
   const mapsQuery = encodeURIComponent(ticketData.eventLocationAddress || ticketData.eventLocation || '');
@@ -520,7 +527,11 @@ export async function sendTicketReminderEmail(to: string, ticketData: {
 
   const siteUrl = config.email.siteUrl || 'https://lumapos.co';
 
-  const emailContent = `Hi ${ticketData.customerName},<br><br>
+  const eventBanner = ticketData.eventImageUrl
+    ? `<div style="margin: 0 0 24px 0; border-radius: 12px; overflow: hidden;"><img src="${ticketData.eventImageUrl}" alt="${ticketData.eventName}" width="520" style="display: block; width: 100%; height: auto; border-radius: 12px;" /></div>`
+    : '';
+
+  const emailContent = `${eventBanner}Hi ${ticketData.customerName},<br><br>
 Just a friendly reminder — <strong>${ticketData.eventName}</strong> is tomorrow!<br><br>
 <strong>Date:</strong> ${ticketData.eventDate}<br>
 <strong>Time:</strong> ${ticketData.eventTime}${locationLine}<br><br>
@@ -539,7 +550,8 @@ ${qrSection}`;
   if (vendorBranding) {
     await sendVendorTemplatedEmail(to, vars, vendorBranding);
   } else {
-    await sendTemplatedEmail(to, vars);
+    // Always use vendor template for customer-facing ticket emails
+    await sendVendorTemplatedEmail(to, vars, { organizationName: 'Event', brandingLogoUrl: null });
   }
 }
 
@@ -637,7 +649,7 @@ Track your order status in real-time using the button below. We'll also email yo
   if (vendorBranding) {
     await sendVendorTemplatedEmail(to, vars, vendorBranding);
   } else {
-    await sendTemplatedEmail(to, vars);
+    await sendVendorTemplatedEmail(to, vars, { organizationName: 'Order', brandingLogoUrl: null });
   }
 }
 
@@ -677,7 +689,7 @@ Please come pick up your order at your earliest convenience. Show your order num
   if (vendorBranding) {
     await sendVendorTemplatedEmail(to, vars, vendorBranding);
   } else {
-    await sendTemplatedEmail(to, vars);
+    await sendVendorTemplatedEmail(to, vars, { organizationName: 'Order', brandingLogoUrl: null });
   }
 }
 
@@ -743,7 +755,7 @@ Click the button below to view and pay your invoice securely.`;
   if (vendorBranding) {
     await sendVendorTemplatedEmail(to, vars, vendorBranding);
   } else {
-    await sendTemplatedEmail(to, vars);
+    await sendVendorTemplatedEmail(to, vars, { organizationName: invoiceData.organizationName, brandingLogoUrl: null });
   }
 }
 
@@ -772,7 +784,7 @@ No further action is needed.${pdfLine}`;
   if (vendorBranding) {
     await sendVendorTemplatedEmail(to, vars, vendorBranding);
   } else {
-    await sendTemplatedEmail(to, vars);
+    await sendVendorTemplatedEmail(to, vars, { organizationName: invoiceData.organizationName, brandingLogoUrl: null });
   }
 }
 
@@ -799,7 +811,7 @@ Please try again using the button below. If you continue to experience issues, c
   if (vendorBranding) {
     await sendVendorTemplatedEmail(to, vars, vendorBranding);
   } else {
-    await sendTemplatedEmail(to, vars);
+    await sendVendorTemplatedEmail(to, vars, { organizationName: invoiceData.organizationName, brandingLogoUrl: null });
   }
 }
 
@@ -826,7 +838,7 @@ The refund will be returned to your original payment method. Please allow 5-10 b
   if (vendorBranding) {
     await sendVendorTemplatedEmail(to, vars, vendorBranding);
   } else {
-    await sendTemplatedEmail(to, vars);
+    await sendVendorTemplatedEmail(to, vars, { organizationName: invoiceData.organizationName, brandingLogoUrl: null });
   }
 }
 
@@ -871,7 +883,7 @@ We hope to serve you again soon!`;
   if (vendorBranding) {
     await sendVendorTemplatedEmail(to, vars, vendorBranding);
   } else {
-    await sendTemplatedEmail(to, vars);
+    await sendVendorTemplatedEmail(to, vars, { organizationName: 'Order', brandingLogoUrl: null });
   }
 }
 

@@ -8,6 +8,7 @@ import { staffService } from '../services/staff';
 import { socketService, SocketEvents } from '../services/socket';
 import { cacheService, CacheKeys } from '../services/redis/cache';
 import { redisService } from '../services/redis';
+import { clawbackSubscriptionEarnings } from '../services/referrals';
 
 const app = new Hono();
 
@@ -1013,6 +1014,13 @@ async function handleGoogleRevoked(purchaseToken: string, subscriptionId: string
         error,
         organizationId: sub.organization_id,
       });
+    }
+
+    // Clawback any pending/available referral earnings for this user
+    try {
+      await clawbackSubscriptionEarnings(sub.user_id, 'Google subscription revoked');
+    } catch (err) {
+      logger.error('[GoogleWebhook] Failed to clawback referral earnings', { error: err, userId: sub.user_id });
     }
   } else {
     logger.warn('[GoogleWebhook] No subscription found to revoke', {

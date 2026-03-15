@@ -123,6 +123,8 @@ export class EmailService {
     receiptUrl?: string;
     merchantName?: string;
   }, currency: string = 'usd'): Promise<void> {
+    const { sendVendorTemplatedEmail } = await import('./template-sender');
+
     const formattedAmount = formatSmallestUnit(receiptData.amount, currency);
     const formattedRefundedAmount = receiptData.amountRefunded
       ? formatSmallestUnit(receiptData.amountRefunded, currency)
@@ -143,134 +145,76 @@ export class EmailService {
       ? `${receiptData.cardBrand.toUpperCase()} •••• ${receiptData.cardLast4}`
       : 'Card';
 
-    const html = `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      </head>
-      <body style="margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif; background-color: #f5f5f5;">
-        <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f5f5f5; padding: 40px 20px;">
-          <tr>
-            <td align="center">
-              <table width="100%" cellpadding="0" cellspacing="0" style="max-width: 480px; background-color: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
-                <!-- Header -->
-                <tr>
-                  <td style="background: linear-gradient(135deg, ${isFullyRefunded ? '#6b7280 0%, #4b5563 100%' : '#2563eb 0%, #1d4ed8 100%'}); padding: 32px 24px; text-align: center;">
-                    <h1 style="margin: 0; color: #ffffff; font-size: 24px; font-weight: 600;">${isFullyRefunded ? 'Refund Receipt' : 'Payment Receipt'}</h1>
-                  </td>
-                </tr>
+    // Build amount section
+    let amountSection: string;
+    if (isFullyRefunded) {
+      amountSection = `
+        <p style="margin: 0 0 8px; color: #a3a3a3; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; text-align: center;">Amount Refunded</p>
+        <p style="margin: 0; color: #fafafa; font-size: 48px; font-weight: 700; text-align: center;">${formattedRefundedAmount}</p>`;
+    } else if (isPartiallyRefunded) {
+      amountSection = `
+        <p style="margin: 0 0 8px; color: #a3a3a3; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; text-align: center;">Original Amount</p>
+        <p style="margin: 0; color: #fafafa; font-size: 48px; font-weight: 700; text-align: center;">${formattedAmount}</p>
+        <p style="margin: 12px 0 0; color: #f87171; font-size: 18px; font-weight: 600; text-align: center;">Refunded: ${formattedRefundedAmount}</p>
+        <p style="margin: 4px 0 0; color: #4ade80; font-size: 16px; font-weight: 500; text-align: center;">Net: ${netAmount}</p>`;
+    } else {
+      amountSection = `
+        <p style="margin: 0 0 8px; color: #a3a3a3; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; text-align: center;">Amount Paid</p>
+        <p style="margin: 0; color: #fafafa; font-size: 48px; font-weight: 700; text-align: center;">${formattedAmount}</p>`;
+    }
 
-                <!-- Amount -->
-                <tr>
-                  <td style="padding: 32px 24px 16px; text-align: center;">
-                    ${isFullyRefunded ? `
-                    <p style="margin: 0 0 8px; color: #6b7280; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px;">Amount Refunded</p>
-                    <p style="margin: 0; color: #111827; font-size: 48px; font-weight: 700;">${formattedRefundedAmount}</p>
-                    ` : isPartiallyRefunded ? `
-                    <p style="margin: 0 0 8px; color: #6b7280; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px;">Original Amount</p>
-                    <p style="margin: 0; color: #111827; font-size: 48px; font-weight: 700;">${formattedAmount}</p>
-                    <p style="margin: 12px 0 0; color: #dc2626; font-size: 18px; font-weight: 600;">Refunded: ${formattedRefundedAmount}</p>
-                    <p style="margin: 4px 0 0; color: #16a34a; font-size: 16px; font-weight: 500;">Net: ${netAmount}</p>
-                    ` : `
-                    <p style="margin: 0 0 8px; color: #6b7280; font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px;">Amount Paid</p>
-                    <p style="margin: 0; color: #111827; font-size: 48px; font-weight: 700;">${formattedAmount}</p>
-                    `}
-                  </td>
-                </tr>
+    // Build status badge
+    let statusBadge: string;
+    if (isFullyRefunded) {
+      statusBadge = `<span style="display: inline-block; background-color: #374151; color: #9ca3af; padding: 8px 16px; border-radius: 9999px; font-size: 14px; font-weight: 500;">↩ Fully Refunded</span>`;
+    } else if (isPartiallyRefunded) {
+      statusBadge = `<span style="display: inline-block; background-color: #422006; color: #fbbf24; padding: 8px 16px; border-radius: 9999px; font-size: 14px; font-weight: 500;">↩ Partially Refunded</span>`;
+    } else {
+      statusBadge = `<span style="display: inline-block; background-color: #052e16; color: #4ade80; padding: 8px 16px; border-radius: 9999px; font-size: 14px; font-weight: 500;">✓ Payment Successful</span>`;
+    }
 
-                <!-- Status Badge -->
-                <tr>
-                  <td style="padding: 0 24px 24px; text-align: center;">
-                    ${isFullyRefunded ? `
-                    <span style="display: inline-block; background-color: #f3f4f6; color: #6b7280; padding: 8px 16px; border-radius: 9999px; font-size: 14px; font-weight: 500;">
-                      ↩ Fully Refunded
-                    </span>
-                    ` : isPartiallyRefunded ? `
-                    <span style="display: inline-block; background-color: #fef3c7; color: #d97706; padding: 8px 16px; border-radius: 9999px; font-size: 14px; font-weight: 500;">
-                      ↩ Partially Refunded
-                    </span>
-                    ` : `
-                    <span style="display: inline-block; background-color: #dcfce7; color: #16a34a; padding: 8px 16px; border-radius: 9999px; font-size: 14px; font-weight: 500;">
-                      ✓ Payment Successful
-                    </span>
-                    `}
-                  </td>
-                </tr>
+    // Build details rows
+    const orderNumberRow = receiptData.orderNumber
+      ? `<tr><td style="padding: 12px 16px; border-bottom: 1px solid #404040;">
+          <p style="margin: 0; color: #a3a3a3; font-size: 13px;">Order Number</p>
+          <p style="margin: 4px 0 0; color: #fafafa; font-size: 15px; font-weight: 500;">#${receiptData.orderNumber}</p>
+        </td></tr>`
+      : '';
 
-                <!-- Details -->
-                <tr>
-                  <td style="padding: 0 24px 24px;">
-                    <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #f9fafb; border-radius: 8px; padding: 16px;">
-                      <tr>
-                        <td style="padding: 12px 16px; border-bottom: 1px solid #e5e7eb;">
-                          <p style="margin: 0; color: #6b7280; font-size: 13px;">Date</p>
-                          <p style="margin: 4px 0 0; color: #111827; font-size: 15px; font-weight: 500;">${formattedDate}</p>
-                        </td>
-                      </tr>
-                      ${receiptData.orderNumber ? `
-                      <tr>
-                        <td style="padding: 12px 16px; border-bottom: 1px solid #e5e7eb;">
-                          <p style="margin: 0; color: #6b7280; font-size: 13px;">Order Number</p>
-                          <p style="margin: 4px 0 0; color: #111827; font-size: 15px; font-weight: 500;">#${receiptData.orderNumber}</p>
-                        </td>
-                      </tr>
-                      ` : ''}
-                      <tr>
-                        <td style="padding: 12px 16px;">
-                          <p style="margin: 0; color: #6b7280; font-size: 13px;">Payment Method</p>
-                          <p style="margin: 4px 0 0; color: #111827; font-size: 15px; font-weight: 500;">${paymentMethod}</p>
-                        </td>
-                      </tr>
-                    </table>
-                  </td>
-                </tr>
-
-                ${receiptData.receiptUrl ? `
-                <!-- View Full Receipt Button -->
-                <tr>
-                  <td style="padding: 0 24px 32px; text-align: center;">
-                    <a href="${receiptData.receiptUrl}" style="display: inline-block; background-color: #2563eb; color: #ffffff; text-decoration: none; padding: 14px 32px; border-radius: 8px; font-size: 15px; font-weight: 600;">View Full Receipt</a>
-                  </td>
-                </tr>
-                ` : ''}
-
-                <!-- Footer -->
-                <tr>
-                  <td style="padding: 24px; background-color: #f9fafb; text-align: center; border-top: 1px solid #e5e7eb;">
-                    <p style="margin: 0; color: #6b7280; font-size: 13px;">
-                      ${receiptData.merchantName ? `Thank you for your purchase from ${receiptData.merchantName}` : 'Thank you for your purchase'}
-                    </p>
-                    <p style="margin: 8px 0 0; color: #9ca3af; font-size: 12px;">
-                      Powered by Luma POS
-                    </p>
-                  </td>
-                </tr>
-              </table>
-            </td>
-          </tr>
-        </table>
-      </body>
-      </html>
-    `;
+    const emailContent = `${amountSection}
+      <div style="text-align: center; margin: 16px 0 24px;">${statusBadge}</div>
+      <table width="100%" cellpadding="0" cellspacing="0" style="background-color: #262626; border-radius: 8px;">
+        <tr><td style="padding: 12px 16px; border-bottom: 1px solid #404040;">
+          <p style="margin: 0; color: #a3a3a3; font-size: 13px;">Date</p>
+          <p style="margin: 4px 0 0; color: #fafafa; font-size: 15px; font-weight: 500;">${formattedDate}</p>
+        </td></tr>
+        ${orderNumberRow}
+        <tr><td style="padding: 12px 16px;">
+          <p style="margin: 0; color: #a3a3a3; font-size: 13px;">Payment Method</p>
+          <p style="margin: 4px 0 0; color: #fafafa; font-size: 15px; font-weight: 500;">${paymentMethod}</p>
+        </td></tr>
+      </table>
+      <p style="margin: 24px 0 0; color: #a3a3a3; font-size: 13px; text-align: center;">
+        ${receiptData.merchantName ? `Thank you for your purchase from ${receiptData.merchantName}` : 'Thank you for your purchase'}
+      </p>`;
 
     const subjectPrefix = isFullyRefunded ? 'Refund' : isPartiallyRefunded ? 'Updated' : 'Payment';
     const subject = receiptData.orderNumber
       ? `${subjectPrefix} Receipt for Order #${receiptData.orderNumber}`
       : `${subjectPrefix} Receipt - ${isFullyRefunded ? formattedRefundedAmount : formattedAmount}`;
 
-    const textRefundInfo = isFullyRefunded
-      ? `Amount Refunded: ${formattedRefundedAmount}`
-      : isPartiallyRefunded
-        ? `Original Amount: ${formattedAmount}\nRefunded: ${formattedRefundedAmount}\nNet: ${netAmount}`
-        : `Amount: ${formattedAmount}`;
+    const titleText = isFullyRefunded ? 'Refund Receipt' : 'Payment Receipt';
 
-    await this.sendEmail({
-      to,
+    await sendVendorTemplatedEmail(to, {
       subject,
-      html,
-      text: `${isFullyRefunded ? 'Refund' : 'Payment'} Receipt\n\n${textRefundInfo}\nDate: ${formattedDate}${receiptData.orderNumber ? `\nOrder: #${receiptData.orderNumber}` : ''}\nPayment Method: ${paymentMethod}${receiptData.receiptUrl ? `\n\nView full receipt: ${receiptData.receiptUrl}` : ''}\n\n${isFullyRefunded ? 'Your refund has been processed.' : 'Thank you for your purchase!'}`,
+      preheader_text: `${subjectPrefix} receipt${receiptData.orderNumber ? ` for order #${receiptData.orderNumber}` : ''}`,
+      email_title: titleText,
+      email_content: emailContent,
+      cta_url: receiptData.receiptUrl,
+      cta_text: 'View Full Receipt',
+    }, {
+      organizationName: receiptData.merchantName || 'Receipt',
+      brandingLogoUrl: null,
     });
   }
 

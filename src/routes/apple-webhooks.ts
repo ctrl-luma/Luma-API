@@ -6,6 +6,7 @@ import { staffService } from '../services/staff';
 import { socketService, SocketEvents } from '../services/socket';
 import { cacheService, CacheKeys } from '../services/redis/cache';
 import { redisService } from '../services/redis';
+import { clawbackSubscriptionEarnings } from '../services/referrals';
 
 const app = new Hono();
 
@@ -566,11 +567,18 @@ async function handleAppleRefund(transaction: AppleTransactionInfo) {
       platform: 'apple',
       reason: 'refund',
     });
+
+    // Clawback any pending/available referral earnings for this user
+    try {
+      await clawbackSubscriptionEarnings(sub.user_id, 'Apple subscription refunded');
+    } catch (err) {
+      logger.error('[AppleWebhook] Failed to clawback referral earnings', { error: err, userId: sub.user_id });
+    }
   }
 }
 
 async function handleAppleRevoke(transaction: AppleTransactionInfo) {
-  // Family sharing access revoked - treat as cancellation
+  // Family sharing access revoked - treat as cancellation + clawback
   await handleAppleRefund(transaction);
 }
 

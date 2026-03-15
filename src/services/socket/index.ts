@@ -395,4 +395,10 @@ export const SocketEvents = {
   // Terminal reader events
   TERMINAL_PAYMENT_SUCCEEDED: 'terminal:payment_succeeded',
   TERMINAL_PAYMENT_FAILED: 'terminal:payment_failed',
+  // Referral events
+  REFERRAL_CREATED: 'referral:created',
+  REFERRAL_ACTIVATED: 'referral:activated',
+  REFERRAL_EARNING: 'referral:earning',
+  REFERRAL_PAYOUT: 'referral:payout',
+  REFERRAL_CLAWBACK: 'referral:clawback',
 } as const;

@@ -10,6 +10,7 @@ import { staffService } from '../../services/staff';
 import { cacheService, CacheKeys } from '../../services/redis/cache';
 import { fromSmallestUnit } from '../../utils/currency';
 import { redisService } from '../../services/redis';
+import { clawbackReferralEarnings, clawbackSubscriptionEarnings } from '../../services/referrals';
 
 const app = new Hono();
 
@@ -84,6 +85,11 @@ app.post('/stripe/webhook', async (c) => {
       case 'charge.refunded':
         logger.info('[WEBHOOK DEBUG] >>> Matched charge.refunded');
         await handleChargeRefunded(event.data.object);
+        break;
+
+      case 'charge.dispute.created':
+        logger.info('[WEBHOOK DEBUG] >>> Matched charge.dispute.created');
+        await handleChargeDispute(event.data.object);
         break;
 
       case 'account.updated':
@@ -259,6 +265,37 @@ async function handlePaymentIntentSucceeded(paymentIntent: any) {
       orderFound: result.rows.length > 0,
     });
   });
+
+  // Check for ticket purchase (referral earnings for platform fees)
+  if (paymentIntent.application_fee_amount && paymentIntent.application_fee_amount > 0) {
+    try {
+      // Look up ticket by payment intent
+      const ticketResult = await query(
+        `SELECT t.id, e.organization_id
+         FROM tickets t
+         JOIN events e ON t.event_id = e.id
+         WHERE t.stripe_payment_intent_id = $1
+         LIMIT 1`,
+        [paymentIntent.id]
+      );
+
+      if (ticketResult.length > 0) {
+        const platformFeeDollars = fromSmallestUnit(paymentIntent.application_fee_amount, paymentIntent.currency || 'usd');
+        // Find org owner (the referred vendor)
+        const ownerResult = await query(
+          `SELECT id FROM users WHERE organization_id = $1 AND role = 'owner' LIMIT 1`,
+          [ticketResult[0].organization_id]
+        );
+        if (ownerResult.length > 0) {
+          await transaction(async (client) => {
+            await recordReferralEarning(client, ownerResult[0].id, 'ticket_sale', paymentIntent.id, platformFeeDollars, paymentIntent.currency || 'usd');
+          });
+        }
+      }
+    } catch (err) {
+      logger.error('[Webhook] Failed to record referral earning for ticket sale', { error: err });
+    }
+  }
 
   logger.info('[WEBHOOK DEBUG] ========== handlePaymentIntentSucceeded END ==========');
 }
@@ -503,6 +540,40 @@ async function handleChargeRefunded(charge: any) {
       });
     }
   });
+
+  // Clawback referral earnings tied to this charge
+  // Ticket sale earnings use payment_intent as source_id
+  if (charge.payment_intent) {
+    await clawbackReferralEarnings(charge.payment_intent, 'Charge refunded');
+  }
+  // Subscription earnings use invoice ID as source_id
+  if (charge.invoice) {
+    await clawbackReferralEarnings(charge.invoice as string, 'Subscription payment refunded');
+  }
+}
+
+async function handleChargeDispute(dispute: any) {
+  const charge = dispute.charge;
+  const chargeId = typeof charge === 'string' ? charge : charge?.id;
+  const paymentIntent = dispute.payment_intent || (typeof charge === 'object' ? charge?.payment_intent : null);
+  const invoiceId = typeof charge === 'object' ? charge?.invoice : null;
+
+  logger.warn('[Webhook] Charge disputed (chargeback)', {
+    disputeId: dispute.id,
+    chargeId,
+    paymentIntent,
+    amount: dispute.amount,
+    reason: dispute.reason,
+  });
+
+  // Clawback referral earnings for ticket sales (by payment_intent)
+  if (paymentIntent) {
+    await clawbackReferralEarnings(paymentIntent, 'Chargeback/dispute');
+  }
+  // Clawback referral earnings for subscriptions (by invoice ID)
+  if (invoiceId) {
+    await clawbackReferralEarnings(invoiceId as string, 'Chargeback/dispute');
+  }
 }
 
 async function handleAccountUpdated(account: any) {
@@ -754,6 +825,19 @@ async function handleSubscriptionUpdated(subscription: any) {
 
 async function handleSubscriptionDeleted(subscription: any) {
   await updateSubscriptionStatus(subscription, 'canceled');
+
+  // Clawback any pending/available referral earnings for this user's subscription
+  try {
+    const subResult = await query<{ user_id: string }>(
+      `SELECT user_id FROM subscriptions WHERE stripe_subscription_id = $1`,
+      [subscription.id]
+    );
+    if (subResult.length > 0) {
+      await clawbackSubscriptionEarnings(subResult[0].user_id, 'Subscription cancelled');
+    }
+  } catch (err) {
+    logger.error('[Referral] Failed to clawback on subscription deletion', { error: err, subscriptionId: subscription.id });
+  }
 }
 
 async function updateSubscriptionStatus(subscription: any, status: string) {
@@ -932,6 +1016,18 @@ async function handleInvoicePaymentSucceeded(invoice: any) {
           platform: 'stripe',
         });
       }
+
+      // Record referral earnings for subscription payments
+      if (invoice.amount_paid > 0) {
+        try {
+          const subInfo = subResult?.rows?.[0];
+          if (subInfo) {
+            await recordReferralEarning(client, subInfo.user_id, 'subscription', invoice.id, fromSmallestUnit(invoice.amount_paid, invoice.currency || 'usd'), invoice.currency || 'usd');
+          }
+        } catch (err) {
+          logger.error('[Webhook] Failed to record referral earning for subscription', { error: err, invoiceId: invoice.id });
+        }
+      }
     }
 
     logger.info('Invoice payment succeeded', {
@@ -1005,6 +1101,67 @@ async function handleInvoicePaymentFailed(invoice: any) {
     invoiceId: invoice.id,
     subscriptionId: invoice.subscription,
     amountDue: fromSmallestUnit(invoice.amount_due, invoice.currency || 'usd'),
+  });
+}
+
+async function recordReferralEarning(client: any, referredUserId: string, sourceType: string, sourceId: string, grossAmount: number, currency: string) {
+  // Check if this user was referred
+  const referralResult = await client.query(
+    `SELECT r.id, r.referrer_user_id, r.status, r.activated_at
+     FROM referrals r
+     WHERE r.referred_user_id = $1 AND r.status IN ('pending', 'active')
+       AND CASE
+         WHEN r.activated_at IS NOT NULL THEN r.activated_at > NOW() - INTERVAL '12 months'
+         ELSE r.created_at > NOW() - INTERVAL '12 months'
+       END`,
+    [referredUserId]
+  );
+
+  if (referralResult.rows.length === 0) return;
+
+  const referral = referralResult.rows[0];
+  const earningAmount = parseFloat((grossAmount * 0.15).toFixed(2)); // 15% of Luma's revenue
+
+  if (earningAmount <= 0) return;
+
+  // If referral is still pending, activate it now
+  if (referral.status === 'pending') {
+    await client.query(
+      `UPDATE referrals SET status = 'active', activated_at = NOW(), updated_at = NOW() WHERE id = $1`,
+      [referral.id]
+    );
+
+    // Notify referrer about activation
+    socketService.emitToUser(referral.referrer_user_id, SocketEvents.REFERRAL_ACTIVATED, {
+      referralId: referral.id,
+      timestamp: new Date(),
+    });
+  }
+
+  // Record the earning with 30-day hold
+  await client.query(
+    `INSERT INTO referral_earnings (referral_id, referrer_user_id, source_type, source_id, gross_amount, earning_amount, currency, status, available_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', NOW() + INTERVAL '30 days')`,
+    [referral.id, referral.referrer_user_id, sourceType, sourceId, grossAmount, earningAmount, currency]
+  );
+
+  // Notify referrer about new earning
+  socketService.emitToUser(referral.referrer_user_id, SocketEvents.REFERRAL_EARNING, {
+    sourceType,
+    earningAmount,
+    currency,
+    timestamp: new Date(),
+  });
+
+  logger.info('[Referral] Earning recorded', {
+    referralId: referral.id,
+    referrerUserId: referral.referrer_user_id,
+    referredUserId,
+    sourceType,
+    sourceId,
+    grossAmount,
+    earningAmount,
+    currency,
   });
 }
 

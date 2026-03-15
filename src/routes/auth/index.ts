@@ -8,7 +8,8 @@ import { logger } from '../../utils/logger';
 import { query } from '../../db';
 import { config } from '../../config';
 import signupRoutes from './signup';
-import { sendPasswordResetEmail } from '../../services/email/template-sender';
+import { sendPasswordResetEmail, sendTemplatedEmail } from '../../services/email/template-sender';
+import { emailService } from '../../services/email';
 import { cacheService, CacheKeys } from '../../services/redis/cache';
 import { imageService } from '../../services/images';
 import { stripe } from '../../services/stripe';
@@ -2049,6 +2050,143 @@ app.openapi(registerTapToPayDeviceRoute, async (c) => {
     }
 
     return c.json({ error: 'Failed to register device' }, 500);
+  }
+});
+
+// Account deletion request endpoint
+const requestAccountDeletionRoute = createRoute({
+  method: 'post',
+  path: '/auth/request-account-deletion',
+  summary: 'Request account deletion (scheduled for 30 days)',
+  tags: ['Authentication'],
+  security: [{ bearerAuth: [] }],
+  responses: {
+    200: {
+      description: 'Account flagged for deletion',
+      content: {
+        'application/json': {
+          schema: z.object({
+            success: z.boolean(),
+            message: z.string(),
+            deletionDate: z.string(),
+          }),
+        },
+      },
+    },
+    401: { description: 'Unauthorized' },
+    409: { description: 'Deletion already requested' },
+    500: { description: 'Failed to process request' },
+  },
+});
+
+app.openapi(requestAccountDeletionRoute, async (c) => {
+  const authHeader = c.req.header('Authorization');
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+
+  const token = authHeader.substring(7);
+
+  try {
+    const payload = await authService.verifyToken(token);
+    const dbUser = await authService.getUserById(payload.userId);
+
+    if (!dbUser) {
+      return c.json({ error: 'User not found' }, 404);
+    }
+
+    // Check if deletion already requested
+    if (dbUser.deletion_requested_at) {
+      const deletionDate = new Date(dbUser.deletion_requested_at);
+      deletionDate.setDate(deletionDate.getDate() + 30);
+      return c.json({
+        error: 'Account deletion already requested',
+        deletionDate: deletionDate.toISOString(),
+      }, 409);
+    }
+
+    const now = new Date();
+    const deletionDate = new Date(now);
+    deletionDate.setDate(deletionDate.getDate() + 30);
+
+    // 1. Flag account for deletion and deactivate
+    await query(
+      `UPDATE users SET deletion_requested_at = $1, is_active = false, updated_at = NOW() WHERE id = $2`,
+      [now.toISOString(), dbUser.id]
+    );
+
+    // 2. Increment session version to kick user out of all sessions
+    await query(
+      `UPDATE users SET session_version = session_version + 1 WHERE id = $1`,
+      [dbUser.id]
+    );
+
+    // 3. Invalidate cache
+    await cacheService.del(CacheKeys.user(dbUser.id));
+    await cacheService.del(CacheKeys.userByEmail(dbUser.email));
+
+    // 4. Send confirmation email to user
+    const formattedDate = deletionDate.toLocaleDateString('en-US', {
+      year: 'numeric', month: 'long', day: 'numeric',
+    });
+
+    await sendTemplatedEmail(dbUser.email, {
+      subject: 'Your Luma Account Deletion Request',
+      preheader_text: `Your account is scheduled for deletion on ${formattedDate}`,
+      email_title: 'Account Deletion Scheduled',
+      email_content: `
+        Hi ${dbUser.first_name || 'there'},<br><br>
+        We've received your request to delete your Luma account. Your account has been deactivated and is scheduled for permanent deletion on <strong>${formattedDate}</strong>.<br><br>
+        If you change your mind, you can contact us at <a href="mailto:support@lumapos.co">support@lumapos.co</a> before that date to cancel the deletion.<br><br>
+        Once your account is deleted, all your data — including your profile, organization, payment history, and any associated content — will be permanently removed and cannot be recovered.
+      `,
+      security_notice: true,
+    });
+
+    // 5. Notify support team
+    const supportEmail = process.env.SUPPORT_EMAIL || 'support@lumapos.co';
+    const escapeHtml = (str: string) =>
+      str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    await emailService.sendEmail({
+      to: supportEmail,
+      subject: `Account Deletion Scheduled — ${dbUser.email}`,
+      html: `
+        <h2>Account Deletion Scheduled</h2>
+        <p>A user has requested account deletion. The account will be permanently deleted on <strong>${formattedDate}</strong>.</p>
+        <table style="border-collapse: collapse; margin: 16px 0;">
+          <tr><td style="padding: 4px 12px 4px 0; font-weight: bold;">User ID:</td><td>${escapeHtml(dbUser.id)}</td></tr>
+          <tr><td style="padding: 4px 12px 4px 0; font-weight: bold;">Email:</td><td>${escapeHtml(dbUser.email)}</td></tr>
+          <tr><td style="padding: 4px 12px 4px 0; font-weight: bold;">Name:</td><td>${escapeHtml(dbUser.first_name || '')} ${escapeHtml(dbUser.last_name || '')}</td></tr>
+          <tr><td style="padding: 4px 12px 4px 0; font-weight: bold;">Organization ID:</td><td>${escapeHtml(dbUser.organization_id || '')}</td></tr>
+          <tr><td style="padding: 4px 12px 4px 0; font-weight: bold;">Deletion Date:</td><td>${formattedDate}</td></tr>
+        </table>
+        <p>To cancel this deletion, clear the <code>deletion_requested_at</code> field and set <code>is_active = true</code> before the deletion date.</p>
+      `,
+      replyTo: dbUser.email,
+    });
+
+    logger.info('Account deletion scheduled', {
+      userId: dbUser.id,
+      email: dbUser.email,
+      organizationId: dbUser.organization_id,
+      deletionDate: deletionDate.toISOString(),
+    });
+
+    return c.json({
+      success: true,
+      message: 'Account scheduled for deletion',
+      deletionDate: deletionDate.toISOString(),
+    });
+  } catch (error: any) {
+    logger.error('Account deletion request error', { error });
+
+    if (error.message === 'Invalid token' || error.message === 'Token expired') {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+
+    return c.json({ error: 'Failed to process deletion request' }, 500);
   }
 });
 

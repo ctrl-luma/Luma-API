@@ -16,6 +16,8 @@ import { registerAllWorkers } from './services/queue/workers';
 import { queueService } from './services/queue';
 import { socketService } from './services/socket';
 import { startScheduledCleanups, stopScheduledCleanups } from './services/scheduled/ticket-lock-cleanup';
+import { startReferralPayouts, stopReferralPayouts } from './services/scheduled/referral-payouts';
+import { startAccountDeletionJob, stopAccountDeletionJob } from './services/scheduled/account-deletion';
 import authRoutes from './routes/auth';
 import organizationRoutes from './routes/organizations';
 import stripeWebhookRoutes from './routes/stripe/webhooks';
@@ -42,6 +44,7 @@ import menuRoutes from './routes/menu';
 import preorderRoutes from './routes/preorders';
 import invoiceRoutes from './routes/invoices';
 import disputeRoutes from './routes/disputes';
+import referralRoutes from './routes/referrals';
 import adminErrorRoutes from './routes/admin/errors';
 
 const app = new OpenAPIHono({
@@ -74,7 +77,17 @@ app.openAPIRegistry.registerComponent('securitySchemes', 'bearerAuth', {
   description: 'JWT Authorization header using the Bearer scheme',
 });
 
-app.use('*', logger());
+// Skip request logging for successful health checks — they spam the logs
+app.use('*', async (c, next) => {
+  if (c.req.path === '/health' || c.req.path === '/') {
+    await next();
+    if (c.res.status >= 400) {
+      winstonLogger.error(`Health check failed with status ${c.res.status}`);
+    }
+    return;
+  }
+  return logger()(c, next);
+});
 app.use('*', requestId());
 // Debug CORS
 const corsOrigins = config.cors.origin.split(',').map(origin => origin.trim());
@@ -169,6 +182,7 @@ app.route('/', menuRoutes);
 app.route('/', preorderRoutes);
 app.route('/', invoiceRoutes);
 app.route('/', disputeRoutes);
+app.route('/', referralRoutes);
 app.route('/admin/errors', adminErrorRoutes);
 
 app.onError(errorHandler);
@@ -182,6 +196,8 @@ async function startServer() {
     await redisService.connect();
     registerAllWorkers();
     startScheduledCleanups();
+    startReferralPayouts();
+    startAccountDeletionJob();
 
     // Create HTTP server and initialize Socket.IO
     const server = serve({
@@ -207,6 +223,7 @@ async function gracefulShutdown(signal: string) {
   winstonLogger.info(`${signal} received, starting graceful shutdown...`);
   try {
     stopScheduledCleanups();
+    stopReferralPayouts();
     await queueService.closeAll();
     await redisService.disconnect();
     await pool.end();

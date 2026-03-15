@@ -1,4 +1,4 @@
-export type SubscriptionPlatform = 'stripe' | 'apple' | 'google';
+export type SubscriptionPlatform = 'stripe' | 'apple' | 'google' | 'manual';
 
 export interface Subscription {
   id: string;
