@@ -224,6 +224,7 @@ async function gracefulShutdown(signal: string) {
   try {
     stopScheduledCleanups();
     stopReferralPayouts();
+    stopAccountDeletionJob();
     await queueService.closeAll();
     await redisService.disconnect();
     await pool.end();

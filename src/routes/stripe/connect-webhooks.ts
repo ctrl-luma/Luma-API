@@ -9,6 +9,7 @@ import { queueService, QueueName } from '../../services/queue';
 import { getImageUrl } from '../../services/images';
 import { redisService } from '../../services/redis';
 import { fromSmallestUnit } from '../../utils/currency';
+import { recordReferralEarning, clawbackReferralEarnings } from '../../services/referrals';
 
 const app = new Hono();
 
@@ -539,6 +540,37 @@ async function handlePaymentIntentSucceeded(paymentIntent: any, connectedAccount
     }
   });
 
+  // Check for ticket purchase (referral earnings for platform fees)
+  if (paymentIntent.application_fee_amount && paymentIntent.application_fee_amount > 0) {
+    try {
+      // Look up ticket by payment intent
+      const ticketResult = await query(
+        `SELECT t.id, e.organization_id
+         FROM tickets t
+         JOIN events e ON t.event_id = e.id
+         WHERE t.stripe_payment_intent_id = $1
+         LIMIT 1`,
+        [paymentIntent.id]
+      );
+
+      if (ticketResult.length > 0) {
+        const platformFeeDollars = fromSmallestUnit(paymentIntent.application_fee_amount, paymentIntent.currency || 'usd');
+        // Find org owner (the referred vendor)
+        const ownerResult = await query(
+          `SELECT id FROM users WHERE organization_id = $1 AND role = 'owner' LIMIT 1`,
+          [ticketResult[0].organization_id]
+        );
+        if (ownerResult.length > 0) {
+          await transaction(async (client) => {
+            await recordReferralEarning(client, ownerResult[0].id, 'ticket_sale', paymentIntent.id, platformFeeDollars, paymentIntent.currency || 'usd');
+          });
+        }
+      }
+    } catch (err) {
+      logger.error('[Connect Webhook] Failed to record referral earning for ticket sale', { error: err });
+    }
+  }
+
   logger.info('[CONNECT WEBHOOK DEBUG] ========== handlePaymentIntentSucceeded END ==========');
 }
 
@@ -778,6 +810,16 @@ async function handleChargeRefunded(charge: any, connectedAccountId: string | un
       });
     }
   });
+
+  // Clawback referral earnings tied to this charge
+  // Ticket sale earnings use payment_intent as source_id
+  if (charge.payment_intent) {
+    await clawbackReferralEarnings(charge.payment_intent, 'Charge refunded');
+  }
+  // Invoice/subscription earnings use invoice ID as source_id
+  if (charge.invoice) {
+    await clawbackReferralEarnings(charge.invoice as string, 'Payment refunded');
+  }
 }
 
 // ─── Invoice Webhook Handlers ────────────────────────────────────────────────
@@ -1255,6 +1297,11 @@ async function handleDisputeCreated(dispute: any, connectedAccountId: string | u
           : null,
       },
     });
+  }
+
+  // Clawback referral earnings for disputed charges
+  if (dispute.payment_intent) {
+    await clawbackReferralEarnings(dispute.payment_intent, 'Chargeback/dispute');
   }
 
   logger.info('Dispute created and stored', {

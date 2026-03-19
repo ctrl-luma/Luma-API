@@ -805,4 +805,31 @@ await sendTemplatedEmail(to, {
 
 ---
 
+## Code Review & Quality Enforcement
+
+All implementations will be reviewed by Codex. The following standards are enforced:
+
+### Code Standards
+- **TypeScript strict mode** — no `any` types unless explicitly justified
+- **Consistent naming** — camelCase for variables/functions, PascalCase for types/interfaces, UPPER_SNAKE_CASE for constants
+- **No dead code** — unused imports, variables, functions, or commented-out blocks must be removed
+- **Error handling** — all async operations must have proper try/catch with meaningful error messages and structured logging
+- **Security** — parameterized queries only, webhook signatures verified, no exposed stack traces, Zod validation on all inputs
+- **Cache invalidation** — every `users` table mutation must invalidate both Redis cache keys
+
+### Functionality Checks
+- **All code paths tested** — happy path, error cases, and edge cases must be verified
+- **API contracts honored** — request/response shapes must match Zod schemas and OpenAPI definitions
+- **Database integrity** — migrations must be reversible, foreign keys enforced, monetary values use correct types (`DECIMAL(10,2)` for dollars, `INTEGER` for cents)
+- **Webhook correctness** — platform vs. connect webhook routing must match the charge type (direct charges → connect webhook, platform charges → platform webhook)
+- **Real-time consistency** — Socket.IO events must be emitted for all state changes that frontends subscribe to
+- **Currency handling** — always use `fromSmallestUnit()`/`toSmallestUnit()`, never raw `/ 100` or `* 100`
+
+### Review Process
+- Codex will flag violations of these standards during review
+- PRs with unresolved violations will not be approved
+- When in doubt, prefer explicit over clever — readability and correctness over brevity
+
+---
+
 **Remember:** This is a financial application handling payments and user data. Always prioritize security, data integrity, and proper error handling.
