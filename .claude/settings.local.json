@@ -4,7 +4,8 @@
       "Bash(mkdir:*)",
       "WebFetch(domain:docs.stripe.com)",
       "Bash(npx tsc:*)",
-      "Bash(npx eslint:*)"
+      "Bash(npx eslint:*)",
+      "Bash(npm ls:*)"
     ],
     "deny": []
   }
