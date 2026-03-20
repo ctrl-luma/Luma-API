@@ -5,6 +5,7 @@ import { Product } from '../db/models';
 import { logger } from '../utils/logger';
 import { imageService } from '../services/images';
 import { socketService, SocketEvents } from '../services/socket';
+import { checkFieldsForProfanity } from '../utils/content-filter';
 
 const app = new OpenAPIHono();
 
@@ -205,6 +206,12 @@ app.openapi(createProductRoute, async (c) => {
       logger.info('Parsed JSON', { body });
     }
 
+    // Check for profanity in product name/description
+    const profanityField = checkFieldsForProfanity({ name: body.name, description: body.description });
+    if (profanityField) {
+      return c.json({ error: `The product ${profanityField} contains inappropriate language` }, 400);
+    }
+
     logger.info('Creating product', { body, hasImage: !!imageFile });
 
     // Upload image if provided
@@ -304,6 +311,12 @@ app.openapi(updateProductRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
+
+    // Check for profanity in updated fields
+    const profanityField = checkFieldsForProfanity({ name: body.name, description: body.description });
+    if (profanityField) {
+      return c.json({ error: `The product ${profanityField} contains inappropriate language` }, 400);
+    }
 
     // Build update query dynamically
     const updates: string[] = [];

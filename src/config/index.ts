@@ -51,6 +51,7 @@ const envSchema = z.object({
 
   // Apple App Store IAP
   APPLE_APP_BUNDLE_ID: z.string().optional(),
+  APPLE_APP_ID: z.string().optional(), // Numeric App Apple ID (required for production JWS verification)
   APPLE_APP_STORE_KEY_ID: z.string().optional(),
   APPLE_APP_STORE_ISSUER_ID: z.string().optional(),
   APPLE_APP_STORE_PRIVATE_KEY: z.string().optional(), // Base64 encoded .p8 key
@@ -145,6 +146,7 @@ export const config = {
   },
   appleIap: {
     bundleId: env.APPLE_APP_BUNDLE_ID,
+    appAppleId: env.APPLE_APP_ID ? parseInt(env.APPLE_APP_ID) : undefined,
     keyId: env.APPLE_APP_STORE_KEY_ID,
     issuerId: env.APPLE_APP_STORE_ISSUER_ID,
     privateKey: env.APPLE_APP_STORE_PRIVATE_KEY,

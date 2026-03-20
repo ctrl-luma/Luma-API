@@ -4,6 +4,7 @@ import { query } from '../db';
 import { Category } from '../db/models';
 import { logger } from '../utils/logger';
 import { socketService, SocketEvents } from '../services/socket';
+import { checkFieldsForProfanity } from '../utils/content-filter';
 
 const app = new OpenAPIHono();
 
@@ -240,6 +241,12 @@ app.openapi(createCategoryRoute, async (c) => {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
 
+    // Check for profanity in category name/description
+    const profanityField = checkFieldsForProfanity({ name: body.name, description: body.description });
+    if (profanityField) {
+      return c.json({ error: `The category ${profanityField} contains inappropriate language` }, 400);
+    }
+
     await verifyCatalogOwnership(catalogId, payload.organizationId);
 
     // Get max sort order
@@ -339,6 +346,12 @@ app.openapi(updateCategoryRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
+
+    // Check for profanity in updated fields
+    const profanityField = checkFieldsForProfanity({ name: body.name, description: body.description });
+    if (profanityField) {
+      return c.json({ error: `The category ${profanityField} contains inappropriate language` }, 400);
+    }
 
     await verifyCatalogOwnership(catalogId, payload.organizationId);
 

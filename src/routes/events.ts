@@ -14,6 +14,7 @@ import QRCode from 'qrcode';
 import { generateAppleWalletPass, generateGoogleWalletUrl, isAppleWalletAvailable, isGoogleWalletAvailable } from '../services/wallet';
 import { geocodeAddress } from '../services/geocoder';
 import { clawbackReferralEarnings } from '../services/referrals';
+import { checkFieldsForProfanity } from '../utils/content-filter';
 
 const app = new OpenAPIHono();
 
@@ -116,6 +117,7 @@ function formatTicket(row: any) {
     customerName: row.customer_name,
     qrCode: row.qr_code,
     status: row.status,
+    stripePaymentIntentId: row.stripe_payment_intent_id || null,
     usedAt: row.used_at ? (row.used_at instanceof Date ? row.used_at.toISOString() : row.used_at) : null,
     usedBy: row.used_by,
     usedByName: row.used_by_name || null,
@@ -299,6 +301,16 @@ app.openapi(createEventRoute, async (c) => {
     }
 
     const body = await c.req.json();
+
+    // Check event name, description, and tier names for profanity
+    const profanityField = checkFieldsForProfanity({
+      name: body.name,
+      description: body.description,
+      ...(body.tiers ? Object.fromEntries(body.tiers.map((t: any, i: number) => [`tier ${i + 1} name`, t.name])) : {}),
+    });
+    if (profanityField) {
+      return c.json({ error: `The ${profanityField} contains inappropriate language` }, 400);
+    }
 
     // Force all tier prices to 0 for RSVP-only events
     if (body.isRsvpOnly) {
@@ -1597,6 +1609,15 @@ app.openapi(updateEventRoute, async (c) => {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
 
+    // Check updated fields for profanity
+    const profanityField = checkFieldsForProfanity({
+      name: body.name,
+      description: body.description,
+    });
+    if (profanityField) {
+      return c.json({ error: `The ${profanityField} contains inappropriate language` }, 400);
+    }
+
     const fieldMap: Record<string, string> = {
       name: 'name', slug: 'slug', description: 'description',
       locationName: 'location_name', locationAddress: 'location_address',
@@ -1852,6 +1873,12 @@ app.openapi(addTierRoute, async (c) => {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
 
+    // Check tier name/description for profanity
+    const profanityField = checkFieldsForProfanity({ name: body.name, description: body.description });
+    if (profanityField) {
+      return c.json({ error: `The tier ${profanityField} contains inappropriate language` }, 400);
+    }
+
     // Verify event ownership
     const event = await query('SELECT id FROM events WHERE id = $1 AND organization_id = $2', [id, payload.organizationId]);
     if (!event[0]) return c.json({ error: 'Event not found' }, 404);
@@ -1896,6 +1923,12 @@ app.openapi(updateTierRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
+
+    // Check updated fields for profanity
+    const profanityField = checkFieldsForProfanity({ name: body.name, description: body.description });
+    if (profanityField) {
+      return c.json({ error: `The tier ${profanityField} contains inappropriate language` }, 400);
+    }
 
     const fieldMap: Record<string, string> = {
       name: 'name', description: 'description', price: 'price',
@@ -2187,10 +2220,20 @@ app.openapi(refundTicketRoute, async (c) => {
       isFullRefund,
     });
 
-    // Clawback referral earnings for this ticket sale
+    // Clawback referral earnings for this specific ticket
+    // New format: {paymentIntentId}:ticket:{ticketId} — per-ticket earnings
+    // Old format fallback: {paymentIntentId} — legacy single earning for entire purchase
     if (ticket.stripe_payment_intent_id) {
+      const perTicketSourceId = `${ticket.stripe_payment_intent_id}:ticket:${ticketId}`;
+      logger.info('[Events] Attempting referral clawback for ticket refund', {
+        ticketId,
+        stripePaymentIntentId: ticket.stripe_payment_intent_id,
+        perTicketSourceId,
+        refundAmount,
+        isFullRefund,
+      });
       try {
-        await clawbackReferralEarnings(ticket.stripe_payment_intent_id, 'Ticket refunded');
+        await clawbackReferralEarnings(perTicketSourceId, 'Ticket refunded');
       } catch (clawbackErr) {
         logger.error('[Events] Failed to clawback referral earnings on ticket refund', { error: clawbackErr, ticketId });
       }

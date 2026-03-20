@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { logger } from '../utils/logger';
 import { query } from '../db';
+import { config } from '../config';
 import { DEFAULT_FEATURES_BY_TIER, PRICING_BY_TIER } from '../db/models/subscription';
 import { staffService } from '../services/staff';
 import { socketService, SocketEvents } from '../services/socket';
@@ -79,7 +80,7 @@ interface AppleRenewalInfo {
   signedDate: number;
 }
 
-// Simple base64url decode (for JWS payload)
+// Simple base64url decode (fallback for local/development without Apple certs)
 function base64UrlDecode(str: string): string {
   str = str.replace(/-/g, '+').replace(/_/g, '/');
   const padding = '='.repeat((4 - str.length % 4) % 4);
@@ -87,8 +88,7 @@ function base64UrlDecode(str: string): string {
   return Buffer.from(base64, 'base64').toString('utf-8');
 }
 
-// Decode JWS without verification (for MVP - in production, verify signature)
-function decodeJWS<T>(jws: string): T | null {
+function decodeJWSUnsafe<T>(jws: string): T | null {
   try {
     const parts = jws.split('.');
     if (parts.length !== 3) return null;
@@ -97,6 +97,85 @@ function decodeJWS<T>(jws: string): T | null {
   } catch {
     return null;
   }
+}
+
+// Lazy-loaded Apple JWS verifier (only initialized once, only in production)
+let appleVerifier: any = null;
+
+async function getAppleVerifier() {
+  if (appleVerifier) return appleVerifier;
+
+  try {
+    const { SignedDataVerifier, Environment } = await import('@apple/app-store-server-library');
+    const fs = await import('fs');
+    const path = await import('path');
+
+    // Load Apple Root CA certificates (G3 root CA)
+    // Download from https://www.apple.com/certificateauthority/
+    const rootCaPaths = [
+      path.resolve('apple-root-ca-g3.pem'),
+      path.resolve('apple-root-ca-g2.pem'),
+    ].filter(p => fs.existsSync(p));
+
+    if (rootCaPaths.length === 0) {
+      logger.warn('[Apple Webhook] No Apple Root CA certificates found — JWS verification disabled');
+      return null;
+    }
+
+    const rootCAs = rootCaPaths.map(p => fs.readFileSync(p));
+    const isProduction = config.env === 'production';
+    const environment = isProduction ? Environment.PRODUCTION : Environment.SANDBOX;
+
+    appleVerifier = new SignedDataVerifier(
+      rootCAs,
+      true, // enable online OCSP checks
+      environment,
+      config.appleIap.bundleId || '',
+      isProduction ? config.appleIap.appAppleId : undefined,
+    );
+
+    logger.info('[Apple Webhook] JWS verifier initialized', {
+      environment: isProduction ? 'production' : 'sandbox',
+      rootCAs: rootCaPaths.length,
+    });
+
+    return appleVerifier;
+  } catch (error) {
+    logger.error('[Apple Webhook] Failed to initialize JWS verifier', { error });
+    return null;
+  }
+}
+
+/**
+ * Verify and decode a JWS payload from Apple.
+ * Uses the official Apple library in production, falls back to unsigned decode in local/dev.
+ */
+async function verifyAndDecodeJWS<T>(jws: string, type: 'notification' | 'transaction' | 'renewal'): Promise<T | null> {
+  const verifier = await getAppleVerifier();
+
+  if (verifier) {
+    try {
+      if (type === 'notification') {
+        return await verifier.verifyAndDecodeNotification(jws) as T;
+      } else if (type === 'transaction') {
+        return await verifier.verifyAndDecodeTransaction(jws) as T;
+      } else {
+        return await verifier.verifyAndDecodeRenewalInfo(jws) as T;
+      }
+    } catch (error) {
+      logger.error('[Apple Webhook] JWS signature verification FAILED — rejecting payload', { error, type });
+      return null;
+    }
+  }
+
+  // Fallback: no verifier available (local/dev without certs)
+  if (config.env === 'production') {
+    logger.error('[Apple Webhook] JWS verifier not available in production — rejecting payload');
+    return null;
+  }
+
+  logger.warn('[Apple Webhook] JWS verification skipped (no Apple Root CA certs) — using unsigned decode in dev mode');
+  return decodeJWSUnsafe<T>(jws);
 }
 
 app.post('/apple/webhook', async (c) => {
@@ -115,16 +194,15 @@ app.post('/apple/webhook', async (c) => {
       return c.json({ error: 'Missing signedPayload' }, 400);
     }
 
-    // Decode the signed payload (JWS)
-    // In production, you should verify the signature using Apple's root certificates
-    const payload = decodeJWS<AppleNotificationPayload>(signedPayload);
+    // Verify and decode the signed payload (JWS)
+    const payload = await verifyAndDecodeJWS<AppleNotificationPayload>(signedPayload, 'notification');
 
     if (!payload) {
-      logger.error('Failed to decode Apple notification payload');
-      return c.json({ error: 'Invalid payload' }, 400);
+      logger.error('Failed to verify/decode Apple notification payload');
+      return c.json({ error: 'Invalid or unverified payload' }, 403);
     }
 
-    logger.info('Apple notification decoded', {
+    logger.info('Apple notification verified and decoded', {
       notificationType: payload.notificationType,
       subtype: payload.subtype,
       notificationUUID: payload.notificationUUID,
@@ -138,16 +216,16 @@ app.post('/apple/webhook', async (c) => {
       return c.json({ received: true });
     }
 
-    // Decode transaction info if present
+    // Verify and decode transaction info if present
     let transactionInfo: AppleTransactionInfo | null = null;
     if (payload.data.signedTransactionInfo) {
-      transactionInfo = decodeJWS<AppleTransactionInfo>(payload.data.signedTransactionInfo);
+      transactionInfo = await verifyAndDecodeJWS<AppleTransactionInfo>(payload.data.signedTransactionInfo, 'transaction');
     }
 
-    // Decode renewal info if present
+    // Verify and decode renewal info if present
     let renewalInfo: AppleRenewalInfo | null = null;
     if (payload.data.signedRenewalInfo) {
-      renewalInfo = decodeJWS<AppleRenewalInfo>(payload.data.signedRenewalInfo);
+      renewalInfo = await verifyAndDecodeJWS<AppleRenewalInfo>(payload.data.signedRenewalInfo, 'renewal');
     }
 
     // Handle notification based on type

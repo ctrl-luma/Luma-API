@@ -5,6 +5,7 @@ import { Catalog, Category, CatalogProduct, Product } from '../db/models';
 import { logger } from '../utils/logger';
 import { socketService, SocketEvents } from '../services/socket';
 import { imageService } from '../services/images';
+import { checkFieldsForProfanity } from '../utils/content-filter';
 
 const app = new OpenAPIHono();
 
@@ -375,6 +376,12 @@ app.openapi(createCatalogRoute, async (c) => {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = await c.req.json();
 
+    // Check for profanity in catalog name/description
+    const profanityField = checkFieldsForProfanity({ name: body.name, description: body.description });
+    if (profanityField) {
+      return c.json({ error: `The menu ${profanityField} contains inappropriate language` }, 400);
+    }
+
     // Check subscription tier - free/starter can only have 1 catalog
     const subscriptionResult = await query<{ tier: string; status: string }>(
       `SELECT tier, status FROM subscriptions
@@ -526,6 +533,12 @@ app.openapi(updateCatalogRoute, async (c) => {
     }
 
     const body = await c.req.json();
+
+    // Check for profanity in updated fields
+    const profanityField = checkFieldsForProfanity({ name: body.name, description: body.description });
+    if (profanityField) {
+      return c.json({ error: `The menu ${profanityField} contains inappropriate language` }, 400);
+    }
 
     // Build update query dynamically
     const updates: string[] = [];

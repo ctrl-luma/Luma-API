@@ -541,28 +541,57 @@ async function handlePaymentIntentSucceeded(paymentIntent: any, connectedAccount
   });
 
   // Check for ticket purchase (referral earnings for platform fees)
+  // Record one earning PER ticket so individual refunds only clawback their portion
   if (paymentIntent.application_fee_amount && paymentIntent.application_fee_amount > 0) {
     try {
-      // Look up ticket by payment intent
-      const ticketResult = await query(
+      // Look up ALL tickets for this payment intent
+      const ticketResults = await query<{ id: string; organization_id: string }>(
         `SELECT t.id, e.organization_id
          FROM tickets t
          JOIN events e ON t.event_id = e.id
-         WHERE t.stripe_payment_intent_id = $1
-         LIMIT 1`,
+         WHERE t.stripe_payment_intent_id = $1`,
         [paymentIntent.id]
       );
 
-      if (ticketResult.length > 0) {
-        const platformFeeDollars = fromSmallestUnit(paymentIntent.application_fee_amount, paymentIntent.currency || 'usd');
+      logger.info('[Connect Webhook] Ticket referral earning check', {
+        paymentIntentId: paymentIntent.id,
+        applicationFeeAmount: paymentIntent.application_fee_amount,
+        ticketsFound: ticketResults.length,
+        ticketIds: ticketResults.map(t => t.id),
+      });
+
+      if (ticketResults.length > 0) {
+        const totalPlatformFeeDollars = fromSmallestUnit(paymentIntent.application_fee_amount, paymentIntent.currency || 'usd');
+        const perTicketFee = parseFloat((totalPlatformFeeDollars / ticketResults.length).toFixed(2));
+
+        logger.info('[Connect Webhook] Recording per-ticket referral earnings', {
+          totalPlatformFeeDollars,
+          perTicketFee,
+          ticketCount: ticketResults.length,
+          currency: paymentIntent.currency,
+        });
+
         // Find org owner (the referred vendor)
         const ownerResult = await query(
           `SELECT id FROM users WHERE organization_id = $1 AND role = 'owner' LIMIT 1`,
-          [ticketResult[0].organization_id]
+          [ticketResults[0].organization_id]
         );
         if (ownerResult.length > 0) {
           await transaction(async (client) => {
-            await recordReferralEarning(client, ownerResult[0].id, 'ticket_sale', paymentIntent.id, platformFeeDollars, paymentIntent.currency || 'usd');
+            for (const ticket of ticketResults) {
+              const sourceId = `${paymentIntent.id}:ticket:${ticket.id}`;
+              logger.info('[Connect Webhook] Recording referral earning for ticket', {
+                ticketId: ticket.id,
+                sourceId,
+                perTicketFee,
+                ownerUserId: ownerResult[0].id,
+              });
+              await recordReferralEarning(client, ownerResult[0].id, 'ticket_sale', sourceId, perTicketFee, paymentIntent.currency || 'usd');
+            }
+          });
+        } else {
+          logger.info('[Connect Webhook] No org owner found for referral earning', {
+            organizationId: ticketResults[0].organization_id,
           });
         }
       }
@@ -811,14 +840,22 @@ async function handleChargeRefunded(charge: any, connectedAccountId: string | un
     }
   });
 
-  // Clawback referral earnings tied to this charge
-  // Ticket sale earnings use payment_intent as source_id
-  if (charge.payment_intent) {
-    await clawbackReferralEarnings(charge.payment_intent, 'Charge refunded');
-  }
-  // Invoice/subscription earnings use invoice ID as source_id
-  if (charge.invoice) {
-    await clawbackReferralEarnings(charge.invoice as string, 'Payment refunded');
+  // Clawback referral earnings only on FULL charge refund
+  // Partial refunds (single ticket from multi-ticket purchase) are handled per-ticket in events.ts
+  logger.info('[Connect Webhook] Charge refund — referral clawback check', {
+    chargeId: charge.id,
+    paymentIntent: charge.payment_intent,
+    isFullRefund,
+    refundAmount,
+    willClawback: isFullRefund,
+  });
+  if (isFullRefund) {
+    if (charge.payment_intent) {
+      await clawbackReferralEarnings(charge.payment_intent, 'Charge refunded');
+    }
+    if (charge.invoice) {
+      await clawbackReferralEarnings(charge.invoice as string, 'Payment refunded');
+    }
   }
 }
 

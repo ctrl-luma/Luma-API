@@ -15,11 +15,12 @@ import { socketService, SocketEvents } from './socket';
  * @param currency - 3-letter currency code
  */
 export async function recordReferralEarning(client: any, referredUserId: string, sourceType: string, sourceId: string, grossAmount: number, currency: string) {
-  // Check if this user was referred
+  // Check if this user was referred (must not be expired and within 12-month earning window)
   const referralResult = await client.query(
     `SELECT r.id, r.referrer_user_id, r.status, r.activated_at
      FROM referrals r
      WHERE r.referred_user_id = $1 AND r.status IN ('pending', 'active')
+       AND (r.expires_at IS NULL OR r.expires_at > NOW())
        AND CASE
          WHEN r.activated_at IS NOT NULL THEN r.activated_at > NOW() - INTERVAL '12 months'
          ELSE r.created_at > NOW() - INTERVAL '12 months'
@@ -49,11 +50,21 @@ export async function recordReferralEarning(client: any, referredUserId: string,
   }
 
   // Record the earning with 30-day hold
-  await client.query(
+  // ON CONFLICT prevents duplicate earnings from webhook replays
+  // TODO: Decide on chargeback protection strategy (negative balance carry-forward vs longer hold)
+  const insertResult = await client.query(
     `INSERT INTO referral_earnings (referral_id, referrer_user_id, source_type, source_id, gross_amount, earning_amount, currency, status, available_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', NOW() + INTERVAL '30 days')`,
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', NOW() + INTERVAL '30 days')
+     ON CONFLICT (source_id) DO NOTHING
+     RETURNING id`,
     [referral.id, referral.referrer_user_id, sourceType, sourceId, grossAmount, earningAmount, currency]
   );
+
+  // If no row was inserted (duplicate), skip notifications
+  if (insertResult.rows.length === 0) {
+    logger.warn('[Referral] Duplicate earning skipped', { sourceId, referredUserId });
+    return;
+  }
 
   // Notify referrer about new earning
   socketService.emitToUser(referral.referrer_user_id, SocketEvents.REFERRAL_EARNING, {
@@ -76,12 +87,17 @@ export async function recordReferralEarning(client: any, referredUserId: string,
 }
 
 /**
- * Clawback referral earnings by source_id (payment_intent or invoice ID).
- * Used when a charge is refunded, ticket is refunded, etc.
+ * Clawback referral earnings by source_id (exact match or prefix match).
+ * Exact match: source_id = 'pi_xxx:ticket:abc' (single ticket refund)
+ * Prefix match: source_id LIKE 'pi_xxx%' (full charge refund claws back all tickets in that purchase)
  * Only claws back earnings still in 'pending' or 'available' status — already-paid earnings are not reversed.
  */
 export async function clawbackReferralEarnings(sourceId: string, reason: string) {
   try {
+    logger.info('[Referral] Clawback attempt', { sourceId, reason });
+
+    // Use exact match first; if no results, try prefix match for payment_intent-based lookups
+    // This handles both per-ticket source_ids ({pi}:ticket:{id}) and legacy full-PI source_ids
     const result = await query<{
       id: string;
       referrer_user_id: string;
@@ -91,7 +107,7 @@ export async function clawbackReferralEarnings(sourceId: string, reason: string)
     }>(
       `UPDATE referral_earnings
        SET status = 'clawed_back', clawed_back_at = NOW(), clawed_back_reason = $2
-       WHERE source_id = $1 AND status IN ('pending', 'available')
+       WHERE (source_id = $1 OR source_id LIKE $1 || ':%') AND status IN ('pending', 'available')
        RETURNING id, referrer_user_id, earning_amount, status, currency`,
       [sourceId, reason]
     );

@@ -5,6 +5,7 @@ import { logger } from '../utils/logger';
 import { cacheService, CacheKeys } from '../services/redis/cache';
 import { config } from '../config';
 import { rateLimit } from '../middleware/rate-limit';
+import { containsProfanity } from '../utils/content-filter';
 
 const app = new OpenAPIHono({
   defaultHook: (result, c) => {
@@ -167,12 +168,26 @@ const customizeCodeRoute = createRoute({
   },
 });
 
+// Additional referral-code-specific blocked terms (beyond the shared profanity filter)
+const BLOCKED_CODE_TERMS = ['lumapos', 'stripe', 'apple', 'google', 'admin', 'support', 'help', 'official', 'team', 'staff', 'system', 'test'];
+
+function isBlockedCode(code: string): boolean {
+  if (containsProfanity(code)) return true;
+  const lower = code.toLowerCase();
+  return BLOCKED_CODE_TERMS.some(term => lower.includes(term));
+}
+
 app.openapi(customizeCodeRoute, async (c) => {
   try {
     const payload = await verifyAuth(c.req.header('Authorization'));
     const body = c.req.valid('json');
 
     const newCode = body.code.trim();
+
+    // Check against blocklist
+    if (isBlockedCode(newCode)) {
+      return c.json({ error: 'This referral code is not allowed' }, 400);
+    }
 
     // Check if code is already taken by another user
     const existingResult = await query<{ id: string }>(
